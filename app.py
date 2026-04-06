@@ -613,10 +613,10 @@ def is_project_server_validated(aff_id: str) -> tuple[bool, str]:
     """
     Garde-fou minimal côté client.
 
-    Sans endpoint serveur dédié pour lister/valider les projets, on considère
-    qu'une affaire est "validée côté serveur" si:
+    Sans endpoint serveur dédié de validation, on considère qu'une affaire est
+    suffisamment "validée côté serveur" pour le scaffolding si:
     1) elle a été créée avec succès via /create_affaire pendant cette session, ou
-    2) elle apparaît dans l'index local de référence.
+    2) sa configuration projet est déjà lisible localement.
     """
     aff_id = (aff_id or "").strip()
     if not aff_id:
@@ -626,15 +626,14 @@ def is_project_server_validated(aff_id: str) -> tuple[bool, str]:
     if aff_id in validated:
         return True, "Affaire validée via /create_affaire dans cette session."
 
-    if _project_index_entry(aff_id):
-        return False, (
-            "Affaire présente dans l'index local, mais cette seule présence n'est pas "
-            "considérée comme une validation serveur suffisante pour le scaffolding."
-        )
+    cfg_path = find_project_config_path(aff_id)
+    if cfg_path and Path(cfg_path).exists():
+        return True, "Configuration projet locale déjà lisible pour cette affaire."
 
     return False, (
         "Validation serveur non établie côté client. "
-        "Créer d'abord l'affaire via /create_affaire ou resynchroniser l'index local."
+        "Créer d'abord l'affaire via /create_affaire ou vérifier que project_config.json "
+        "est bien visible localement."
     )
 
 
@@ -644,18 +643,16 @@ def create_affaire_via_server(
     nas_root_unc: str,
 ) -> tuple[dict, str | None]:
     """
-    Flux nominal: création côté serveur d'abord, puis projection locale minimale
-    uniquement pour rester compatible avec le client actuel.
+    Flux nominal: création côté serveur d'abord.
 
-    Limite connue:
-    - le serveur ne reçoit pas encore l'UNC NAS ni le schéma v4 complet.
-    - le client complète donc localement project_config/_remote.map uniquement
-      si le projet serveur devient visible sur le laptop.
+    Le client ne projette plus localement de configuration complémentaire.
+    Il se contente de recharger la configuration si le projet créé devient
+    visible sur le laptop.
     """
     if not ensure_ready():
         raise RuntimeError("Serveur injoignable après WOL")
 
-    aff_root_local, aff_root_unc, paths = build_affaire_paths(aff_id, nas_root_unc)
+    _ = nas_root_unc  # conservé transitoirement dans l'UI, non transmis au serveur
     payload = req(
         "/create_affaire",
         payload={"project_id": aff_id, "nom": titre or aff_id},
@@ -669,63 +666,12 @@ def create_affaire_via_server(
     _mark_project_server_validated(aff_id)
 
     cfg_path_raw = payload.get("project_config_path") or str(
-        Path(aff_root_local) / "_Config" / "project_config.json"
+        Path(AFFAIRES_ROOT) / aff_id / "_Config" / "project_config.json"
     )
     cfg_path = Path(cfg_path_raw)
 
     if not cfg_path.exists():
         return payload, None
-
-    cfg_dir = cfg_path.parent
-    aff_root_local = str(cfg_dir.parent)
-
-    try:
-        annee = int(aff_id.split("-", 1)[0])
-    except Exception:
-        annee = 0
-
-    # Compatibilité transitoire: le client actuel attend un project_config v4
-    # avec roots/paths. On complète localement uniquement si le fichier serveur
-    # est visible depuis le laptop.
-    ensure_project_dirs(aff_root_local, paths)
-    ensure_dir(str(cfg_dir))
-
-    proj_cfg = default_project_config(
-        aff_id=aff_id,
-        annee=annee,
-        root_unc=aff_root_unc,
-        paths=paths,
-        model_name=config.get("default_model", ""),
-        root_local=aff_root_local,
-    )
-    if titre:
-        proj_cfg["titre"] = titre
-
-    cfg_preexisting = cfg_path.exists()
-    if not cfg_preexisting:
-        save_json(str(cfg_path), proj_cfg)
-
-    remote_url_path = cfg_dir / "_remote.url"
-    if not cfg_preexisting or not remote_url_path.exists():
-        remote_url_path.write_text(aff_root_unc + "\n", encoding="utf-8")
-
-    remote_map_path = cfg_dir / "_remote.map.json"
-    if not cfg_preexisting or not remote_map_path.exists():
-        save_json(str(remote_map_path), {
-            "contexts": {
-                "pcfixe": {"root": aff_root_unc},
-                "nas": {"root": aff_root_unc},
-                "laptop": {"root": aff_root_local},
-            },
-            "paths_rel": paths,
-            "qdrant_uri": os.getenv("QDRANT_URI", "http://PCFIXE:6333"),
-            "chromadb_path": os.getenv("CHROMA_ROOT", r"\\PCFIXE\VectorDB\chroma") + f"\\{aff_id}\\",
-        })
-
-    sqlite_path = pj(aff_root_local, paths.get("sqlite", r"_DB\project.sqlite"))
-    ensure_dir(str(Path(sqlite_path).parent))
-    if not Path(sqlite_path).exists():
-        Path(sqlite_path).touch()
 
     return payload, str(cfg_path)
 
@@ -1584,7 +1530,10 @@ if selection == "➕ Créer une nouvelle affaire…":
         st.subheader("Créer une affaire")
         aff_id = st.text_input("ID affaire (ex: 2025-J38)")
         titre = st.text_input("Titre (facultatif)")
-        nas_root_unc = st.text_input("UNC racine NAS de l’affaire (obligatoire)", value="")  # ex: \\\\NAS\\Affaires\\2025-J38\\
+        nas_root_unc = st.text_input(
+            "UNC racine NAS de l’affaire (optionnelle, non transmise au serveur)",
+            value="",
+        )  # ex: \\\\NAS\\Affaires\\2025-J38\\
         submitted = st.form_submit_button("Créer")
 
     if submitted and aff_id:
