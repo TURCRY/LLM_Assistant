@@ -586,6 +586,149 @@ def req(path: str, payload=None, method="POST", timeout=600):
     r.raise_for_status()
     return r.json()
 
+
+def _project_index_entry(aff_id: str) -> dict | None:
+    """
+    Retourne l'entrée locale d'index si elle existe.
+
+    Hypothèse transitoire:
+    - le client ne traite pas cet index local comme source de vérité,
+    - mais il s'en sert encore comme indice de validation "déjà connue" côté serveur
+      tant qu'aucune route dédiée de lecture des projets n'existe.
+    """
+    idx = _read_json(PROJETS_INDEX_PATH, [])
+    for it in idx or []:
+        if it.get("id") == aff_id or it.get("id_projet") == aff_id:
+            return it
+    return None
+
+
+def _mark_project_server_validated(aff_id: str) -> None:
+    validated = set(st.session_state.get("server_validated_projects", []))
+    validated.add((aff_id or "").strip())
+    st.session_state["server_validated_projects"] = sorted(x for x in validated if x)
+
+
+def is_project_server_validated(aff_id: str) -> tuple[bool, str]:
+    """
+    Garde-fou minimal côté client.
+
+    Sans endpoint serveur dédié pour lister/valider les projets, on considère
+    qu'une affaire est "validée côté serveur" si:
+    1) elle a été créée avec succès via /create_affaire pendant cette session, ou
+    2) elle apparaît dans l'index local de référence.
+    """
+    aff_id = (aff_id or "").strip()
+    if not aff_id:
+        return False, "ID affaire manquant."
+
+    validated = set(st.session_state.get("server_validated_projects", []))
+    if aff_id in validated:
+        return True, "Affaire validée via /create_affaire dans cette session."
+
+    if _project_index_entry(aff_id):
+        return False, (
+            "Affaire présente dans l'index local, mais cette seule présence n'est pas "
+            "considérée comme une validation serveur suffisante pour le scaffolding."
+        )
+
+    return False, (
+        "Validation serveur non établie côté client. "
+        "Créer d'abord l'affaire via /create_affaire ou resynchroniser l'index local."
+    )
+
+
+def create_affaire_via_server(
+    aff_id: str,
+    titre: str,
+    nas_root_unc: str,
+) -> tuple[dict, str | None]:
+    """
+    Flux nominal: création côté serveur d'abord, puis projection locale minimale
+    uniquement pour rester compatible avec le client actuel.
+
+    Limite connue:
+    - le serveur ne reçoit pas encore l'UNC NAS ni le schéma v4 complet.
+    - le client complète donc localement project_config/_remote.map uniquement
+      si le projet serveur devient visible sur le laptop.
+    """
+    if not ensure_ready():
+        raise RuntimeError("Serveur injoignable après WOL")
+
+    aff_root_local, aff_root_unc, paths = build_affaire_paths(aff_id, nas_root_unc)
+    payload = req(
+        "/create_affaire",
+        payload={"project_id": aff_id, "nom": titre or aff_id},
+        method="POST",
+        timeout=timeout,
+    )
+
+    if not payload.get("ok"):
+        raise RuntimeError(payload.get("error") or "Création serveur impossible.")
+
+    _mark_project_server_validated(aff_id)
+
+    cfg_path_raw = payload.get("project_config_path") or str(
+        Path(aff_root_local) / "_Config" / "project_config.json"
+    )
+    cfg_path = Path(cfg_path_raw)
+
+    if not cfg_path.exists():
+        return payload, None
+
+    cfg_dir = cfg_path.parent
+    aff_root_local = str(cfg_dir.parent)
+
+    try:
+        annee = int(aff_id.split("-", 1)[0])
+    except Exception:
+        annee = 0
+
+    # Compatibilité transitoire: le client actuel attend un project_config v4
+    # avec roots/paths. On complète localement uniquement si le fichier serveur
+    # est visible depuis le laptop.
+    ensure_project_dirs(aff_root_local, paths)
+    ensure_dir(str(cfg_dir))
+
+    proj_cfg = default_project_config(
+        aff_id=aff_id,
+        annee=annee,
+        root_unc=aff_root_unc,
+        paths=paths,
+        model_name=config.get("default_model", ""),
+        root_local=aff_root_local,
+    )
+    if titre:
+        proj_cfg["titre"] = titre
+
+    cfg_preexisting = cfg_path.exists()
+    if not cfg_preexisting:
+        save_json(str(cfg_path), proj_cfg)
+
+    remote_url_path = cfg_dir / "_remote.url"
+    if not cfg_preexisting or not remote_url_path.exists():
+        remote_url_path.write_text(aff_root_unc + "\n", encoding="utf-8")
+
+    remote_map_path = cfg_dir / "_remote.map.json"
+    if not cfg_preexisting or not remote_map_path.exists():
+        save_json(str(remote_map_path), {
+            "contexts": {
+                "pcfixe": {"root": aff_root_unc},
+                "nas": {"root": aff_root_unc},
+                "laptop": {"root": aff_root_local},
+            },
+            "paths_rel": paths,
+            "qdrant_uri": os.getenv("QDRANT_URI", "http://PCFIXE:6333"),
+            "chromadb_path": os.getenv("CHROMA_ROOT", r"\\PCFIXE\VectorDB\chroma") + f"\\{aff_id}\\",
+        })
+
+    sqlite_path = pj(aff_root_local, paths.get("sqlite", r"_DB\project.sqlite"))
+    ensure_dir(str(Path(sqlite_path).parent))
+    if not Path(sqlite_path).exists():
+        Path(sqlite_path).touch()
+
+    return payload, str(cfg_path)
+
 # ============================================================
 # Gestion des parties (écran unique) — création / ajout / renommage
 # - charge _Config/parties.json si présent
@@ -1445,70 +1588,27 @@ if selection == "➕ Créer une nouvelle affaire…":
         submitted = st.form_submit_button("Créer")
 
     if submitted and aff_id:
-        # parsing année
         try:
-            annee = int(aff_id.split("-", 1)[0])
-        except Exception:
-            annee = 0
-
-        try:
-            # 1) chemins standard
-            aff_root_local, aff_root_unc, paths = build_affaire_paths(aff_id, nas_root_unc)
-
-            # 2) création locale 
-            ensure_project_dirs(aff_root_local, paths)
-
-            # 3) project_config.json (v4)
-            cfg_dir = pj(aff_root_local, "_Config")
-            ensure_dir(cfg_dir)
-
-            proj_cfg = default_project_config(
-                aff_id=aff_id,
-                annee=annee,
-                root_unc=aff_root_unc,
-                paths=paths,
-                model_name=config.get("default_model", ""),
-                root_local=aff_root_local
+            payload, cfg_path = create_affaire_via_server(
+                aff_id=(aff_id or "").strip(),
+                titre=(titre or "").strip(),
+                nas_root_unc=(nas_root_unc or "").strip(),
             )
-            if titre:
-                proj_cfg["titre"] = titre
 
-            chemin_config = pj(cfg_dir, "project_config.json")
-            save_json(chemin_config, proj_cfg)
+            if cfg_path:
+                st.success(f"Affaire créée côté serveur : {aff_id}. Chargement…")
+                st.caption(f"Configuration locale projet visible : {cfg_path}")
+                # Important : revenir au mode “affaire existante”
+                st.session_state["last_created_affaire"] = aff_id
+                st.rerun()
 
-            # 4bis) pointeur officiel *_remote.url (convention)
-            Path(pj(cfg_dir, "_remote.url")).write_text(aff_root_unc + "\n", encoding="utf-8")
-
-            # 4) _remote.map.json (optionnel)
-            remote_map = pj(cfg_dir, "_remote.map.json")
-            save_json(remote_map, {
-                "contexts": {
-                    "pcfixe": {"root": aff_root_unc},
-                    "nas":    {"root": aff_root_unc},
-                    "laptop": {"root": aff_root_local}
-                },
-                "paths_rel": paths,
-                "qdrant_uri": os.getenv("QDRANT_URI", "http://PCFIXE:6333"),
-                "chromadb_path": os.getenv("CHROMA_ROOT", r"\\PCFIXE\VectorDB\chroma") + f"\\{aff_id}\\"
-            })
-
-
-
-
-            # 5) SQLite "placeholder" (si vous gardez cette approche)
-            sqlite_path = pj(aff_root_local, paths.get("sqlite", r"_DB\project.sqlite"))
-            ensure_dir(str(Path(sqlite_path).parent))
-            if not Path(sqlite_path).exists():
-                Path(sqlite_path).touch()
-
-
-            st.success(f"Affaire créée : {aff_id}. Chargement…")
-            # Important : revenir au mode “affaire existante”
-            st.session_state["last_created_affaire"] = aff_id
-            st.rerun()
-
-
-
+            st.success(f"Affaire créée côté serveur : {aff_id}.")
+            st.warning(
+                "Le projet a bien été créé via /create_affaire, mais sa configuration n'est "
+                "pas encore visible sur le laptop. Resynchronisez les fichiers projet avant "
+                "de poursuivre dans l'interface."
+            )
+            st.json(payload)
         except Exception as e:
             st.error(f"Création impossible : {e}")
             st.stop()
@@ -1611,11 +1711,20 @@ if st.button("🔧 (Re)créer l’arborescence"):
     if not ensure_ready():
         st.error("❌ Serveur injoignable après WOL"); st.stop()
     try:
+        project_id = project_config.get("id", "")
+        validated, reason = is_project_server_validated(project_id)
+        if not validated:
+            st.error(
+                "Création des dossiers côté serveur bloquée : affaire non validée côté serveur."
+            )
+            st.caption(reason)
+            st.stop()
+
         # On conserve ta route existante si elle attend 'project_id'
         r = requests.post(
             f"{SERVER_URL}/scaffold_project_dirs",
             headers={"x-api-key": API_KEY},
-            json={"project_id": project_config.get("id", "")},   # nouveau champ 'id'
+            json={"project_id": project_id},   # nouveau champ 'id'
             timeout=timeout
         )
         data = r.json()
