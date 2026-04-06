@@ -1,0 +1,11 @@
+LLM_Assistant/
+├── app.py
+├── requirements.txt
+├── utils/
+│   ├── rag_utils.py
+│   ├── api_client.py
+│   └── export_utils.py
+├── config/
+│   └── settings.json
+└── data/
+    └── (exemples de fichiers Q&A ou dossiers RAG)

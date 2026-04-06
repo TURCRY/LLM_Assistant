@@ -1,0 +1,7 @@
+{
+  "objectif": "Ce que vous attendez comme résultat (ex. : résumé, analyse, réponse précise, génération créative, etc.).",
+  "contexte": "Contexte nécessaire pour bien comprendre la question (ex. : domaine, situation, historique...).",
+  "format": "Forme attendue de la réponse (ex. : liste, paragraphe, style synthétique, ton formel ou familier...).",
+  "contraintes": "Contraintes à respecter (ex. : ne pas dépasser 100 mots, ne pas citer de noms, respecter la législation...).",
+  "exemples": "Exemples de réponses attendues ou éléments types pour guider le LLM dans son style ou contenu."
+}

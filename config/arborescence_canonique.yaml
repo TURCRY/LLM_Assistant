@@ -1,0 +1,100 @@
+version: 4
+root: "/Affaires/{id_affaire}"
+
+tree:
+  "00_Juridiction": {}
+  "01_Partie_01_{Nom}": {}
+  "02_Partie_02_{Nom}": {}
+  # ...
+  "40_Partie_40_{Nom}": {}
+  "99_Autre_Source": {}
+
+  "AA_Expert_Admin":
+    "Depot_initial": {}
+    "_Paperless_Inbox": {}
+    "_Logs": {}
+
+  "AB_Organisation_expertise":
+    # fichier attendu (optionnel à la création, mais emplacement figé)
+    "Id_affaire_en_tete_dossier.xlsx": { type: "file_placeholder" }
+
+  "AC_Journaux": {}
+
+  "AD_Expert_Traitements":
+    "_Queue_OCR": {}
+    "_OCR_Texte": {}
+    "_Splits": {}
+    "_CSV_RAG": {}
+    "_Manifests": {}
+
+  "AE_Expert_captations":
+    "{id_captation}":
+      "audio": {}
+      "photos":
+        "JPG": {}
+        "JPG reduit": {}
+        "RAW2": {}
+        # fichiers attendus (placeholders)
+        "batch_photos.csv": { type: "file_placeholder" }
+
+  "AF_Expert_ASR":
+    "transcriptions":
+      "{id_captation}":
+        "config_llm.json": { type: "file_placeholder" }
+        "contexte_general.json": { type: "file_placeholder" }
+        "contexte_general_compte_rendu.json": { type: "file_placeholder" }
+        "contexte_general_photos.json": { type: "file_placeholder" }
+        "infos_projet.json": { type: "file_placeholder" }
+        "prompt_gpt.json": { type: "file_placeholder" }
+        "prompt_gpt_batch_only.json": { type: "file_placeholder" }
+        "Participants.xlsx": { type: "file_placeholder" }
+        "Sujets.xlsx": { type: "file_placeholder" }
+        "id_affaire_proper_names.txt": { type: "file_placeholder" }
+
+  "BA_Pieces_de_expert": {}
+
+  "BB_Préparation_livrables":
+    "convocation_accedit": {}
+    "Consignation_planning": {}
+    "Note_aux_parties": {}
+    "Rapport_initial_et_note_de_synthese_intermediaire": {}
+    "Pre-rapport": {}
+    "rapport_final": {}
+
+  "BC_Traitement_automatise_livrables":
+    "PCfixe": {}
+    "NAS": {}
+    "Laptop": {}
+
+  "BD_Etudes_diveres_Expert": {}
+
+  "BE_Traitement_captations":
+    "{id_captation}":
+      "compte_rendu_LLM":
+        "out":
+          "logs": {}
+          "pass2B_batches": {}
+          "pass3E_sujets": {}
+          "segments": {}
+          "sujets": {}
+        # fichiers attendus (placeholders)
+        "global.json": { type: "file_placeholder" }
+        "global_by_sujet.json": { type: "file_placeholder" }
+        "global_final.json": { type: "file_placeholder" }
+        "global_meeting.json": { type: "file_placeholder" }
+        "sujet_ref.json": { type: "file_placeholder" }
+
+  "BF_Prefabrication_livrables":
+    "Batch_NAS": {}
+    "Batch_PCfixe": {}
+    "Batch_Laptop": {}
+
+  "BD_Exports": {}
+  "CZ_Cloture": {}
+
+  "_DB":
+    "project.sqlite": { type: "file_placeholder" }
+  "_Config":
+    "project_config.json": { type: "file_placeholder" }
+    "asr_lexique.json": { type: "file_placeholder" }
+  "_Manifests": {}

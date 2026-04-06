@@ -1,0 +1,78 @@
+########################################
+# Python
+########################################
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+########################################
+# Environnements / secrets
+########################################
+.env
+config/.env
+*.key
+*.pem
+*.secret
+
+########################################
+# IDE / OS
+########################################
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+########################################
+# Logs / temporaires
+########################################
+*.log
+*.tmp
+*.bak
+*.old
+
+########################################
+# Dossiers locaux non versionnés
+########################################
+temp/
+data/
+
+########################################
+# Médias et fichiers lourds locaux
+########################################
+*.wav
+*.mp3
+*.flac
+*.mp4
+*.m4a
+*.zip
+
+########################################
+# Sorties générées / artefacts locaux
+########################################
+*.jsonl
+*_progress.json
+
+########################################
+# Caches Python dans sous-dossiers
+########################################
+scripts/__pycache__/
+tools/**/__pycache__/
+utils/__pycache__/
+
+########################################
+# Fichiers métier à conserver
+########################################
+!config/*.json
+!config/*.yaml
+!config/*.yml
+!docs/**
+!*.md
+!requirements.txt
+!*.bat
+
+# fichiers temporaires Word
+~$*.docx
+~WRL*.tmp

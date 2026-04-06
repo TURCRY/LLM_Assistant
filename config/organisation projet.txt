@@ -1,0 +1,24 @@
+C:/Mes_Projets/expertise_maison_versailles_2025/
+├── projet_config.json
+├── prompts/
+│   ├── prompt_1.json
+│   └── prompt_refus_legaux.json
+├── qa_log_2025_07_20.csv
+├── dossier_rag/
+│   ├── rapport_2022.pdf
+│   ├── tableau_reparations.csv
+│   └── notes_mission.txt
+├── sources_web/
+│   ├── source_meteo_juin.json
+│   └── arrete_catnat_yvelines.json
+
+
+{
+  "project_id": "expertise_maison_versailles_2025",
+  "rag_dossier_laptop": "C:/Mes_Projets/expertise_maison_versailles_2025",
+  "rag_dossier_pcfixe": "C:/Dossier_rag/expertise_maison_versailles_2025",
+  "model_name": "Mistral_7B",
+  "use_web": true,
+  "prompts": ["prompt_1.json", "prompt_refus_legaux.json"],
+  "qa_files": ["qa_log_2025_07_20.csv"]
+}

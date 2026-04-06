@@ -1,0 +1,4 @@
+{
+  "timeout": 600,
+  "default_model": "Mistral_7B"
+}

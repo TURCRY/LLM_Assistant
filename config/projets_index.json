@@ -1,0 +1,11 @@
+[
+  {
+    "id": "2025-J38",
+    "nom": "J38 BLAU CASTEL c/ MAISONS LELIEVRE – GUERNES TJ78",
+    "commentaire": "Réserves de réception non levées",
+    "chemin_config": "C:/Affaires/2025-J38/_Config/project_config.json",
+    "rag_dossier_pcfixe": "C:/Affaires/2025-J38",
+    "model_name": "Mistral_7B",
+    "date_creation": "2025-07-01"
+  }
+]
