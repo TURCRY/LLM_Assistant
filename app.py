@@ -924,6 +924,139 @@ def list_captations(affaire_id: str):
 
     return items
 
+ASR_MEDIA_EXTENSIONS = (".wav", ".mp3", ".flac", ".m4a", ".ogg", ".mp4", ".mkv", ".mov")
+
+def _read_text_list_file(path: str | Path | None) -> list[str]:
+    if not path:
+        return []
+    try:
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return []
+        lines = []
+        for raw in p.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            lines.append(line)
+        return lines
+    except Exception:
+        return []
+
+def _pick_existing_path(*candidates: str | Path | None) -> str:
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            p = Path(candidate)
+            if p.exists():
+                return str(p)
+        except Exception:
+            continue
+    return ""
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    out = []
+    seen = set()
+    for item in items:
+        norm = (item or "").strip()
+        if not norm:
+            continue
+        key = norm.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(norm)
+    return out
+
+def resolve_asr_captation_context(project_config: dict, affaire_id: str, id_captation: str) -> dict:
+    proj_pcfixe = ((project_config.get("roots") or {}).get("pcfixe") or "").rstrip("\\/")
+    proj_laptop = str((Path(AFFAIRES_ROOT) / affaire_id).resolve())
+
+    audio_dir_lp = Path(proj_laptop) / "AE_Expert_captations" / id_captation / "audio"
+    trans_dir_lp = Path(proj_laptop) / "AF_Expert_ASR" / "transcriptions" / id_captation
+    audio_dir_pc = Path(proj_pcfixe) / "AE_Expert_captations" / id_captation / "audio" if proj_pcfixe else None
+    trans_dir_pc = Path(proj_pcfixe) / "AF_Expert_ASR" / "transcriptions" / id_captation if proj_pcfixe else None
+
+    infos_lp_path = trans_dir_lp / "infos_projet.json"
+    infos = load_json(str(infos_lp_path), {}) if infos_lp_path.exists() else {}
+    infos_pc = infos.get("pcfixe", {}) if isinstance(infos.get("pcfixe"), dict) else {}
+
+    local_audio_candidates = []
+    for src in [
+        infos.get("fichier_audio_source"),
+        infos.get("audio_compat_source"),
+        infos.get("fichier_audio_compatible"),
+    ]:
+        if src:
+            local_audio_candidates.append(src)
+
+    if audio_dir_lp.exists():
+        discovered = []
+        for ext in ASR_MEDIA_EXTENSIONS:
+            discovered.extend(sorted(audio_dir_lp.glob(f"*{ext}")))
+            discovered.extend(sorted(audio_dir_lp.glob(f"*{ext.upper()}")))
+        local_audio_candidates.extend(str(p) for p in discovered)
+
+    local_audio_path = _pick_existing_path(*local_audio_candidates)
+    local_audio_name = Path(local_audio_path).name if local_audio_path else ""
+
+    server_audio_path = ""
+    for src in [
+        infos_pc.get("fichier_audio_source"),
+        infos_pc.get("audio_compat_source"),
+        infos_pc.get("fichier_audio_compatible"),
+    ]:
+        if src:
+            server_audio_path = str(Path(src))
+            break
+    if not server_audio_path and audio_dir_pc and local_audio_name:
+        server_audio_path = str(audio_dir_pc / local_audio_name)
+
+    canonical_proper_names_lp = trans_dir_lp / f"{affaire_id}_proper_names.txt"
+    canonical_proper_names_pc = (trans_dir_pc / f"{affaire_id}_proper_names.txt") if trans_dir_pc else None
+
+    proper_names_local_path = _pick_existing_path(
+        canonical_proper_names_lp,
+        infos.get("proper_names_file"),
+        infos_pc.get("proper_names_file"),
+    )
+    proper_names_server_path = str(canonical_proper_names_pc) if canonical_proper_names_pc else ""
+    if proper_names_server_path and not Path(proper_names_server_path).exists():
+        proper_names_server_path = infos_pc.get("proper_names_file") or proper_names_server_path
+
+    boost_candidates = [
+        Path(r"C:\LLM_Assistant\config\boost_vocab.txt"),
+        Path(r"C:\CodexWorkspace\LLM_Assistant\config\boost_vocab.txt"),
+        Path(r"\\192.168.0.155\GPT4All_Local\config\boost_vocab.txt"),
+        Path(r"D:\GPT4All_Local\config\boost_vocab.txt"),
+        Path(infos_pc.get("boost_file") or "") if infos_pc.get("boost_file") else None,
+    ]
+    boost_local_path = _pick_existing_path(*boost_candidates)
+    boost_server_path = infos_pc.get("boost_file") or str(Path(r"\\192.168.0.155\GPT4All_Local\config\boost_vocab.txt"))
+
+    proper_names_lines = _read_text_list_file(proper_names_local_path)
+    boost_lines = _read_text_list_file(boost_local_path)
+
+    return {
+        "infos_path_laptop": str(infos_lp_path),
+        "infos_exists": infos_lp_path.exists(),
+        "infos": infos,
+        "audio_dir_laptop": str(audio_dir_lp),
+        "audio_dir_pcfixe": str(audio_dir_pc) if audio_dir_pc else "",
+        "trans_dir_laptop": str(trans_dir_lp),
+        "trans_dir_pcfixe": str(trans_dir_pc) if trans_dir_pc else "",
+        "server_audio_path": server_audio_path,
+        "local_audio_path": local_audio_path,
+        "proper_names_local_path": proper_names_local_path,
+        "proper_names_server_path": proper_names_server_path,
+        "proper_names_exists": bool(proper_names_local_path),
+        "boost_local_path": boost_local_path,
+        "boost_server_path": boost_server_path,
+        "boost_exists": bool(boost_local_path),
+        "auto_vocab_lines": _dedupe_keep_order(proper_names_lines + boost_lines),
+    }
+
 def normalize_photos_csv_for_laptop(
     photos_csv,
     id_affaire,
@@ -2144,7 +2277,8 @@ elif page == "Voxtral (ASR / CR)":
 
     # Chemins projet depuis la config
     proj_pcfixe = (project_config.get("roots") or {}).get("pcfixe") or ""
-    proj_laptop = pj(AFFAIRES_ROOT, get_project_id(project_config, ""))
+    affaire_id = get_project_id(project_config, "")
+    proj_laptop = pj(AFFAIRES_ROOT, affaire_id)
 
     pcfixe_root = proj_pcfixe
     laptop_root = proj_laptop
@@ -2157,6 +2291,32 @@ elif page == "Voxtral (ASR / CR)":
     except Exception:
         asr_list = []
     asr_model_key = st.selectbox("Modèle ASR", asr_list or asr_models or ["Voxtral_Mini_3B_Transformers"])
+
+    captations = list_captations(affaire_id) if affaire_id else []
+    captation_options = ["(aucune)"] + [c["id_captation"] for c in captations]
+    selected_captation = st.selectbox("Captation liÃ©e Ã  l'ASR", captation_options, index=0)
+    asr_ctx = {}
+    if selected_captation != "(aucune)":
+        asr_ctx = resolve_asr_captation_context(project_config, affaire_id, selected_captation)
+        st.caption(f"Audio canonique PC fixe: {asr_ctx.get('audio_dir_pcfixe')}")
+        st.caption(f"Sortie canonique transcription: {asr_ctx.get('trans_dir_pcfixe')}")
+        if asr_ctx.get("infos_exists"):
+            st.caption(f"infos_projet.json dÃ©tectÃ©: {asr_ctx.get('infos_path_laptop')}")
+        else:
+            st.warning("`infos_projet.json` non dÃ©tectÃ© pour cette captation; repli sur l'arborescence canonique.")
+
+        col_auto = st.columns(2)
+        with col_auto[0]:
+            st.text_input("Audio source rÃ©solu (PC fixe)", value=asr_ctx.get("server_audio_path", ""), disabled=True)
+            st.text_input("Proper names attendu (PC fixe)", value=asr_ctx.get("proper_names_server_path", ""), disabled=True)
+        with col_auto[1]:
+            st.text_input("Sortie transcription cible (PC fixe)", value=asr_ctx.get("trans_dir_pcfixe", ""), disabled=True)
+            st.text_input("Boost vocab par dÃ©faut", value=asr_ctx.get("boost_server_path", ""), disabled=True)
+
+        if asr_ctx.get("auto_vocab_lines"):
+            st.caption(f"Vocabulaire auto injectÃ©: {len(asr_ctx['auto_vocab_lines'])} terme(s) depuis `proper_names`/`boost_vocab`.")
+        else:
+            st.caption("Aucun vocabulaire auto lisible localement pour cette captation.")
 
     # ===== Diarisation (unique) =====
     st.markdown("### 📓 Noms propres, glossaires & alias locuteurs")
@@ -2278,6 +2438,8 @@ elif page == "Voxtral (ASR / CR)":
 
             # 2) Par défaut: chemin local lu par le serveur (sous-dossier ASR_In du projet PC fixe)
             server_audio_path = build_server_local_path(proj_pcfixe, sub_in, filename)
+            if asr_ctx.get("audio_dir_pcfixe"):
+                server_audio_path = str(Path(asr_ctx["audio_dir_pcfixe"]) / filename)
 
             # 3) Si un UNC est fourni, on pousse aussi dessus et on l'utilise comme audio_path
             if share_unc.strip():
@@ -2294,6 +2456,9 @@ elif page == "Voxtral (ASR / CR)":
             if st.button("🎧 Transcrire le média déposé"):
                 if not ensure_ready():
                     st.error("❌ Serveur injoignable après WOL"); st.stop()
+                # Le serveur rÃ©sout `asr_transcriptions` au niveau affaire via `project_id`,
+                # mais pas le sous-niveau `{id_captation}`: on force donc le dossier canonique ici.
+                resolved_output_dir = asr_ctx.get("trans_dir_pcfixe") or ""
                 payload = {
                     "audio_path": server_audio_path,
                     "model_key": asr_model_key,
@@ -2309,12 +2474,15 @@ elif page == "Voxtral (ASR / CR)":
                     "project_id": get_project_id(project_config, ""),             
                 }
 
-                if use_output_override:
+                if resolved_output_dir:
+                    payload["output_csv_dir"] = resolved_output_dir
+                elif use_output_override:
                     payload["output_csv_dir"] = build_server_local_path(proj_pcfixe, sub_out, "")
 
                 
                 # Noms / glossaire / alias locuteurs
                 names_list = [l.strip() for l in (names_text or "").splitlines() if l.strip()]
+                names_list = _dedupe_keep_order(names_list + list(asr_ctx.get("auto_vocab_lines") or []))
                 if names_list: payload["vocab_hint"] = names_list
                 if glossary_path.strip(): payload["glossary_path"] = glossary_path.strip()
                 if speaker_rules_path.strip(): payload["speaker_rules_path"] = speaker_rules_path.strip()
@@ -2342,7 +2510,7 @@ elif page == "Voxtral (ASR / CR)":
                 # Récup résultats via UNC (si dispo)
                 st.markdown("---")
                 st.markdown("### ⬇️ Récupération des résultats (PC fixe → laptop)")
-                laptop_out_dir = pj("\\".join([proj_laptop, sub_out]))
+                laptop_out_dir = asr_ctx.get("trans_dir_laptop") or pj("\\".join([proj_laptop, sub_out]))
                 unc_out_dir = st.text_input("UNC sorties (serveur)", value=share_unc if share_unc.strip() else "")
                 if st.button("📥 Copier résultats (CSV/DOCX/SRT/VTT) → laptop"):
                     try:
@@ -2362,6 +2530,7 @@ elif page == "Voxtral (ASR / CR)":
 
             if st.button("🧾 Générer CR via /voxtral_chat"):
                 names_list = [l.strip() for l in (names_text or "").splitlines() if l.strip()]
+                names_list = _dedupe_keep_order(names_list + list(asr_ctx.get("auto_vocab_lines") or []))
                 payload = {
                     "mode": "summarize",
                     "csv_path": csv_for_chat,
@@ -2375,7 +2544,9 @@ elif page == "Voxtral (ASR / CR)":
                     "excel_decimal":  excel_dec,
                     "project_id": get_project_id(project_config, ""),                    
                 }
-                if use_output_override:
+                if asr_ctx.get("trans_dir_pcfixe"):
+                    payload["output_csv_dir"] = asr_ctx["trans_dir_pcfixe"]
+                elif use_output_override:
                     payload["output_csv_dir"] = build_server_local_path(proj_pcfixe, sub_out, "")
                 elif (csv_out_cr or "").strip():
                     payload["output_csv_dir"] = csv_out_cr.strip()
@@ -2394,8 +2565,10 @@ elif page == "Voxtral (ASR / CR)":
         if st.button("🎧 Transcrire (CSV)"):
             if not ensure_ready():
                 st.error("❌ Serveur injoignable après WOL"); st.stop()
+            # `project_id` seul ne suffit pas Ã  descendre jusqu'Ã  `{id_captation}`.
+            resolved_output_dir = asr_ctx.get("trans_dir_pcfixe") or ""
             payload = {
-                "audio_path": media,
+                "audio_path": asr_ctx.get("server_audio_path") or media,
                 "model_key": asr_model_key,
                 "timestamps": bool(timestamps),
                 "lang": lang_asr or None,
@@ -2405,13 +2578,16 @@ elif page == "Voxtral (ASR / CR)":
                 "export_chat_docx": False,
                 "project_id": get_project_id(project_config, ""),
             }
-            if use_output_override:
+            if resolved_output_dir:
+                payload["output_csv_dir"] = resolved_output_dir
+            elif use_output_override:
                 payload["output_csv_dir"] = build_server_local_path(proj_pcfixe, sub_out, "")
             elif (csv_dir or "").strip():
                 payload["output_csv_dir"] = csv_dir.strip()
 
             # — noms propres en liste
             names_list = [l.strip() for l in (names_text or "").splitlines() if l.strip()]
+            names_list = _dedupe_keep_order(names_list + list(asr_ctx.get("auto_vocab_lines") or []))
             if names_list:
                 payload["vocab_hint"] = names_list
 
@@ -2452,7 +2628,7 @@ elif page == "Voxtral (ASR / CR)":
                 )
 
             # miroir des sorties côté PC -> laptop
-            asr_out_pc = pj(pcfixe_root, project_config.get("asr_out_subdir","ASR_Out"))
+            asr_out_pc = resolved_output_dir or pj(pcfixe_root, project_config.get("asr_out_subdir","ASR_Out"))
             produced = [str(p) for p in Path(asr_out_pc).glob("*.*")]
             mirror_results_asr(pcfixe_root, laptop_root, project_config, produced, push_csv_to_vec=True)
             st.success("✅ Résultats ASR répliqués (Laptop\\RAG_Vectoriel [+ PCfixe\\RAG_Vectoriel]).")
@@ -2500,8 +2676,10 @@ elif page == "Voxtral (ASR / CR)":
                 st.error("❌ Serveur injoignable après WOL"); st.stop()
 
             # 0) payload minimal
+            # MÃªme ciblage canonique pour les sorties de CR dÃ©rivÃ©es de l'ASR.
+            resolved_output_dir = asr_ctx.get("trans_dir_pcfixe") or ""
             payload = {
-                "audio_path": media,
+                "audio_path": asr_ctx.get("server_audio_path") or media,
                 "model_key": asr_model_key,
                 "export_chat_csv": True,
                 "export_chat_docx": True,
@@ -2513,7 +2691,9 @@ elif page == "Voxtral (ASR / CR)":
                 "project_id": get_project_id(project_config, ""),               
             }
 
-            if use_output_override:
+            if resolved_output_dir:
+                payload["output_csv_dir"] = resolved_output_dir
+            elif use_output_override:
                 payload["output_csv_dir"] = build_server_local_path(proj_pcfixe, sub_out, "")  
             elif also_csv and (csv_dir2 or "").strip():
                 payload["output_csv_dir"] = csv_dir2.strip()          
@@ -2529,6 +2709,7 @@ elif page == "Voxtral (ASR / CR)":
 
             # hints/glossaire/alias + templates CR
             names_list = [l.strip() for l in (names_text or "").splitlines() if l.strip()]
+            names_list = _dedupe_keep_order(names_list + list(asr_ctx.get("auto_vocab_lines") or []))
             if names_list: payload["vocab_hint"] = names_list
             if glossary_path.strip(): payload["glossary_path"] = glossary_path.strip()
             if speaker_rules_path.strip(): payload["speaker_rules_path"] = speaker_rules_path.strip()
@@ -2545,7 +2726,7 @@ elif page == "Voxtral (ASR / CR)":
             st.write(res)
 
             # 8) miroir sorties
-            asr_out_pc = pj(pcfixe_root, project_config.get("asr_out_subdir","ASR_Out"))
+            asr_out_pc = resolved_output_dir or pj(pcfixe_root, project_config.get("asr_out_subdir","ASR_Out"))
             produced = [str(p) for p in Path(asr_out_pc).glob("*.*")]
             mirror_results_asr(pcfixe_root, laptop_root, project_config, produced, push_csv_to_vec=True)
             st.success("✅ Résultats ASR répliqués (Laptop\\RAG_Vectoriel [+ PCfixe\\RAG_Vectoriel]).")
