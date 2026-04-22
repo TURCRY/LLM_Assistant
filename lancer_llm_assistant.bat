@@ -1,13 +1,17 @@
 @echo off
 title LLM_Assistant - Streamlit
 
-REM === Adaptation du chemin du projet ===
-cd /d "C:\LLM_Assistant"
+REM === Se placer dans le dossier du projet ===
+cd /d "%~dp0"
 
-REM === (Optionnel) activer un environnement virtuel ===
-REM call venv\Scripts\activate.bat
+REM === Vérifier l'environnement virtuel ===
+if not exist ".venv\Scripts\python.exe" (
+  echo ERREUR: environnement virtuel introuvable : %cd%\.venv\Scripts\python.exe
+  pause
+  exit /b 1
+)
 
 REM === Lancer Streamlit ===
-streamlit run app.py
+.venv\Scripts\python.exe -m streamlit run app.py
 
 pause
