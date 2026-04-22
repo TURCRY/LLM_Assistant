@@ -943,12 +943,66 @@ def _read_text_list_file(path: str | Path | None) -> list[str]:
     except Exception:
         return []
 
+def _resolve_local_user_profile_path(path_value: str | Path | None) -> str:
+    raw = str(path_value or "").strip()
+    if not raw or raw.startswith("\\\\"):
+        return raw
+
+    normalized = os.path.normpath(raw.replace("/", "\\"))
+    if Path(normalized).exists():
+        return normalized
+
+    match = re.match(r"^(?P<drive>[A-Za-z]:)\\Users\\[^\\]+(?:\\(?P<rest>.*))?$", normalized, re.IGNORECASE)
+    if not match:
+        return raw
+
+    user_home = Path(os.environ.get("USERPROFILE") or Path.home())
+    user_docs = user_home / "Documents"
+    rest = match.group("rest") or ""
+    rest_lower = rest.lower()
+
+    if rest_lower == "documents" or rest_lower.startswith("documents\\"):
+        suffix = rest[10:] if len(rest) > 10 else ""
+        candidate = user_docs / suffix if suffix else user_docs
+    else:
+        candidate = user_home / rest if rest else user_home
+
+    candidate_str = os.path.normpath(str(candidate))
+    return candidate_str if Path(candidate_str).exists() else raw
+
+
+def _migrate_infos_local_paths(data):
+    changed = False
+
+    if isinstance(data, dict):
+        migrated = {}
+        for key, value in data.items():
+            new_value, item_changed = _migrate_infos_local_paths(value)
+            migrated[key] = new_value
+            changed = changed or item_changed
+        return migrated, changed
+
+    if isinstance(data, list):
+        migrated = []
+        for value in data:
+            new_value, item_changed = _migrate_infos_local_paths(value)
+            migrated.append(new_value)
+            changed = changed or item_changed
+        return migrated, changed
+
+    if isinstance(data, str):
+        resolved = _resolve_local_user_profile_path(data)
+        return resolved, resolved != data
+
+    return data, False
+
+
 def _pick_existing_path(*candidates: str | Path | None) -> str:
     for candidate in candidates:
         if not candidate:
             continue
         try:
-            p = Path(candidate)
+            p = Path(_resolve_local_user_profile_path(candidate))
             if p.exists():
                 return str(p)
         except Exception:
@@ -980,6 +1034,9 @@ def resolve_asr_captation_context(project_config: dict, affaire_id: str, id_capt
 
     infos_lp_path = trans_dir_lp / "infos_projet.json"
     infos = load_json(str(infos_lp_path), {}) if infos_lp_path.exists() else {}
+    infos, infos_changed = _migrate_infos_local_paths(infos)
+    if infos_changed and infos_lp_path.exists():
+        save_json(str(infos_lp_path), infos)
     infos_pc = infos.get("pcfixe", {}) if isinstance(infos.get("pcfixe"), dict) else {}
 
     local_audio_candidates = []

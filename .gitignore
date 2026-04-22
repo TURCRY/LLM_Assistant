@@ -17,6 +17,14 @@ config/.env
 *.secret
 
 ########################################
+# Environnements virtuels
+########################################
+.venv/
+venv/
+env/
+
+
+########################################
 # IDE / OS
 ########################################
 .vscode/
@@ -38,6 +46,9 @@ Thumbs.db
 ########################################
 temp/
 data/
+
+!data/*.example.json
+!data/README_data.md
 
 ########################################
 # Médias et fichiers lourds locaux
@@ -61,6 +72,13 @@ data/
 scripts/__pycache__/
 tools/**/__pycache__/
 utils/__pycache__/
+
+# caches Python supplémentaires
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+
 
 ########################################
 # Fichiers métier à conserver
