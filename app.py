@@ -140,7 +140,7 @@ else:
     WEBHOOK_URL = ""
 
 SEED_SCRIPT = r"C:\LLM_Assistant\tools\sync\seed_captation.py"
-ROOT_DST_DEFAULT = r"\\192.168.1.20\volume1\Affaires"
+ROOT_DST_DEFAULT = r"\\192.168.1.20\Affaires"
 AFFAIRES_ROOT = Path(r"C:\Affaires")
 
 
@@ -587,6 +587,69 @@ def req(path: str, payload=None, method="POST", timeout=600):
     return r.json()
 
 
+def _normalize_nas_affaire_root(aff_id: str, nas_root_unc: str | None) -> str:
+    nas_root_unc = (nas_root_unc or "").strip()
+    if not nas_root_unc:
+        nas_root_unc = pj(ROOT_DST_DEFAULT, aff_id)
+
+    nas_root = Path(nas_root_unc.rstrip("\\/"))
+    if nas_root.name.lower() != aff_id.lower() and nas_root.name.lower() == "affaires":
+        nas_root = nas_root / aff_id
+    return str(nas_root)
+
+
+def effective_nas_affaire_root(cfg: dict | None, aff_id: str) -> str:
+    """Return an UNC NAS affaire root, even if legacy cfg.roots.nas is local."""
+    raw = (((cfg or {}).get("roots") or {}).get("nas") or "").strip()
+    if not raw.startswith("\\\\"):
+        return pj(ROOT_DST_DEFAULT, aff_id)
+
+    root = raw.rstrip("\\/ ")
+    tail = root.strip("\\").split("\\")[-1].lower() if root.strip("\\") else ""
+    if tail == aff_id.lower():
+        return root
+    if tail == "affaires":
+        return pj(root, aff_id)
+    return root
+
+
+def split_pdf_job_with_nas_mirror(job: dict, cfg: dict | None, aff_id: str) -> dict:
+    out = dict(job or {})
+    project_id = out.get("project_id") or aff_id
+    out["project_id"] = project_id
+    out["mirror_to_nas"] = True
+
+    if not out.get("output_dir_nas"):
+        nas_root = effective_nas_affaire_root(cfg, project_id)
+        output_dir = str(out.get("output_dir") or "").rstrip("\\/ ")
+        pc_root = ((((cfg or {}).get("roots") or {}).get("pcfixe") or "")).rstrip("\\/ ")
+        output_dir_nas = pj(nas_root, "AD_Expert_Traitements", "_Splits")
+        if pc_root and output_dir.lower().startswith(pc_root.lower()):
+            rel_out = output_dir[len(pc_root):].lstrip("\\/")
+            output_dir_nas = pj(nas_root, rel_out) if rel_out else nas_root
+        out["output_dir_nas"] = output_dir_nas
+
+    return out
+
+
+def split_pdf_batch_payload_with_nas_mirror(
+    payload: dict,
+    cfg: dict | None,
+    aff_id: str,
+    force_dry_run: bool | None = None,
+) -> dict:
+    jobs = []
+    for job in (payload or {}).get("jobs", []) or []:
+        next_job = split_pdf_job_with_nas_mirror(job, cfg, aff_id)
+        if force_dry_run is not None:
+            next_job["dry_run"] = bool(force_dry_run)
+        jobs.append(next_job)
+    return {
+        "jobs": jobs,
+        "stop_on_error": bool((payload or {}).get("stop_on_error", False)),
+    }
+
+
 def _project_index_entry(aff_id: str) -> dict | None:
     """
     Retourne l'entrée locale d'index si elle existe.
@@ -893,7 +956,7 @@ from pathlib import Path
 import streamlit as st
 
 SEED_SCRIPT = r"C:\LLM_Assistant\tools\sync\seed_captation.py"
-ROOT_DST_DEFAULT = r"\\192.168.1.20\volume1\Affaires"
+ROOT_DST_DEFAULT = r"\\192.168.1.20\Affaires"
 AFFAIRES_ROOT = Path(r"C:\Affaires")
 
 
@@ -2959,6 +3022,16 @@ elif page == "Pré-traitement dépôt PDF":
     code_partie = st.text_input("Code partie (ex: 03)", value="")
     prefix      = st.text_input("Préfixe n° avocat", value="PIECE")
     project_id  = get_project_id(project_config)
+    nas_affaire_root = effective_nas_affaire_root(project_config, project_id)
+    output_dir_nas = pj(nas_affaire_root, "AD_Expert_Traitements", "_Splits")
+    try:
+        pc_root = str(proj_pcfixe or "").rstrip("\\/ ")
+        out_root = str(output_dir or "").rstrip("\\/ ")
+        if pc_root and out_root.lower().startswith(pc_root.lower()):
+            rel_out = out_root[len(pc_root):].lstrip("\\/")
+            output_dir_nas = pj(nas_affaire_root, rel_out) if rel_out else nas_affaire_root
+    except Exception:
+        pass
 
     # =====================================================
 
@@ -3129,8 +3202,10 @@ elif page == "Pré-traitement dépôt PDF":
             "project_id": affaire_id,
             "rel_input": "queue_ocr",   # ou chemin absolu si vous préférez
             "rel_output": "splits",
+            "output_dir_nas": output_dir_nas,
             "pieces": pieces,
-            "dry_run": True
+            "dry_run": True,
+            "mirror_to_nas": True
         }
 
         r = requests.post(
@@ -3153,9 +3228,11 @@ elif page == "Pré-traitement dépôt PDF":
             "project_id": affaire_id,
             "rel_input": "queue_ocr",
             "rel_output": "splits",
+            "output_dir_nas": output_dir_nas,
             "pieces": pieces,
             "dry_run": False,
-            "overwrite": False
+            "overwrite": False,
+            "mirror_to_nas": True
         }
 
         r = requests.post(
@@ -3355,10 +3432,12 @@ elif page == "Pré-traitement dépôt PDF":
             c = st.columns(2)
             with c[0]:
                 if st.button("🧪 Simuler tout (dry-run forcé)"):
-                    sim = {"jobs": [], "stop_on_error": False}
-                    for j in st.session_state.guided_jobs:
-                        j2 = dict(j); j2["dry_run"] = True
-                        sim["jobs"].append(j2)
+                    sim = split_pdf_batch_payload_with_nas_mirror(
+                        {"jobs": st.session_state.guided_jobs, "stop_on_error": False},
+                        project_config,
+                        get_project_id(project_config, ""),
+                        force_dry_run=True,
+                    )
                     if not ensure_server_ready(MAC_PCFIXE, SERVER_IP, int(SERVER_PORT)):
                         st.error("Serveur KO"); st.stop()
                     r = requests.post(f"{SERVER_URL}/api/split_pdf_batch",
@@ -3367,7 +3446,11 @@ elif page == "Pré-traitement dépôt PDF":
 
             with c[1]:
                 if st.button("✂️ Exécuter le batch (respecte dry-run par job)"):
-                    payload = {"jobs": st.session_state.guided_jobs, "stop_on_error": False}
+                    payload = split_pdf_batch_payload_with_nas_mirror(
+                        {"jobs": st.session_state.guided_jobs, "stop_on_error": False},
+                        project_config,
+                        get_project_id(project_config, ""),
+                    )
                     if not ensure_server_ready(MAC_PCFIXE, SERVER_IP, int(SERVER_PORT)):
                         st.error("Serveur KO"); st.stop()
                     r = requests.post(f"{SERVER_URL}/api/split_pdf_batch",
@@ -3472,11 +3555,12 @@ with colb1:
             st.warning("Charge d'abord un JSON de jobs.")
         else:
             # on force dry_run=True job par job pour une simulation globale
-            sim_data = {"jobs": [], "stop_on_error": bool(batch_data.get("stop_on_error", False))}
-            for j in batch_data["jobs"]:
-                j2 = dict(j)
-                j2["dry_run"] = True
-                sim_data["jobs"].append(j2)
+            sim_data = split_pdf_batch_payload_with_nas_mirror(
+                batch_data,
+                project_config,
+                get_project_id(project_config, ""),
+                force_dry_run=True,
+            )
             if not ensure_ready():
                 st.error("❌ Serveur injoignable après WOL"); st.stop()
             try:
@@ -3505,9 +3589,14 @@ with colb2:
                 st.error("❌ Serveur injoignable après WOL"); st.stop()
             try:
                 with st.spinner("Découpage batch en cours..."):
+                    payload = split_pdf_batch_payload_with_nas_mirror(
+                        batch_data,
+                        project_config,
+                        get_project_id(project_config, ""),
+                    )
                     r = requests.post(f"{SERVER_URL}/api/split_pdf_batch",
                                       headers={"x-api-key": API_KEY},
-                                      json=batch_data, timeout= max( timeout, 600 ))
+                                      json=payload, timeout= max( timeout, 600 ))
                 if r.status_code == 200:
                     res = r.json()
                     # rendu lisible : récap par fichier
@@ -3593,7 +3682,7 @@ if gen_btn:
                     }]
                 else:
                     pieces = []  # squelette à compléter plus tard
-                jobs.append({
+                jobs.append(split_pdf_job_with_nas_mirror({
                     "input_path": p,
                     "output_dir": out_dir,
                     "code_partie": code_partie_default,
@@ -3603,7 +3692,7 @@ if gen_btn:
                     "project_id": project_id_default,
                     "pieces": pieces,
                     "dry_run": True
-                })
+                }, project_config, project_id_default))
             batch_preview = {"jobs": jobs, "stop_on_error": stop_on_error_default}
             # Aperçu synthétique
             st.markdown("### Aperçu (synthèse)")
