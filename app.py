@@ -1,4 +1,4 @@
-﻿# app_v1_1.py - Version nettoyée, modulaire et fonctionnelle
+# app_v1_1.py - Version nettoyée, modulaire et fonctionnelle
 from __future__ import annotations
 
 import socket
@@ -8375,1154 +8375,1161 @@ if batch_preview:
     st.info("Tu peux charger ce JSON juste au-dessus dans 'Traitement en lot (batch)' ➜ 'Simuler tout le lot (dry-run forcé)'.\n"
             "Ensuite, édite le JSON pour compléter les 'pieces' (start_page/title) et repasse en exécution réelle.")
 # ================== FIN GENERATEUR BATCH ==================
-current_pdf_cohort = current_pdf_cohort if "current_pdf_cohort" in locals() else {}
-st.markdown("### 📤 Classement des originaux et dépôt technique")
-if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("uploads"):
-    uploaded_files = list((current_pdf_cohort.get("uploads") or {}).values())
-    st.info(f"Fichiers utilisés : cohorte courante ({len(uploaded_files)} fichier(s)).")
-else:
-    uploaded_files = st.file_uploader(
-        "Dépose tes fichiers ici",
-        type=["pdf", "docx", "txt", "jpg", "jpeg", "png", "tif", "tiff"],
-        accept_multiple_files=True,
-    )
-st.caption("Images acceptées comme pièces : jpg, jpeg, png, tif, tiff. HEIC non proposé ici.")
 
-party_options = [juridiction_record()] + [
-    p for p in (existing_parties or [])
-    if (p.get("folder_rel") or "").strip()
-]
-selected_party = None
-if party_options:
-    default_party_index = 0
-    if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("code_partie"):
-        for i, party in enumerate(party_options):
-            if party_code(party.get("code_partie")) == current_pdf_cohort.get("code_partie"):
-                default_party_index = i
-                break
-    selected_party = st.selectbox(
-        "Partie cible",
-        party_options,
-        format_func=source_code_label,
-        index=default_party_index,
+def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None = None) -> None:
+    current_pdf_cohort = current_pdf_cohort or {}
+    st.markdown("### 📤 Classement des originaux et dépôt technique")
+    if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("uploads"):
+        uploaded_files = list((current_pdf_cohort.get("uploads") or {}).values())
+        st.info(f"Fichiers utilisés : cohorte courante ({len(uploaded_files)} fichier(s)).")
+    else:
+        uploaded_files = st.file_uploader(
+            "Dépose tes fichiers ici",
+            type=["pdf", "docx", "txt", "jpg", "jpeg", "png", "tif", "tiff"],
+            accept_multiple_files=True,
         )
-
-with st.expander("Ingestion des pièces d'une partie", expanded=False):
-    st.text_input("Affaire", value=get_project_id(project_config, ""), disabled=True)
-    source_summary = load_transmission_source_summary(aff_root_local, project_config)
-    with st.expander("Synthèse des transmissions documentaires", expanded=False):
-        st.json({
-            "documents reçus des parties": source_summary.get("documents_recus_des_parties", 0),
-            "documents reçus de la juridiction": source_summary.get("documents_recus_de_la_juridiction", 0),
-        })
-    ingestion_party = None
+    st.caption("Images acceptées comme pièces : jpg, jpeg, png, tif, tiff. HEIC non proposé ici.")
+    
+    party_options = [juridiction_record()] + [
+        p for p in (existing_parties or [])
+        if (p.get("folder_rel") or "").strip()
+    ]
+    selected_party = None
     if party_options:
-        default_ingestion_party_index = 0
+        default_party_index = 0
         if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("code_partie"):
             for i, party in enumerate(party_options):
                 if party_code(party.get("code_partie")) == current_pdf_cohort.get("code_partie"):
-                    default_ingestion_party_index = i
+                    default_party_index = i
                     break
-        ingestion_party = st.selectbox(
-            "Partie",
+        selected_party = st.selectbox(
+            "Partie cible",
             party_options,
             format_func=source_code_label,
-            index=default_ingestion_party_index,
-            key="ingestion_party",
-        )
-    else:
-        st.warning("Aucune partie avec dossier cible n'est disponible.")
-
-    col_tx_1, col_tx_2 = st.columns(2)
-    with col_tx_1:
-        date_transmission_expert = st.date_input(
-            "Date de transmission à l'expert",
-            value=date.fromisoformat(current_pdf_cohort.get("date_transmission")) if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("date_transmission") else date.today(),
-            key="ingestion_date_transmission_expert",
-        )
-        type_transmission = st.selectbox(
-            "Type de transmission",
-            ["lettre", "dire", "BCP", "production complémentaire", "autre"],
-            key="ingestion_type_transmission",
-        )
-    with col_tx_2:
-        auteur_transmission = st.text_input("Auteur / conseil", value=current_pdf_cohort.get("avocat", "") if page == "Pré-traitement dépôt PDF" else "", key="ingestion_auteur_transmission")
-        reference_transmission = st.text_input("Référence", value="", key="ingestion_reference_transmission")
-    commentaire_transmission = st.text_area("Commentaire", value="", key="ingestion_commentaire_transmission")
-
-    source_dir = st.text_input("Dossier source (métadonnée de traçabilité)", value="", key="ingestion_source_dir")
-    uploaded_by_name = {}
-    for file_obj in uploaded_files or []:
-        name = Path(file_obj.name).name
-        if name and name not in uploaded_by_name:
-            uploaded_by_name[name] = file_obj
-
-    file_labels = sorted(uploaded_by_name.keys(), key=str.lower)
-    image_suffixes = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
-    non_image_file_labels = [name for name in file_labels if Path(name).suffix.lower() not in image_suffixes]
-    if not file_labels:
-        st.warning("Aucun fichier déposé. L'ingestion documentaire ne propose que les fichiers explicitement déposés dans la zone d'upload.")
-
-    force_image_as_source = st.checkbox(
-        "Autoriser une image comme lettre/dire ou BCP",
-        value=False,
-        key="ingestion_allow_image_as_source",
-    )
-    source_file_labels = file_labels if force_image_as_source else non_image_file_labels
-    col_ing_1, col_ing_2 = st.columns(2)
-    with col_ing_1:
-        dire_name = st.selectbox("Lettre / dire", ["(aucun)"] + source_file_labels, key="ingestion_dire")
-        bcp_name = st.selectbox("BCP", ["(aucun)"] + source_file_labels, key="ingestion_bcp")
-    with col_ing_2:
-        piece_names = st.multiselect("Fichiers de pièces", file_labels, key="ingestion_pieces")
-        multi_pdf_name = st.selectbox("PDF unique multi-pièces", ["(aucun)"] + file_labels, key="ingestion_multi_pdf")
-
-    selected_names = []
-    for name in [dire_name, bcp_name, multi_pdf_name, *piece_names]:
-        if name and name != "(aucun)" and name not in selected_names:
-            selected_names.append(name)
-    selected_uploads = [uploaded_by_name[name] for name in selected_names if name in uploaded_by_name]
-    selected_document_roles = build_ingestion_document_roles(dire_name, bcp_name, piece_names, multi_pdf_name)
-
-    if st.button("Valider le dépôt documentaire et copier les originaux", key="ingestion_copy_originals"):
-        if not ingestion_party:
-            st.error("Choisir une partie.")
-        elif not file_labels:
-            st.error("Déposer au moins un fichier dans la zone d'upload.")
-        elif not date_transmission_expert:
-            st.error("Renseigner la date de transmission à l'expert.")
-        elif not type_transmission:
-            st.error("Renseigner le type de transmission.")
-        elif not auteur_transmission.strip():
-            st.error("Renseigner l'auteur ou le conseil.")
-        elif not selected_uploads:
-            st.error("Choisir au moins un fichier parmi les fichiers déposés.")
+            index=default_party_index,
+            )
+    
+    with st.expander("Ingestion des pièces d'une partie", expanded=False):
+        st.text_input("Affaire", value=get_project_id(project_config, ""), disabled=True)
+        source_summary = load_transmission_source_summary(aff_root_local, project_config)
+        with st.expander("Synthèse des transmissions documentaires", expanded=False):
+            st.json({
+                "documents reçus des parties": source_summary.get("documents_recus_des_parties", 0),
+                "documents reçus de la juridiction": source_summary.get("documents_recus_de_la_juridiction", 0),
+            })
+        ingestion_party = None
+        if party_options:
+            default_ingestion_party_index = 0
+            if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("code_partie"):
+                for i, party in enumerate(party_options):
+                    if party_code(party.get("code_partie")) == current_pdf_cohort.get("code_partie"):
+                        default_ingestion_party_index = i
+                        break
+            ingestion_party = st.selectbox(
+                "Partie",
+                party_options,
+                format_func=source_code_label,
+                index=default_ingestion_party_index,
+                key="ingestion_party",
+            )
         else:
-            try:
-                transmission_id = make_transmission_id(get_project_id(project_config, ""))
-                transmission_meta = {
-                    "transmission_id": transmission_id,
-                    "date_transmission_expert": date_transmission_expert.isoformat(),
-                    "type_transmission": type_transmission,
-                    "auteur_transmission": auteur_transmission.strip(),
-                    "reference": reference_transmission.strip(),
-                    "commentaire": commentaire_transmission.strip(),
-                    "dossier_source": source_dir,
-                }
-                event = copy_ingestion_uploaded_originals(
-                    aff_root_local,
-                    get_project_id(project_config, ""),
-                    ingestion_party,
-                    selected_uploads,
-                    transmission_meta,
-                    project_config,
-                    selected_document_roles,
-                )
-                st.session_state["last_ingestion_event"] = event
-                st.session_state["last_transmission_id"] = event.get("transmission_id")
-                st.session_state["ingestion_local_original_paths"] = {
-                    item.get("name") or Path(item.get("destination", "")).name: item.get("destination")
-                    for item in event.get("copied", [])
-                    if item.get("destination")
-                }
-                st.success(f"{len(event.get('copied', []))} original/originaux copié(s).")
-                st.info(f"transmission_id : {event.get('transmission_id')}")
-                st.info(f"Journal transmissions : {event.get('transmissions_journal_path')}")
-                if event.get("skipped"):
-                    st.warning(f"{len(event['skipped'])} fichier(s) non copié(s), voir le journal.")
-                if event.get("errors"):
-                    st.error(f"{len(event['errors'])} erreur(s) pendant la copie, voir le journal.")
-                st.json(event)
-            except Exception as e:
-                st.error(f"Erreur ingestion : {e}")
-
-    folder_rel_ing = (ingestion_party or {}).get("folder_rel", "")
-    proj_pcfixe_ing = pcfixe_local_root_for_server(
-        project_config,
-        get_project_id(project_config, ""),
-    )
-    ocr_out_ing = pj(proj_pcfixe_ing, "AD_Expert_Traitements", "_OCR_Texte")
-
-    st.markdown("#### OCR ciblé lettre/dire et BCP")
-    ocr_targets = []
-    uploaded_ocr_paths = st.session_state.get("ingestion_server_ocr_paths", {})
-    forced_image_ocr_sources = []
-    if dire_name != "(aucun)" and folder_rel_ing:
-        if Path(dire_name).suffix.lower() in image_suffixes:
-            forced_image_ocr_sources.append(dire_name)
-        resolved = resolve_ingestion_server_file(project_config, folder_rel_ing, dire_name)
-        if uploaded_ocr_paths.get(dire_name):
-            resolved = {
-                "ok": True,
-                "path": uploaded_ocr_paths[dire_name],
-                "local_path": resolved.get("local_path"),
-                "candidates": resolved.get("candidates", []),
-                "source": "ingestion_server_ocr_paths",
-            }
-        ocr_targets.append(("dire", dire_name, resolved))
-    if bcp_name != "(aucun)" and folder_rel_ing:
-        if Path(bcp_name).suffix.lower() in image_suffixes:
-            forced_image_ocr_sources.append(bcp_name)
-        resolved = resolve_ingestion_server_file(project_config, folder_rel_ing, bcp_name)
-        if uploaded_ocr_paths.get(bcp_name):
-            resolved = {
-                "ok": True,
-                "path": uploaded_ocr_paths[bcp_name],
-                "local_path": resolved.get("local_path"),
-                "candidates": resolved.get("candidates", []),
-                "source": "ingestion_server_ocr_paths",
-            }
-        ocr_targets.append(("bcp", bcp_name, resolved))
-    if forced_image_ocr_sources:
-        st.warning(
-            "Image sélectionnée comme source OCR ciblée. Elle sera envoyée au dépôt technique, "
-            "mais l'OCR image directe dépend du support de la route /ocr côté serveur."
+            st.warning("Aucune partie avec dossier cible n'est disponible.")
+    
+        col_tx_1, col_tx_2 = st.columns(2)
+        with col_tx_1:
+            date_transmission_expert = st.date_input(
+                "Date de transmission à l'expert",
+                value=date.fromisoformat(current_pdf_cohort.get("date_transmission")) if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("date_transmission") else date.today(),
+                key="ingestion_date_transmission_expert",
+            )
+            type_transmission = st.selectbox(
+                "Type de transmission",
+                ["lettre", "dire", "BCP", "production complémentaire", "autre"],
+                key="ingestion_type_transmission",
+            )
+        with col_tx_2:
+            auteur_transmission = st.text_input("Auteur / conseil", value=current_pdf_cohort.get("avocat", "") if page == "Pré-traitement dépôt PDF" else "", key="ingestion_auteur_transmission")
+            reference_transmission = st.text_input("Référence", value="", key="ingestion_reference_transmission")
+        commentaire_transmission = st.text_area("Commentaire", value="", key="ingestion_commentaire_transmission")
+    
+        source_dir = st.text_input("Dossier source (métadonnée de traçabilité)", value="", key="ingestion_source_dir")
+        uploaded_by_name = {}
+        for file_obj in uploaded_files or []:
+            name = Path(file_obj.name).name
+            if name and name not in uploaded_by_name:
+                uploaded_by_name[name] = file_obj
+    
+        file_labels = sorted(uploaded_by_name.keys(), key=str.lower)
+        image_suffixes = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+        non_image_file_labels = [name for name in file_labels if Path(name).suffix.lower() not in image_suffixes]
+        if not file_labels:
+            st.warning("Aucun fichier déposé. L'ingestion documentaire ne propose que les fichiers explicitement déposés dans la zone d'upload.")
+    
+        force_image_as_source = st.checkbox(
+            "Autoriser une image comme lettre/dire ou BCP",
+            value=False,
+            key="ingestion_allow_image_as_source",
         )
-
-    unavailable_ocr_targets = [t for t in ocr_targets if not t[2].get("ok")]
-    if unavailable_ocr_targets:
-        st.warning("Fichier classé localement mais non encore disponible côté serveur.")
-        nas_root_for_ocr = ((project_config.get("roots") or {}).get("nas") or "").rstrip("\\/ ")
-        if not nas_root_for_ocr:
-            st.error("OCR bloqué : roots.nas est absent, aucun chemin NAS ne peut être transmis au serveur.")
-        elif not Path(nas_root_for_ocr).exists():
-            st.error(f"OCR bloqué : roots.nas est inaccessible depuis le laptop : {nas_root_for_ocr}")
-        st.info("Action explicite possible : envoyer les fichiers vers le dépôt technique NAS / OCR-RAG avant OCR.")
-        with st.expander("Chemins OCR testés", expanded=False):
-            st.json([
-                {
-                    "type": kind,
-                    "fichier": name,
-                    "chemin_laptop": resolved.get("local_path"),
-                    "candidats_serveur": resolved.get("candidates", []),
-                }
-                for kind, name, resolved in unavailable_ocr_targets
-            ])
-
-    if ocr_targets and st.button("Envoyer lettre/dire et BCP vers dépôt technique / OCR-RAG", key="ingestion_upload_ocr_sources"):
-        aff_id_upload = get_project_id(project_config, "")
-        try:
-            technical_depot = ingestion_technical_depot(project_config)
-            pcfixe_depot = ingestion_pcfixe_technical_depot(project_config, aff_id_upload)
-        except Exception as e:
-            st.error(str(e))
-            technical_depot = None
-            pcfixe_depot = None
-        if not technical_depot or not pcfixe_depot:
-            st.stop()
-        nas_root = technical_depot.get("root") or ""
-        try:
-            technical_depot["path"] = assert_canonical_admin_path(
-                technical_depot["path"],
-                label="Dépôt technique NAS utilisé",
-            )
-            pcfixe_depot["unc_path"] = assert_canonical_admin_path(
-                pcfixe_depot["unc_path"],
-                label="Dépôt technique PC fixe UNC utilisé",
-            )
-            pcfixe_depot["server_path"] = assert_canonical_admin_path(
-                pcfixe_depot["server_path"],
-                label="Dépôt technique PC fixe transmis OCR",
-            )
-            show_path("Dépôt technique NAS utilisé :", technical_depot["path"])
-            show_path("Dépôt technique PC fixe UNC utilisé :", pcfixe_depot["unc_path"])
-            show_path("Chemin PC fixe transmis à /ocr :", pcfixe_depot["server_path"])
-        except Exception as e:
-            st.error(str(e))
-            st.stop()
-        if not nas_root:
-            st.error("OCR bloqué : roots.nas est absent du project_config, impossible de copier vers un chemin visible par le PC fixe.")
-        elif not is_unc_path(nas_root):
-            st.error(f"OCR bloqué : roots.nas doit être un chemin UNC accessible par le PC fixe. Valeur actuelle : {nas_root}")
-        elif not Path(nas_root).exists():
-            st.error(f"OCR bloqué : roots.nas est inaccessible depuis le laptop : {nas_root}")
-        elif not is_under_root(technical_depot["path"], nas_root):
-            st.error(f"Dépôt technique refusé : le chemin doit rester sous la racine NAS {nas_root}.")
-        elif not is_unc_path(pcfixe_depot["unc_path"]):
-            st.error(f"OCR bloqué : le dépôt PC fixe doit être accessible en UNC depuis le laptop : {pcfixe_depot['unc_path']}")
-        else:
-            upload_results = []
-            server_ocr_paths = dict(st.session_state.get("ingestion_server_ocr_paths", {}))
-            local_original_paths = st.session_state.get("ingestion_local_original_paths", {})
-            show_path("pcfixe_unc calculé :", pcfixe_depot["unc_path"])
-            for kind, name, resolved in ocr_targets:
-                server_ocr_paths.pop(name, None)
-                source_resolution = resolve_ingestion_local_source(
-                    aff_root_local,
-                    folder_rel_ing,
-                    name,
-                    project_config,
-                    local_original_paths,
-                )
-                local_src_raw = source_resolution.get("selected_source") or ""
-                local_src = Path(local_src_raw) if local_src_raw else None
-                row = {
-                    "type": kind,
-                    "name": name,
-                    "ok": False,
-                    "source_locale": str(local_src_raw),
-                    "chemin_local_source": str(local_src_raw),
-                    "destination_nas": str(Path(technical_depot["path"]) / name),
-                    "chemin_nas_destination": str(Path(technical_depot["path"]) / name),
-                    "destination_pcfixe_unc": str(Path(pcfixe_depot["unc_path"]) / name),
-                    "chemin_pcfixe_unc_destination": str(Path(pcfixe_depot["unc_path"]) / name),
-                    "chemin_transmis_ocr": pj(pcfixe_depot["server_path"], name),
-                    "source_exists_before": bool(local_src and local_src.exists()),
-                    "nas_exists_before": False,
-                    "pcfixe_exists_before": False,
-                    "nas_action": "not_attempted",
-                    "pcfixe_action": "not_attempted",
-                    "nas_exists_after": False,
-                    "pcfixe_exists_after": False,
-                    "error": "",
-                    "pcfixe_error": "",
-                }
-                row.update(source_resolution)
-                if not local_src or not local_src.exists():
-                    row["error"] = "source locale introuvable dans le dossier de partie et dans transmissions.jsonl"
-                    upload_results.append(row)
-                    continue
+        source_file_labels = file_labels if force_image_as_source else non_image_file_labels
+        col_ing_1, col_ing_2 = st.columns(2)
+        with col_ing_1:
+            dire_name = st.selectbox("Lettre / dire", ["(aucun)"] + source_file_labels, key="ingestion_dire")
+            bcp_name = st.selectbox("BCP", ["(aucun)"] + source_file_labels, key="ingestion_bcp")
+        with col_ing_2:
+            piece_names = st.multiselect("Fichiers de pièces", file_labels, key="ingestion_pieces")
+            multi_pdf_name = st.selectbox("PDF unique multi-pièces", ["(aucun)"] + file_labels, key="ingestion_multi_pdf")
+    
+        selected_names = []
+        for name in [dire_name, bcp_name, multi_pdf_name, *piece_names]:
+            if name and name != "(aucun)" and name not in selected_names:
+                selected_names.append(name)
+        selected_uploads = [uploaded_by_name[name] for name in selected_names if name in uploaded_by_name]
+        selected_document_roles = build_ingestion_document_roles(dire_name, bcp_name, piece_names, multi_pdf_name)
+    
+        if st.button("Valider le dépôt documentaire et copier les originaux", key="ingestion_copy_originals"):
+            if not ingestion_party:
+                st.error("Choisir une partie.")
+            elif not file_labels:
+                st.error("Déposer au moins un fichier dans la zone d'upload.")
+            elif not date_transmission_expert:
+                st.error("Renseigner la date de transmission à l'expert.")
+            elif not type_transmission:
+                st.error("Renseigner le type de transmission.")
+            elif not auteur_transmission.strip():
+                st.error("Renseigner l'auteur ou le conseil.")
+            elif not selected_uploads:
+                st.error("Choisir au moins un fichier parmi les fichiers déposés.")
+            else:
                 try:
-                    nas_dst_dir = Path(technical_depot["path"])
-                    pc_unc_dst_dir = Path(pcfixe_depot["unc_path"])
-                    nas_dst = nas_dst_dir / local_src.name
-                    pc_unc_dst = pc_unc_dst_dir / local_src.name
-                    pc_server_path = pj(pcfixe_depot["server_path"], local_src.name)
-                    row["destination_nas"] = str(nas_dst)
-                    row["chemin_nas_destination"] = str(nas_dst)
-                    row["destination_pcfixe_unc"] = str(pc_unc_dst)
-                    row["chemin_pcfixe_unc_destination"] = str(pc_unc_dst)
-                    row["chemin_transmis_ocr"] = pc_server_path
-                    row["nas_dir_exists_before"] = nas_dst_dir.exists()
-                    row["pcfixe_dir_exists_before"] = pc_unc_dst_dir.exists()
-                    nas_dst_dir.mkdir(parents=True, exist_ok=True)
-                    pc_unc_dst_dir.mkdir(parents=True, exist_ok=True)
-                    row["nas_exists_before"] = nas_dst.exists()
-                    row["pcfixe_exists_before"] = pc_unc_dst.exists()
-
-                    if row["nas_exists_before"]:
-                        row["nas_action"] = "already_exists"
-                    else:
-                        shutil.copy2(str(local_src), str(nas_dst))
-                        row["nas_action"] = "copied"
-
-                    if row["pcfixe_exists_before"]:
-                        row["pcfixe_action"] = "already_exists"
-                    else:
-                        shutil.copy2(str(local_src), str(pc_unc_dst))
-                        row["pcfixe_action"] = "copied"
-
-                    row["nas_exists_after"] = nas_dst.exists()
-                    row["pcfixe_exists_after"] = pc_unc_dst.exists()
-                    row["source_stat"] = file_stat_record(local_src)
-                    if row["nas_exists_after"]:
-                        row["nas_destination_stat"] = file_stat_record(nas_dst)
-                    if row["pcfixe_exists_after"]:
-                        row["pcfixe_destination_stat"] = file_stat_record(pc_unc_dst)
-
-                    if not row["pcfixe_exists_after"]:
-                        row["error"] = "copie PC fixe impossible; fichier absent du partage UNC après copie"
+                    transmission_id = make_transmission_id(get_project_id(project_config, ""))
+                    transmission_meta = {
+                        "transmission_id": transmission_id,
+                        "date_transmission_expert": date_transmission_expert.isoformat(),
+                        "type_transmission": type_transmission,
+                        "auteur_transmission": auteur_transmission.strip(),
+                        "reference": reference_transmission.strip(),
+                        "commentaire": commentaire_transmission.strip(),
+                        "dossier_source": source_dir,
+                    }
+                    event = copy_ingestion_uploaded_originals(
+                        aff_root_local,
+                        get_project_id(project_config, ""),
+                        ingestion_party,
+                        selected_uploads,
+                        transmission_meta,
+                        project_config,
+                        selected_document_roles,
+                    )
+                    st.session_state["last_ingestion_event"] = event
+                    st.session_state["last_transmission_id"] = event.get("transmission_id")
+                    st.session_state["ingestion_local_original_paths"] = {
+                        item.get("name") or Path(item.get("destination", "")).name: item.get("destination")
+                        for item in event.get("copied", [])
+                        if item.get("destination")
+                    }
+                    st.success(f"{len(event.get('copied', []))} original/originaux copié(s).")
+                    st.info(f"transmission_id : {event.get('transmission_id')}")
+                    st.info(f"Journal transmissions : {event.get('transmissions_journal_path')}")
+                    if event.get("skipped"):
+                        st.warning(f"{len(event['skipped'])} fichier(s) non copié(s), voir le journal.")
+                    if event.get("errors"):
+                        st.error(f"{len(event['errors'])} erreur(s) pendant la copie, voir le journal.")
+                    st.json(event)
+                except Exception as e:
+                    st.error(f"Erreur ingestion : {e}")
+    
+        folder_rel_ing = (ingestion_party or {}).get("folder_rel", "")
+        proj_pcfixe_ing = pcfixe_local_root_for_server(
+            project_config,
+            get_project_id(project_config, ""),
+        )
+        ocr_out_ing = pj(proj_pcfixe_ing, "AD_Expert_Traitements", "_OCR_Texte")
+    
+        st.markdown("#### OCR ciblé lettre/dire et BCP")
+        ocr_targets = []
+        uploaded_ocr_paths = st.session_state.get("ingestion_server_ocr_paths", {})
+        forced_image_ocr_sources = []
+        if dire_name != "(aucun)" and folder_rel_ing:
+            if Path(dire_name).suffix.lower() in image_suffixes:
+                forced_image_ocr_sources.append(dire_name)
+            resolved = resolve_ingestion_server_file(project_config, folder_rel_ing, dire_name)
+            if uploaded_ocr_paths.get(dire_name):
+                resolved = {
+                    "ok": True,
+                    "path": uploaded_ocr_paths[dire_name],
+                    "local_path": resolved.get("local_path"),
+                    "candidates": resolved.get("candidates", []),
+                    "source": "ingestion_server_ocr_paths",
+                }
+            ocr_targets.append(("dire", dire_name, resolved))
+        if bcp_name != "(aucun)" and folder_rel_ing:
+            if Path(bcp_name).suffix.lower() in image_suffixes:
+                forced_image_ocr_sources.append(bcp_name)
+            resolved = resolve_ingestion_server_file(project_config, folder_rel_ing, bcp_name)
+            if uploaded_ocr_paths.get(bcp_name):
+                resolved = {
+                    "ok": True,
+                    "path": uploaded_ocr_paths[bcp_name],
+                    "local_path": resolved.get("local_path"),
+                    "candidates": resolved.get("candidates", []),
+                    "source": "ingestion_server_ocr_paths",
+                }
+            ocr_targets.append(("bcp", bcp_name, resolved))
+        if forced_image_ocr_sources:
+            st.warning(
+                "Image sélectionnée comme source OCR ciblée. Elle sera envoyée au dépôt technique, "
+                "mais l'OCR image directe dépend du support de la route /ocr côté serveur."
+            )
+    
+        unavailable_ocr_targets = [t for t in ocr_targets if not t[2].get("ok")]
+        if unavailable_ocr_targets:
+            st.warning("Fichier classé localement mais non encore disponible côté serveur.")
+            nas_root_for_ocr = ((project_config.get("roots") or {}).get("nas") or "").rstrip("\\/ ")
+            if not nas_root_for_ocr:
+                st.error("OCR bloqué : roots.nas est absent, aucun chemin NAS ne peut être transmis au serveur.")
+            elif not Path(nas_root_for_ocr).exists():
+                st.error(f"OCR bloqué : roots.nas est inaccessible depuis le laptop : {nas_root_for_ocr}")
+            st.info("Action explicite possible : envoyer les fichiers vers le dépôt technique NAS / OCR-RAG avant OCR.")
+            with st.expander("Chemins OCR testés", expanded=False):
+                st.json([
+                    {
+                        "type": kind,
+                        "fichier": name,
+                        "chemin_laptop": resolved.get("local_path"),
+                        "candidats_serveur": resolved.get("candidates", []),
+                    }
+                    for kind, name, resolved in unavailable_ocr_targets
+                ])
+    
+        if ocr_targets and st.button("Envoyer lettre/dire et BCP vers dépôt technique / OCR-RAG", key="ingestion_upload_ocr_sources"):
+            aff_id_upload = get_project_id(project_config, "")
+            try:
+                technical_depot = ingestion_technical_depot(project_config)
+                pcfixe_depot = ingestion_pcfixe_technical_depot(project_config, aff_id_upload)
+            except Exception as e:
+                st.error(str(e))
+                technical_depot = None
+                pcfixe_depot = None
+            if not technical_depot or not pcfixe_depot:
+                st.stop()
+            nas_root = technical_depot.get("root") or ""
+            try:
+                technical_depot["path"] = assert_canonical_admin_path(
+                    technical_depot["path"],
+                    label="Dépôt technique NAS utilisé",
+                )
+                pcfixe_depot["unc_path"] = assert_canonical_admin_path(
+                    pcfixe_depot["unc_path"],
+                    label="Dépôt technique PC fixe UNC utilisé",
+                )
+                pcfixe_depot["server_path"] = assert_canonical_admin_path(
+                    pcfixe_depot["server_path"],
+                    label="Dépôt technique PC fixe transmis OCR",
+                )
+                show_path("Dépôt technique NAS utilisé :", technical_depot["path"])
+                show_path("Dépôt technique PC fixe UNC utilisé :", pcfixe_depot["unc_path"])
+                show_path("Chemin PC fixe transmis à /ocr :", pcfixe_depot["server_path"])
+            except Exception as e:
+                st.error(str(e))
+                st.stop()
+            if not nas_root:
+                st.error("OCR bloqué : roots.nas est absent du project_config, impossible de copier vers un chemin visible par le PC fixe.")
+            elif not is_unc_path(nas_root):
+                st.error(f"OCR bloqué : roots.nas doit être un chemin UNC accessible par le PC fixe. Valeur actuelle : {nas_root}")
+            elif not Path(nas_root).exists():
+                st.error(f"OCR bloqué : roots.nas est inaccessible depuis le laptop : {nas_root}")
+            elif not is_under_root(technical_depot["path"], nas_root):
+                st.error(f"Dépôt technique refusé : le chemin doit rester sous la racine NAS {nas_root}.")
+            elif not is_unc_path(pcfixe_depot["unc_path"]):
+                st.error(f"OCR bloqué : le dépôt PC fixe doit être accessible en UNC depuis le laptop : {pcfixe_depot['unc_path']}")
+            else:
+                upload_results = []
+                server_ocr_paths = dict(st.session_state.get("ingestion_server_ocr_paths", {}))
+                local_original_paths = st.session_state.get("ingestion_local_original_paths", {})
+                show_path("pcfixe_unc calculé :", pcfixe_depot["unc_path"])
+                for kind, name, resolved in ocr_targets:
+                    server_ocr_paths.pop(name, None)
+                    source_resolution = resolve_ingestion_local_source(
+                        aff_root_local,
+                        folder_rel_ing,
+                        name,
+                        project_config,
+                        local_original_paths,
+                    )
+                    local_src_raw = source_resolution.get("selected_source") or ""
+                    local_src = Path(local_src_raw) if local_src_raw else None
+                    row = {
+                        "type": kind,
+                        "name": name,
+                        "ok": False,
+                        "source_locale": str(local_src_raw),
+                        "chemin_local_source": str(local_src_raw),
+                        "destination_nas": str(Path(technical_depot["path"]) / name),
+                        "chemin_nas_destination": str(Path(technical_depot["path"]) / name),
+                        "destination_pcfixe_unc": str(Path(pcfixe_depot["unc_path"]) / name),
+                        "chemin_pcfixe_unc_destination": str(Path(pcfixe_depot["unc_path"]) / name),
+                        "chemin_transmis_ocr": pj(pcfixe_depot["server_path"], name),
+                        "source_exists_before": bool(local_src and local_src.exists()),
+                        "nas_exists_before": False,
+                        "pcfixe_exists_before": False,
+                        "nas_action": "not_attempted",
+                        "pcfixe_action": "not_attempted",
+                        "nas_exists_after": False,
+                        "pcfixe_exists_after": False,
+                        "error": "",
+                        "pcfixe_error": "",
+                    }
+                    row.update(source_resolution)
+                    if not local_src or not local_src.exists():
+                        row["error"] = "source locale introuvable dans le dossier de partie et dans transmissions.jsonl"
                         upload_results.append(row)
                         continue
-
-                    server_ocr_paths[name] = pc_server_path
-                    row["ok"] = True
-                    row["note"] = "Copie directe vers NAS et PC fixe; OCR autorisé seulement après confirmation PC fixe."
-                    upload_results.append(row)
-                except Exception as e:
-                    row["error"] = str(e)
-                    row["exception_type"] = type(e).__name__
-                    row["traceback"] = traceback.format_exc()
                     try:
-                        row["nas_exists_after"] = Path(row["destination_nas"]).exists()
-                        row["pcfixe_exists_after"] = Path(row["destination_pcfixe_unc"]).exists()
-                    except Exception as check_e:
-                        row["pcfixe_error"] = str(check_e)
-                    upload_results.append(row)
-            st.session_state["ingestion_server_ocr_paths"] = server_ocr_paths
-            upload_event = {
-                "ts": datetime.now().isoformat(timespec="seconds"),
-                "action": "ingestion_contradictoire_upload_ocr_sources",
-                "aff_id": aff_id_upload,
-                "transmission_id": st.session_state.get("last_transmission_id"),
-                "technical_depot": technical_depot,
-                "pcfixe_depot": pcfixe_depot,
-                "results": upload_results,
-            }
-            try:
-                assert_no_flat_admin_paths(upload_results, label="résultats upload OCR")
-                assert_no_flat_admin_paths(upload_event, label="journal upload OCR")
-            except Exception as e:
-                st.error(str(e))
-                st.stop()
-            upload_event["log_path"] = write_ingestion_log(aff_root_local, upload_event, project_config)
-            failed_pcfixe = [r for r in upload_results if not r.get("pcfixe_exists_after")]
-            if failed_pcfixe:
-                st.error("OCR bloqué : au moins un fichier n'est pas visible sur le PC fixe après copie UNC.")
-            st.dataframe(
-                prepare_df_for_streamlit_display([
-                    {
-                        "fichier": r.get("name"),
-                        "source_locale": r.get("source_locale"),
-                        "source_candidate_1": r.get("source_candidate_1"),
-                        "source_candidate_1_exists": r.get("source_candidate_1_exists"),
-                        "source_candidate_2_from_transmissions": r.get("source_candidate_2_from_transmissions"),
-                        "source_candidate_2_exists": r.get("source_candidate_2_from_transmissions_exists"),
-                        "destination_nas": r.get("destination_nas"),
-                        "destination_pcfixe_unc": r.get("destination_pcfixe_unc"),
-                        "nas_exists_before": r.get("nas_exists_before"),
-                        "nas_action": r.get("nas_action"),
-                        "nas_exists_after": r.get("nas_exists_after"),
-                        "pcfixe_exists_before": r.get("pcfixe_exists_before"),
-                        "pcfixe_action": r.get("pcfixe_action"),
-                        "pcfixe_exists_after": r.get("pcfixe_exists_after"),
-                        "chemin_transmis_ocr": r.get("chemin_transmis_ocr") if r.get("pcfixe_exists_after") else "",
-                        "error": r.get("error"),
-                    }
-                    for r in upload_results
-                ]),
-                width="stretch",
-            )
-            st.json(upload_results)
-            try:
-                show_path("Journal upload OCR :", upload_event["log_path"])
-            except Exception as e:
-                st.error(str(e))
-                st.stop()
-
-    if st.button("2. OCR ciblé lettre/dire et BCP", key="ingestion_ocr_targets"):
-        if not ocr_targets:
-            st.error("Choisir une lettre/dire ou un BCP.")
-        elif unavailable_ocr_targets:
-            st.error("OCR bloqué : fichier classé localement mais non encore disponible côté serveur.")
-        elif not ensure_ready():
-            st.error("Serveur injoignable.")
-        else:
-            results = []
-            generated_sources = {}
-            for kind, name, resolved in ocr_targets:
-                input_path_pc = resolved["path"]
-                payload_ocr = {
-                    "input_path": input_path_pc,
-                    "output_dir": ocr_out_ing,
-                    "lang": "fra",
-                    "dpi": 300,
-                    "project_id": get_project_id(project_config, ""),
+                        nas_dst_dir = Path(technical_depot["path"])
+                        pc_unc_dst_dir = Path(pcfixe_depot["unc_path"])
+                        nas_dst = nas_dst_dir / local_src.name
+                        pc_unc_dst = pc_unc_dst_dir / local_src.name
+                        pc_server_path = pj(pcfixe_depot["server_path"], local_src.name)
+                        row["destination_nas"] = str(nas_dst)
+                        row["chemin_nas_destination"] = str(nas_dst)
+                        row["destination_pcfixe_unc"] = str(pc_unc_dst)
+                        row["chemin_pcfixe_unc_destination"] = str(pc_unc_dst)
+                        row["chemin_transmis_ocr"] = pc_server_path
+                        row["nas_dir_exists_before"] = nas_dst_dir.exists()
+                        row["pcfixe_dir_exists_before"] = pc_unc_dst_dir.exists()
+                        nas_dst_dir.mkdir(parents=True, exist_ok=True)
+                        pc_unc_dst_dir.mkdir(parents=True, exist_ok=True)
+                        row["nas_exists_before"] = nas_dst.exists()
+                        row["pcfixe_exists_before"] = pc_unc_dst.exists()
+    
+                        if row["nas_exists_before"]:
+                            row["nas_action"] = "already_exists"
+                        else:
+                            shutil.copy2(str(local_src), str(nas_dst))
+                            row["nas_action"] = "copied"
+    
+                        if row["pcfixe_exists_before"]:
+                            row["pcfixe_action"] = "already_exists"
+                        else:
+                            shutil.copy2(str(local_src), str(pc_unc_dst))
+                            row["pcfixe_action"] = "copied"
+    
+                        row["nas_exists_after"] = nas_dst.exists()
+                        row["pcfixe_exists_after"] = pc_unc_dst.exists()
+                        row["source_stat"] = file_stat_record(local_src)
+                        if row["nas_exists_after"]:
+                            row["nas_destination_stat"] = file_stat_record(nas_dst)
+                        if row["pcfixe_exists_after"]:
+                            row["pcfixe_destination_stat"] = file_stat_record(pc_unc_dst)
+    
+                        if not row["pcfixe_exists_after"]:
+                            row["error"] = "copie PC fixe impossible; fichier absent du partage UNC après copie"
+                            upload_results.append(row)
+                            continue
+    
+                        server_ocr_paths[name] = pc_server_path
+                        row["ok"] = True
+                        row["note"] = "Copie directe vers NAS et PC fixe; OCR autorisé seulement après confirmation PC fixe."
+                        upload_results.append(row)
+                    except Exception as e:
+                        row["error"] = str(e)
+                        row["exception_type"] = type(e).__name__
+                        row["traceback"] = traceback.format_exc()
+                        try:
+                            row["nas_exists_after"] = Path(row["destination_nas"]).exists()
+                            row["pcfixe_exists_after"] = Path(row["destination_pcfixe_unc"]).exists()
+                        except Exception as check_e:
+                            row["pcfixe_error"] = str(check_e)
+                        upload_results.append(row)
+                st.session_state["ingestion_server_ocr_paths"] = server_ocr_paths
+                upload_event = {
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "action": "ingestion_contradictoire_upload_ocr_sources",
+                    "aff_id": aff_id_upload,
+                    "transmission_id": st.session_state.get("last_transmission_id"),
+                    "technical_depot": technical_depot,
+                    "pcfixe_depot": pcfixe_depot,
+                    "results": upload_results,
                 }
                 try:
-                    r = requests.post(f"{SERVER_URL}/ocr", headers={"x-api-key": API_KEY}, json=payload_ocr, timeout=900)
-                    data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {"ok": False, "raw": r.text}
-                    generated_source = first_generated_ocr_source(data)
-                    if generated_source:
-                        generated_sources[kind] = generated_source
-                    results.append({"type": kind, "name": name, "payload": payload_ocr, "input_path": input_path_pc, "output_dir": ocr_out_ing, "project_id": get_project_id(project_config, ""), "response": data})
+                    assert_no_flat_admin_paths(upload_results, label="résultats upload OCR")
+                    assert_no_flat_admin_paths(upload_event, label="journal upload OCR")
                 except Exception as e:
-                    results.append({"type": kind, "name": name, "input_path": input_path_pc, "output_dir": ocr_out_ing, "project_id": get_project_id(project_config, ""), "error": str(e)})
-            st.session_state["ingestion_ocr_results"] = results
-            st.session_state["ingestion_ocr_generated_sources"] = generated_sources
-            preferred_source = generated_sources.get("bcp") or generated_sources.get("dire") or ""
-            if preferred_source:
-                st.session_state["ingestion_source_titles_path"] = preferred_source
-                st.session_state["ingestion_bcp_csv"] = preferred_source
-            write_ingestion_log(aff_root_local, {
-                "ts": datetime.now().isoformat(timespec="seconds"),
-                "action": "ingestion_contradictoire_ocr_targets",
-                "aff_id": get_project_id(project_config, ""),
-                "transmission_id": st.session_state.get("last_transmission_id"),
-                "generated_sources": generated_sources,
-                "results": results,
-            }, project_config)
-            st.json(results)
-
-    bcp_csv_default = ""
-    dire_csv_default = ""
-    for item in st.session_state.get("ingestion_ocr_results", []):
-        resp = item.get("response") or {}
-        if item.get("type") == "bcp":
-            bcp_csv_default = first_generated_ocr_source(resp) or bcp_csv_default
-        elif item.get("type") == "dire":
-            dire_csv_default = first_generated_ocr_source(resp) or dire_csv_default
-    source_titles_csv_default = (
-        st.session_state.get("ingestion_source_titles_path")
-        or bcp_csv_default
-        or dire_csv_default
-    )
-    if source_titles_csv_default and not st.session_state.get("ingestion_bcp_csv"):
-        st.session_state["ingestion_bcp_csv"] = source_titles_csv_default
-    bcp_csv_path = st.text_input(
-        "CSV/JSON OCR du BCP ou lettre/dire (chemin vu PC fixe)",
-        key="ingestion_bcp_csv",
-        disabled=True,
-    )
-    bcp_csv_effective = (
-        st.session_state.get("ingestion_bcp_csv")
-        or source_titles_csv_default
-        or bcp_csv_path
-        or ""
-    ).strip()
-    max_piece_no_ing = st.number_input("Nombre maximal de pièces à extraire", min_value=1, max_value=500, value=200, step=1, key="ingestion_max_piece_no")
-
-    if st.button("3. Extraire depuis BCP ou lettre/dire", key="ingestion_extract_bcp"):
-        if not bcp_csv_effective:
-            st.error("Lancer d'abord l'OCR ciblé sur le BCP ou la lettre/dire pour générer automatiquement la source d'extraction.")
-        elif not ensure_ready():
-            st.error("Serveur injoignable.")
-        else:
-            payload = {"sources": [{"csv_path": bcp_csv_effective}], "max_piece_no": int(max_piece_no_ing)}
-            try:
-                r = requests.post(f"{SERVER_URL}/infer_piece_titles", headers={"x-api-key": API_KEY}, json=payload, timeout=180)
-                data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {"ok": False, "raw": r.text}
-                pieces = normalize_piece_map(data.get("pieces") or {})
-                fallback_info = {}
-                bcp_debug = {
-                    "csv_path_input": bcp_csv_effective,
-                    "widget_value": bcp_csv_path,
-                    "session_state_value": st.session_state.get("ingestion_bcp_csv"),
-                    "computed_default_value": source_titles_csv_default,
-                    "rows_consumed": [],
-                    "matched_rows": [],
-                    "ignored_rows": [],
-                    "reason": "",
-                }
-                if not pieces:
-                    ocr_rows, local_ocr_source, ocr_debug = read_ocr_lines_from_source(bcp_csv_effective)
-                    fallback_info = extract_piece_titles_from_ocr_rows(ocr_rows, int(max_piece_no_ing))
-                    pieces = normalize_piece_map(fallback_info.get("pieces") or {})
-                    fallback_info["local_ocr_source"] = local_ocr_source
-                    fallback_info["source_rows"] = len(ocr_rows)
-                    bcp_debug.update(ocr_debug)
-                    bcp_debug.update(fallback_info.get("debug") or {})
-                else:
-                    bcp_debug["reason"] = "infer_piece_titles a fourni des intitulés; fallback local non utilisé"
-
-                rows, mapping_warnings = build_piece_mapping_rows(
-                    piece_names,
-                    pieces,
-                    aff_root_local,
-                    folder_rel_ing,
+                    st.error(str(e))
+                    st.stop()
+                upload_event["log_path"] = write_ingestion_log(aff_root_local, upload_event, project_config)
+                failed_pcfixe = [r for r in upload_results if not r.get("pcfixe_exists_after")]
+                if failed_pcfixe:
+                    st.error("OCR bloqué : au moins un fichier n'est pas visible sur le PC fixe après copie UNC.")
+                st.dataframe(
+                    prepare_df_for_streamlit_display([
+                        {
+                            "fichier": r.get("name"),
+                            "source_locale": r.get("source_locale"),
+                            "source_candidate_1": r.get("source_candidate_1"),
+                            "source_candidate_1_exists": r.get("source_candidate_1_exists"),
+                            "source_candidate_2_from_transmissions": r.get("source_candidate_2_from_transmissions"),
+                            "source_candidate_2_exists": r.get("source_candidate_2_from_transmissions_exists"),
+                            "destination_nas": r.get("destination_nas"),
+                            "destination_pcfixe_unc": r.get("destination_pcfixe_unc"),
+                            "nas_exists_before": r.get("nas_exists_before"),
+                            "nas_action": r.get("nas_action"),
+                            "nas_exists_after": r.get("nas_exists_after"),
+                            "pcfixe_exists_before": r.get("pcfixe_exists_before"),
+                            "pcfixe_action": r.get("pcfixe_action"),
+                            "pcfixe_exists_after": r.get("pcfixe_exists_after"),
+                            "chemin_transmis_ocr": r.get("chemin_transmis_ocr") if r.get("pcfixe_exists_after") else "",
+                            "error": r.get("error"),
+                        }
+                        for r in upload_results
+                    ]),
+                    width="stretch",
                 )
-                st.session_state["ingestion_mapping_rows"] = rows
-                st.session_state["ingestion_mapping_warnings"] = mapping_warnings
-                st.session_state["ingestion_bcp_extracted_titles"] = pieces
-                st.session_state["ingestion_bcp_debug"] = bcp_debug
+                st.json(upload_results)
+                try:
+                    show_path("Journal upload OCR :", upload_event["log_path"])
+                except Exception as e:
+                    st.error(str(e))
+                    st.stop()
+    
+        if st.button("2. OCR ciblé lettre/dire et BCP", key="ingestion_ocr_targets"):
+            if not ocr_targets:
+                st.error("Choisir une lettre/dire ou un BCP.")
+            elif unavailable_ocr_targets:
+                st.error("OCR bloqué : fichier classé localement mais non encore disponible côté serveur.")
+            elif not ensure_ready():
+                st.error("Serveur injoignable.")
+            else:
+                results = []
+                generated_sources = {}
+                for kind, name, resolved in ocr_targets:
+                    input_path_pc = resolved["path"]
+                    payload_ocr = {
+                        "input_path": input_path_pc,
+                        "output_dir": ocr_out_ing,
+                        "lang": "fra",
+                        "dpi": 300,
+                        "project_id": get_project_id(project_config, ""),
+                    }
+                    try:
+                        r = requests.post(f"{SERVER_URL}/ocr", headers={"x-api-key": API_KEY}, json=payload_ocr, timeout=900)
+                        data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {"ok": False, "raw": r.text}
+                        generated_source = first_generated_ocr_source(data)
+                        if generated_source:
+                            generated_sources[kind] = generated_source
+                        results.append({"type": kind, "name": name, "payload": payload_ocr, "input_path": input_path_pc, "output_dir": ocr_out_ing, "project_id": get_project_id(project_config, ""), "response": data})
+                    except Exception as e:
+                        results.append({"type": kind, "name": name, "input_path": input_path_pc, "output_dir": ocr_out_ing, "project_id": get_project_id(project_config, ""), "error": str(e)})
+                st.session_state["ingestion_ocr_results"] = results
+                st.session_state["ingestion_ocr_generated_sources"] = generated_sources
+                preferred_source = generated_sources.get("bcp") or generated_sources.get("dire") or ""
+                if preferred_source:
+                    st.session_state["ingestion_source_titles_path"] = preferred_source
+                    st.session_state["ingestion_bcp_csv"] = preferred_source
                 write_ingestion_log(aff_root_local, {
                     "ts": datetime.now().isoformat(timespec="seconds"),
-                    "action": "ingestion_contradictoire_extract_bcp_draft",
+                    "action": "ingestion_contradictoire_ocr_targets",
                     "aff_id": get_project_id(project_config, ""),
                     "transmission_id": st.session_state.get("last_transmission_id"),
-                    "bcp_csv_path": bcp_csv_effective,
-                    "pieces": pieces,
-                    "fallback_info": fallback_info,
-                    "bcp_debug": bcp_debug,
-                    "mapping_warnings": mapping_warnings,
-                    "definitive": False,
-                    "response": data,
+                    "generated_sources": generated_sources,
+                    "results": results,
                 }, project_config)
-                if fallback_info:
-                    st.info(f"Fallback local appliqué : {fallback_info.get('mode')} ({len(pieces)} intitulé(s)).")
-                with st.expander("Lignes OCR BCP utilisées", expanded=True):
-                    st.json({
-                        "csv_path_input": bcp_debug.get("csv_path_input"),
-                        "widget_value": bcp_debug.get("widget_value"),
-                        "session_state_value": bcp_debug.get("session_state_value"),
-                        "computed_default_value": bcp_debug.get("computed_default_value"),
-                        "selected_path": bcp_debug.get("selected_path"),
-                        "source_type": bcp_debug.get("source_type"),
-                        "first_line": bcp_debug.get("first_line"),
-                        "csv_columns": bcp_debug.get("csv_columns"),
-                        "rows_total": bcp_debug.get("rows_total"),
-                        "rows_with_text": bcp_debug.get("rows_with_text"),
-                        "empty_text_rows": bcp_debug.get("empty_text_rows"),
-                        "errors": bcp_debug.get("errors"),
-                        "reason": bcp_debug.get("reason"),
-                    })
-                    st.json(bcp_debug.get("rows_consumed") or [])
-                with st.expander("Intitulés BCP extraits", expanded=True):
-                    st.json({str(k): v for k, v in sorted(pieces.items())})
-                    if not pieces:
-                        st.json({
-                            "why_empty": bcp_debug.get("reason") or "dictionnaire vide apres parse",
-                            "ignored_rows": bcp_debug.get("ignored_rows") or [],
-                            "matched_rows": bcp_debug.get("matched_rows") or [],
-                        })
-                if mapping_warnings:
-                    st.warning("Validation manuelle requise : incohérences détectées entre BCP et fichiers.")
-                    st.json(mapping_warnings)
-                st.json(data)
-            except Exception as e:
-                st.error(f"Erreur extraction BCP : {e}")
-
-    mapping_rows = st.session_state.get("ingestion_mapping_rows", [])
-    mapping_warnings = st.session_state.get("ingestion_mapping_warnings", [])
-    bcp_extracted_titles = st.session_state.get("ingestion_bcp_extracted_titles", {})
-    bcp_debug = st.session_state.get("ingestion_bcp_debug", {})
-    if bcp_debug:
-        with st.expander("Lignes OCR BCP utilisées", expanded=False):
-            st.json({
-                "csv_path_input": bcp_debug.get("csv_path_input"),
-                "widget_value": bcp_debug.get("widget_value"),
-                "session_state_value": bcp_debug.get("session_state_value"),
-                "computed_default_value": bcp_debug.get("computed_default_value"),
-                "selected_path": bcp_debug.get("selected_path"),
-                "source_type": bcp_debug.get("source_type"),
-                "first_line": bcp_debug.get("first_line"),
-                "csv_columns": bcp_debug.get("csv_columns"),
-                "rows_total": bcp_debug.get("rows_total"),
-                "rows_with_text": bcp_debug.get("rows_with_text"),
-                "empty_text_rows": bcp_debug.get("empty_text_rows"),
-                "errors": bcp_debug.get("errors"),
-                "reason": bcp_debug.get("reason"),
-            })
-            st.json(bcp_debug.get("rows_consumed") or [])
-    if bcp_extracted_titles or bcp_debug:
-        with st.expander("Intitulés BCP extraits", expanded=False):
-            st.json({str(k): v for k, v in sorted((bcp_extracted_titles or {}).items(), key=lambda item: int(item[0]))})
-            if not bcp_extracted_titles:
-                st.json({
-                    "why_empty": bcp_debug.get("reason") or "dictionnaire vide apres parse",
-                    "ignored_rows": bcp_debug.get("ignored_rows") or [],
-                    "matched_rows": bcp_debug.get("matched_rows") or [],
-                })
-    if mapping_warnings:
-        st.warning("Validation manuelle obligatoire avant journalisation définitive.")
-        with st.expander("Alertes rapprochement BCP / fichiers", expanded=True):
-            st.json(mapping_warnings)
-    mapping_column_order = [
-        "fichier_source",
-        "numero_piece",
-        "sous_piece",
-        "intitule_bcp",
-        "intitule_fichier",
-        "complement_fichier",
-        "libelle_final",
-        "libelle_affichage",
-        "mime_type",
-        "page_count",
-        "page_count_source",
-        "page_count_error",
-        "action",
-        "destination",
-    ]
-    edited_mapping = st.data_editor(
-        prepare_df_for_streamlit_display(mapping_rows),
-        width="stretch",
-        num_rows="dynamic",
-        column_order=mapping_column_order,
-        column_config={
-            "action": st.column_config.SelectboxColumn(
-                "action",
-                options=["classer", "ignorer", "à vérifier"],
-                required=True,
-            ),
-            "libelle_final": st.column_config.TextColumn(
-                "libelle_final",
-                help="Libellé validé par l'opérateur pour la pièce ou sous-pièce.",
-            ),
-            "libelle_affichage": st.column_config.TextColumn(
-                "libelle_affichage",
-                help="Calculé à partir de la référence de pièce et du libellé final; recalculé à la validation.",
-                disabled=True,
-            ),
-            "mime_type": st.column_config.TextColumn("mime_type", disabled=True),
-            "page_count": st.column_config.NumberColumn(
-                "page_count",
-                help="Nombre de pages du fichier remis, calculé depuis les métadonnées disponibles.",
-                disabled=True,
-            ),
-            "page_count_source": st.column_config.TextColumn("page_count_source", disabled=True),
-            "page_count_error": st.column_config.TextColumn("page_count_error", disabled=True),
-        },
-        key="ingestion_mapping_editor",
-    )
-    mapping_validation_ok = True
-    if mapping_warnings:
-        mapping_validation_ok = st.checkbox(
-            "Je valide manuellement cette correspondance malgré les alertes",
-            value=False,
-            key="ingestion_mapping_manual_validation",
+                st.json(results)
+    
+        bcp_csv_default = ""
+        dire_csv_default = ""
+        for item in st.session_state.get("ingestion_ocr_results", []):
+            resp = item.get("response") or {}
+            if item.get("type") == "bcp":
+                bcp_csv_default = first_generated_ocr_source(resp) or bcp_csv_default
+            elif item.get("type") == "dire":
+                dire_csv_default = first_generated_ocr_source(resp) or dire_csv_default
+        source_titles_csv_default = (
+            st.session_state.get("ingestion_source_titles_path")
+            or bcp_csv_default
+            or dire_csv_default
         )
-    if st.button("Valider la correspondance", key="ingestion_log_mapping"):
-        if mapping_warnings and not mapping_validation_ok:
-            st.error("Validation manuelle requise avant journalisation définitive.")
-            st.stop()
-        rows = data_editor_rows(edited_mapping)
-        for row in rows:
-            row["libelle_final"] = compact_spaces(row.get("libelle_final") or row.get("intitule_bcp") or row.get("intitule_fichier") or "")
-            row["libelle_affichage"] = build_libelle_affichage(
-                row.get("numero_piece"),
-                row.get("sous_piece") or "",
-                row.get("libelle_final") or "",
-            )
-            destination = str(row.get("destination") or "")
-            page_meta = file_page_count_record(Path(destination)) if destination else {
-                "page_count": None,
-                "page_count_source": "unknown",
-                "page_count_error": "destination absente",
-            }
-            row.update(page_meta)
-            row["action"] = row.get("action") if row.get("action") in {"classer", "ignorer", "à vérifier"} else "à vérifier"
-        log_path = write_ingestion_log(aff_root_local, {
-            "ts": datetime.now().isoformat(timespec="seconds"),
-            "action": "ingestion_contradictoire_mapping_validated",
-            "aff_id": get_project_id(project_config, ""),
-            "transmission_id": st.session_state.get("last_transmission_id"),
-            "party": {
-                "code_partie": (ingestion_party or {}).get("code_partie"),
-                "nom": (ingestion_party or {}).get("nom"),
-                "folder_rel": folder_rel_ing,
-            },
-            "rows": rows,
-            "mapping_warnings": mapping_warnings,
-            "manual_validation": bool(mapping_validation_ok),
-            "definitive": True,
-            "note": "Table validée par l'utilisateur; aucun titre n'est inventé automatiquement.",
-        }, project_config)
-        st.success(f"Correspondance journalisée : {log_path}")
-
-    st.markdown("#### PDF multi-pièces")
-    aff_id_ing = get_project_id(project_config, "")
-    multi_pdf_selected = multi_pdf_name != "(aucun)" and bool(folder_rel_ing)
-    multi_pdf_source = resolve_ingestion_local_source(
-        aff_root_local,
-        folder_rel_ing,
-        multi_pdf_name if multi_pdf_selected else "",
-        project_config,
-        st.session_state.get("ingestion_local_original_paths", {}),
-    )
-    multi_pdf_local = multi_pdf_source.get("selected_source") or ""
-    multi_pdf_pages_meta = file_page_count_record(Path(multi_pdf_local)) if multi_pdf_local else {"page_count": None}
-    multi_pdf_total_pages = multi_pdf_pages_meta.get("page_count") if multi_pdf_pages_meta.get("page_count_source") == "pdf_metadata" else None
-    multi_pdf_pc = pj(proj_pcfixe_ing, folder_rel_ing, multi_pdf_name) if multi_pdf_selected else ""
-    split_output_dir_pc_default = pj(proj_pcfixe_ing, folder_rel_ing) if folder_rel_ing else ""
-    split_output_dir_pc_raw = st.text_input(
-        "Dossier de sortie des pièces découpées (chemin vu PC fixe)",
-        value=split_output_dir_pc_default,
-        key="ingestion_split_output_dir",
-    )
-    split_output_dir_pc = _norm(split_output_dir_pc_raw) or split_output_dir_pc_default
-    split_output_dir_nas = pj(effective_nas_affaire_root(project_config, aff_id_ing), folder_rel_ing) if folder_rel_ing else ""
-    selected_part_folder = folder_rel_ing
-    st.write("Diagnostic dossier sortie découpe PDF multi-pièces", {
-        "output_dir_pcfixe_raw": split_output_dir_pc_raw,
-        "output_dir_pcfixe": split_output_dir_pc,
-        "output_dir_pcfixe_default": split_output_dir_pc_default,
-        "output_dir_unc": pcfixe_server_path_to_unc(project_config, aff_id_ing, split_output_dir_pc),
-        "output_dir_nas": split_output_dir_nas,
-        "dossier_partie": folder_rel_ing,
-        "selected_part_folder": selected_part_folder,
-        "roots.pcfixe": (project_config.get("roots") or {}).get("pcfixe"),
-        "roots.nas": (project_config.get("roots") or {}).get("nas"),
-        "proj_pcfixe_ing": proj_pcfixe_ing,
-    })
-    if multi_pdf_selected:
-        st.caption(f"PDF local : {multi_pdf_local or '(introuvable localement)'}")
-        st.caption(f"Nombre de pages détecté : {multi_pdf_total_pages or 'indéterminé'}")
-
-    if st.button("OCR du PDF multi-pièces", key="ingestion_multi_pdf_ocr"):
-        if not multi_pdf_selected:
-            st.error("Choisir un PDF multi-pièces.")
-        elif not multi_pdf_local:
-            st.error("PDF multi-pièces introuvable dans le dossier de partie. Classer d'abord les originaux.")
-            st.json(multi_pdf_source)
-        elif not ensure_ready():
-            st.error("Serveur injoignable.")
-        else:
-            copy_info = copy_ingestion_file_to_technical_depots(multi_pdf_local, project_config, aff_id_ing)
-            st.json(copy_info)
-            if not copy_info.get("ok_for_server"):
-                st.error("OCR bloqué : copie PC fixe impossible ou fichier indisponible côté serveur.")
+        if source_titles_csv_default and not st.session_state.get("ingestion_bcp_csv"):
+            st.session_state["ingestion_bcp_csv"] = source_titles_csv_default
+        bcp_csv_path = st.text_input(
+            "CSV/JSON OCR du BCP ou lettre/dire (chemin vu PC fixe)",
+            key="ingestion_bcp_csv",
+            disabled=True,
+        )
+        bcp_csv_effective = (
+            st.session_state.get("ingestion_bcp_csv")
+            or source_titles_csv_default
+            or bcp_csv_path
+            or ""
+        ).strip()
+        max_piece_no_ing = st.number_input("Nombre maximal de pièces à extraire", min_value=1, max_value=500, value=200, step=1, key="ingestion_max_piece_no")
+    
+        if st.button("3. Extraire depuis BCP ou lettre/dire", key="ingestion_extract_bcp"):
+            if not bcp_csv_effective:
+                st.error("Lancer d'abord l'OCR ciblé sur le BCP ou la lettre/dire pour générer automatiquement la source d'extraction.")
+            elif not ensure_ready():
+                st.error("Serveur injoignable.")
             else:
-                input_path_pc = copy_info["chemin_transmis_serveur"]
-                st.session_state["ingestion_multi_pdf_server_path"] = input_path_pc
-                payload_ocr = {
-                    "input_path": input_path_pc,
-                    "output_dir": ocr_out_ing,
-                    "lang": "fra",
-                    "dpi": 300,
-                    "project_id": aff_id_ing,
-                }
+                payload = {"sources": [{"csv_path": bcp_csv_effective}], "max_piece_no": int(max_piece_no_ing)}
                 try:
-                    r = requests.post(f"{SERVER_URL}/ocr", headers={"x-api-key": API_KEY}, json=payload_ocr, timeout=900)
+                    r = requests.post(f"{SERVER_URL}/infer_piece_titles", headers={"x-api-key": API_KEY}, json=payload, timeout=180)
                     data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {"ok": False, "raw": r.text}
-                    generated_source = first_generated_ocr_source(data)
-                    if generated_source:
-                        st.session_state["ingestion_multi_pdf_ocr_csv"] = generated_source
-                        st.session_state["ingestion_detect_csv"] = generated_source
-                    log_path = write_ingestion_log(aff_root_local, {
+                    pieces = normalize_piece_map(data.get("pieces") or {})
+                    fallback_info = {}
+                    bcp_debug = {
+                        "csv_path_input": bcp_csv_effective,
+                        "widget_value": bcp_csv_path,
+                        "session_state_value": st.session_state.get("ingestion_bcp_csv"),
+                        "computed_default_value": source_titles_csv_default,
+                        "rows_consumed": [],
+                        "matched_rows": [],
+                        "ignored_rows": [],
+                        "reason": "",
+                    }
+                    if not pieces:
+                        ocr_rows, local_ocr_source, ocr_debug = read_ocr_lines_from_source(bcp_csv_effective)
+                        fallback_info = extract_piece_titles_from_ocr_rows(ocr_rows, int(max_piece_no_ing))
+                        pieces = normalize_piece_map(fallback_info.get("pieces") or {})
+                        fallback_info["local_ocr_source"] = local_ocr_source
+                        fallback_info["source_rows"] = len(ocr_rows)
+                        bcp_debug.update(ocr_debug)
+                        bcp_debug.update(fallback_info.get("debug") or {})
+                    else:
+                        bcp_debug["reason"] = "infer_piece_titles a fourni des intitulés; fallback local non utilisé"
+    
+                    rows, mapping_warnings = build_piece_mapping_rows(
+                        piece_names,
+                        pieces,
+                        aff_root_local,
+                        folder_rel_ing,
+                    )
+                    st.session_state["ingestion_mapping_rows"] = rows
+                    st.session_state["ingestion_mapping_warnings"] = mapping_warnings
+                    st.session_state["ingestion_bcp_extracted_titles"] = pieces
+                    st.session_state["ingestion_bcp_debug"] = bcp_debug
+                    write_ingestion_log(aff_root_local, {
                         "ts": datetime.now().isoformat(timespec="seconds"),
-                        "action": "ingestion_multi_pdf_ocr",
-                        "aff_id": aff_id_ing,
+                        "action": "ingestion_contradictoire_extract_bcp_draft",
+                        "aff_id": get_project_id(project_config, ""),
                         "transmission_id": st.session_state.get("last_transmission_id"),
-                        "date_transmission_expert": str(date_transmission_expert) if date_transmission_expert else "",
-                        "ocr_performed": True,
-                        "pdf_source_local": multi_pdf_local,
-                        "copy_info": copy_info,
-                        "payload": payload_ocr,
-                        "csv_ocr": generated_source,
+                        "bcp_csv_path": bcp_csv_effective,
+                        "pieces": pieces,
+                        "fallback_info": fallback_info,
+                        "bcp_debug": bcp_debug,
+                        "mapping_warnings": mapping_warnings,
+                        "definitive": False,
                         "response": data,
                     }, project_config)
-                    st.success(f"OCR PDF multi-pièces terminée. Journal : {log_path}")
-                    if generated_source:
-                        st.info(f"CSV/JSON OCR du PDF multi-pièces : {generated_source}")
+                    if fallback_info:
+                        st.info(f"Fallback local appliqué : {fallback_info.get('mode')} ({len(pieces)} intitulé(s)).")
+                    with st.expander("Lignes OCR BCP utilisées", expanded=True):
+                        st.json({
+                            "csv_path_input": bcp_debug.get("csv_path_input"),
+                            "widget_value": bcp_debug.get("widget_value"),
+                            "session_state_value": bcp_debug.get("session_state_value"),
+                            "computed_default_value": bcp_debug.get("computed_default_value"),
+                            "selected_path": bcp_debug.get("selected_path"),
+                            "source_type": bcp_debug.get("source_type"),
+                            "first_line": bcp_debug.get("first_line"),
+                            "csv_columns": bcp_debug.get("csv_columns"),
+                            "rows_total": bcp_debug.get("rows_total"),
+                            "rows_with_text": bcp_debug.get("rows_with_text"),
+                            "empty_text_rows": bcp_debug.get("empty_text_rows"),
+                            "errors": bcp_debug.get("errors"),
+                            "reason": bcp_debug.get("reason"),
+                        })
+                        st.json(bcp_debug.get("rows_consumed") or [])
+                    with st.expander("Intitulés BCP extraits", expanded=True):
+                        st.json({str(k): v for k, v in sorted(pieces.items())})
+                        if not pieces:
+                            st.json({
+                                "why_empty": bcp_debug.get("reason") or "dictionnaire vide apres parse",
+                                "ignored_rows": bcp_debug.get("ignored_rows") or [],
+                                "matched_rows": bcp_debug.get("matched_rows") or [],
+                            })
+                    if mapping_warnings:
+                        st.warning("Validation manuelle requise : incohérences détectées entre BCP et fichiers.")
+                        st.json(mapping_warnings)
                     st.json(data)
                 except Exception as e:
-                    st.error(f"Erreur OCR PDF multi-pièces : {e}")
-
-    if "ingestion_detect_csv" not in st.session_state:
-        st.session_state["ingestion_detect_csv"] = st.session_state.get("ingestion_multi_pdf_ocr_csv", "")
-    detect_csv_path = st.text_input("CSV OCR du PDF multi-pièces", key="ingestion_detect_csv")
-    if st.button("Détecter automatiquement les limites de pièces", key="ingestion_detect_boundaries"):
-        if not detect_csv_path.strip():
-            st.error("Renseigner le CSV OCR du PDF multi-pièces ou lancer l'OCR optionnelle de ce PDF.")
-        elif not ensure_ready():
-            st.error("Serveur injoignable.")
-        else:
-            r = requests.post(
-                f"{SERVER_URL}/api/detect_piece_boundaries",
-                headers={"x-api-key": API_KEY},
-                json={"project_id": aff_id_ing, "csv_path": detect_csv_path.strip()},
-                timeout=timeout,
-            )
-            data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {"ok": False, "raw": r.text}
-            if data.get("ok"):
-                st.session_state["ingestion_manual_split_rows"] = split_rows_from_detected_pieces(
-                    data.get("pieces", []),
-                    st.session_state.get("ingestion_mapping_rows", []),
-                )
-                st.success("Limites détectées et reportées dans la table manuelle.")
-            st.json(data)
-
-    if not st.session_state.get("ingestion_manual_split_rows"):
-        seeded_split_rows = split_rows_from_mapping(st.session_state.get("ingestion_mapping_rows", []))
-        if seeded_split_rows:
-            st.session_state["ingestion_manual_split_rows"] = seeded_split_rows
-        elif multi_pdf_selected:
-            st.session_state["ingestion_manual_split_rows"] = [blank_manual_split_row()]
-
-    manual_table_rows = st.session_state.get("ingestion_manual_split_rows", [])
-    st.write("Diagnostic PDF multi-pièces", {
-        "pdf_multi_selected": bool(multi_pdf_selected),
-        "split_plan": st.session_state.get("ingestion_split_rows", []),
-        "split_plan_manual": st.session_state.get("ingestion_manual_split_rows", []),
-        "manual_table_rows": manual_table_rows,
-        "conditions_affichage": {
-            "table_affichee": bool(multi_pdf_selected),
-            "ocr_prealable_requis": False,
-            "plan_decoupe_non_vide_requis": False,
-            "session_state_requis": False,
-            "ligne_vide_injectee_si_aucun_plan": bool(multi_pdf_selected and len(manual_table_rows) == 1 and not manual_table_rows[0].get("numero_piece")),
-        },
-    })
-
-    if multi_pdf_selected:
-        st.markdown("##### Découpe manuelle du PDF multi-pièces")
-        st.text_area(
-            "Pagination manuelle",
-            key="ingestion_manual_pagination_text",
-            height=220,
-            placeholder=(
-                "numero_piece;page_debut;page_fin;libelle_final\n"
-                "1;1;16;Piece 1\n"
-                "2;17;18;Piece 2\n"
-                "3;19;24;Piece 3"
-            ),
-            help="Coller une ligne par pièce au format numero_piece;page_debut;page_fin;libelle_final.",
+                    st.error(f"Erreur extraction BCP : {e}")
+    
+        mapping_rows = st.session_state.get("ingestion_mapping_rows", [])
+        mapping_warnings = st.session_state.get("ingestion_mapping_warnings", [])
+        bcp_extracted_titles = st.session_state.get("ingestion_bcp_extracted_titles", {})
+        bcp_debug = st.session_state.get("ingestion_bcp_debug", {})
+        if bcp_debug:
+            with st.expander("Lignes OCR BCP utilisées", expanded=False):
+                st.json({
+                    "csv_path_input": bcp_debug.get("csv_path_input"),
+                    "widget_value": bcp_debug.get("widget_value"),
+                    "session_state_value": bcp_debug.get("session_state_value"),
+                    "computed_default_value": bcp_debug.get("computed_default_value"),
+                    "selected_path": bcp_debug.get("selected_path"),
+                    "source_type": bcp_debug.get("source_type"),
+                    "first_line": bcp_debug.get("first_line"),
+                    "csv_columns": bcp_debug.get("csv_columns"),
+                    "rows_total": bcp_debug.get("rows_total"),
+                    "rows_with_text": bcp_debug.get("rows_with_text"),
+                    "empty_text_rows": bcp_debug.get("empty_text_rows"),
+                    "errors": bcp_debug.get("errors"),
+                    "reason": bcp_debug.get("reason"),
+                })
+                st.json(bcp_debug.get("rows_consumed") or [])
+        if bcp_extracted_titles or bcp_debug:
+            with st.expander("Intitulés BCP extraits", expanded=False):
+                st.json({str(k): v for k, v in sorted((bcp_extracted_titles or {}).items(), key=lambda item: int(item[0]))})
+                if not bcp_extracted_titles:
+                    st.json({
+                        "why_empty": bcp_debug.get("reason") or "dictionnaire vide apres parse",
+                        "ignored_rows": bcp_debug.get("ignored_rows") or [],
+                        "matched_rows": bcp_debug.get("matched_rows") or [],
+                    })
+        if mapping_warnings:
+            st.warning("Validation manuelle obligatoire avant journalisation définitive.")
+            with st.expander("Alertes rapprochement BCP / fichiers", expanded=True):
+                st.json(mapping_warnings)
+        mapping_column_order = [
+            "fichier_source",
+            "numero_piece",
+            "sous_piece",
+            "intitule_bcp",
+            "intitule_fichier",
+            "complement_fichier",
+            "libelle_final",
+            "libelle_affichage",
+            "mime_type",
+            "page_count",
+            "page_count_source",
+            "page_count_error",
+            "action",
+            "destination",
+        ]
+        edited_mapping = st.data_editor(
+            prepare_df_for_streamlit_display(mapping_rows),
+            width="stretch",
+            num_rows="dynamic",
+            column_order=mapping_column_order,
+            column_config={
+                "action": st.column_config.SelectboxColumn(
+                    "action",
+                    options=["classer", "ignorer", "à vérifier"],
+                    required=True,
+                ),
+                "libelle_final": st.column_config.TextColumn(
+                    "libelle_final",
+                    help="Libellé validé par l'opérateur pour la pièce ou sous-pièce.",
+                ),
+                "libelle_affichage": st.column_config.TextColumn(
+                    "libelle_affichage",
+                    help="Calculé à partir de la référence de pièce et du libellé final; recalculé à la validation.",
+                    disabled=True,
+                ),
+                "mime_type": st.column_config.TextColumn("mime_type", disabled=True),
+                "page_count": st.column_config.NumberColumn(
+                    "page_count",
+                    help="Nombre de pages du fichier remis, calculé depuis les métadonnées disponibles.",
+                    disabled=True,
+                ),
+                "page_count_source": st.column_config.TextColumn("page_count_source", disabled=True),
+                "page_count_error": st.column_config.TextColumn("page_count_error", disabled=True),
+            },
+            key="ingestion_mapping_editor",
         )
-        if st.button("Importer la pagination saisie", key="ingestion_import_manual_pagination"):
-            parsed = parse_manual_pagination_text(st.session_state.get("ingestion_manual_pagination_text", ""))
-            title_lookup = piece_title_lookup_from_state(
-                st.session_state.get("ingestion_mapping_rows", []),
-                st.session_state.get("ingestion_bcp_extracted_titles", {}),
+        mapping_validation_ok = True
+        if mapping_warnings:
+            mapping_validation_ok = st.checkbox(
+                "Je valide manuellement cette correspondance malgré les alertes",
+                value=False,
+                key="ingestion_mapping_manual_validation",
             )
-            parsed["rows"] = apply_piece_titles_to_split_rows(parsed["rows"], title_lookup)
-            st.session_state["ingestion_manual_pagination_parse"] = parsed
-            if parsed["errors"]:
-                st.error("Import partiel ou impossible : corriger les lignes signalées.")
-                st.json(parsed["errors"])
-            if parsed["rows"]:
-                st.session_state["ingestion_manual_split_rows"] = parsed["rows"]
-                st.session_state["ingestion_manual_split_rows_current"] = parsed["rows"]
-                st.session_state["ingestion_manual_pagination_imported_count"] = parsed["imported_line_count"]
-                st.success(f"Pagination importée : {len(parsed['rows'])} ligne(s).")
-                st.write("Diagnostic libellés pagination manuelle")
-                st.json(st.session_state.get("ingestion_manual_pagination_label_diagnostics", []))
-    else:
-        st.info("Sélectionner un PDF multi-pièces pour afficher la table de découpe manuelle.")
-    current_split_rows = st.session_state.get("ingestion_manual_split_rows_current") or st.session_state.get("ingestion_manual_split_rows", [])
-    st.session_state["ingestion_manual_split_rows"] = current_split_rows
-    st.session_state["ingestion_manual_split_rows_current"] = current_split_rows
-    split_preview = prepare_manual_split_rows(
-        current_split_rows,
-        multi_pdf_total_pages,
-        split_output_dir_pc,
-        project_config,
-        aff_id_ing,
-        check_existing=True,
-    )
-    expected_manual_piece_count = sum(
-        1
-        for row in current_split_rows
-        if coerce_editor_int((row or {}).get("numero_piece")) is not None
-        and coerce_editor_int((row or {}).get("page_debut")) is not None
-        and coerce_editor_int((row or {}).get("page_fin")) is not None
-    )
-    with st.expander("Debug data_editor découpe manuelle", expanded=True):
-        st.write("raw_editor_value")
-        st.json([])
-        st.write("editor_state")
-        st.json({
-            "source": "pagination_manuelle_texte",
-            "parse": st.session_state.get("ingestion_manual_pagination_parse", {}),
-            "texte": st.session_state.get("ingestion_manual_pagination_text", ""),
-        })
-        st.write("lignes_normalisees")
-        st.json(split_preview.get("rows"))
-        st.write("pieces_retenues")
-        st.json({
-            "expected_manual_piece_count": expected_manual_piece_count,
-            "pieces_count": len(split_preview.get("pieces") or []),
-            "pieces": split_preview.get("pieces") or [],
-        })
-        st.write("diagnostic_libelles")
-        st.json(st.session_state.get("ingestion_manual_pagination_label_diagnostics", []))
-    if current_split_rows:
-        st.dataframe(prepare_df_for_streamlit_display(split_preview.get("rows") or current_split_rows), width="stretch")
-    if split_preview["errors"]:
-        st.error("Découpe non prête : corriger les erreurs de pagination ou de sortie.")
-        st.json(split_preview["errors"])
-    if split_preview["warnings"]:
-        st.warning("Points à vérifier avant découpe.")
-        st.json(split_preview["warnings"])
-    with st.expander("Aperçu du plan de découpe", expanded=False):
-        st.json({
-            "input_path_pcfixe": multi_pdf_pc,
+        if st.button("Valider la correspondance", key="ingestion_log_mapping"):
+            if mapping_warnings and not mapping_validation_ok:
+                st.error("Validation manuelle requise avant journalisation définitive.")
+                st.stop()
+            rows = data_editor_rows(edited_mapping)
+            for row in rows:
+                row["libelle_final"] = compact_spaces(row.get("libelle_final") or row.get("intitule_bcp") or row.get("intitule_fichier") or "")
+                row["libelle_affichage"] = build_libelle_affichage(
+                    row.get("numero_piece"),
+                    row.get("sous_piece") or "",
+                    row.get("libelle_final") or "",
+                )
+                destination = str(row.get("destination") or "")
+                page_meta = file_page_count_record(Path(destination)) if destination else {
+                    "page_count": None,
+                    "page_count_source": "unknown",
+                    "page_count_error": "destination absente",
+                }
+                row.update(page_meta)
+                row["action"] = row.get("action") if row.get("action") in {"classer", "ignorer", "à vérifier"} else "à vérifier"
+            log_path = write_ingestion_log(aff_root_local, {
+                "ts": datetime.now().isoformat(timespec="seconds"),
+                "action": "ingestion_contradictoire_mapping_validated",
+                "aff_id": get_project_id(project_config, ""),
+                "transmission_id": st.session_state.get("last_transmission_id"),
+                "party": {
+                    "code_partie": (ingestion_party or {}).get("code_partie"),
+                    "nom": (ingestion_party or {}).get("nom"),
+                    "folder_rel": folder_rel_ing,
+                },
+                "rows": rows,
+                "mapping_warnings": mapping_warnings,
+                "manual_validation": bool(mapping_validation_ok),
+                "definitive": True,
+                "note": "Table validée par l'utilisateur; aucun titre n'est inventé automatiquement.",
+            }, project_config)
+            st.success(f"Correspondance journalisée : {log_path}")
+    
+        st.markdown("#### PDF multi-pièces")
+        aff_id_ing = get_project_id(project_config, "")
+        multi_pdf_selected = multi_pdf_name != "(aucun)" and bool(folder_rel_ing)
+        multi_pdf_source = resolve_ingestion_local_source(
+            aff_root_local,
+            folder_rel_ing,
+            multi_pdf_name if multi_pdf_selected else "",
+            project_config,
+            st.session_state.get("ingestion_local_original_paths", {}),
+        )
+        multi_pdf_local = multi_pdf_source.get("selected_source") or ""
+        multi_pdf_pages_meta = file_page_count_record(Path(multi_pdf_local)) if multi_pdf_local else {"page_count": None}
+        multi_pdf_total_pages = multi_pdf_pages_meta.get("page_count") if multi_pdf_pages_meta.get("page_count_source") == "pdf_metadata" else None
+        multi_pdf_pc = pj(proj_pcfixe_ing, folder_rel_ing, multi_pdf_name) if multi_pdf_selected else ""
+        split_output_dir_pc_default = pj(proj_pcfixe_ing, folder_rel_ing) if folder_rel_ing else ""
+        split_output_dir_pc_raw = st.text_input(
+            "Dossier de sortie des pièces découpées (chemin vu PC fixe)",
+            value=split_output_dir_pc_default,
+            key="ingestion_split_output_dir",
+        )
+        split_output_dir_pc = _norm(split_output_dir_pc_raw) or split_output_dir_pc_default
+        split_output_dir_nas = pj(effective_nas_affaire_root(project_config, aff_id_ing), folder_rel_ing) if folder_rel_ing else ""
+        selected_part_folder = folder_rel_ing
+        st.write("Diagnostic dossier sortie découpe PDF multi-pièces", {
+            "output_dir_pcfixe_raw": split_output_dir_pc_raw,
             "output_dir_pcfixe": split_output_dir_pc,
-            "output_dir_unc": split_preview.get("output_dir_unc"),
+            "output_dir_pcfixe_default": split_output_dir_pc_default,
+            "output_dir_unc": pcfixe_server_path_to_unc(project_config, aff_id_ing, split_output_dir_pc),
             "output_dir_nas": split_output_dir_nas,
-            "lignes_normalisees": split_preview.get("rows"),
-            "pieces": split_preview.get("pieces"),
+            "dossier_partie": folder_rel_ing,
+            "selected_part_folder": selected_part_folder,
+            "roots.pcfixe": (project_config.get("roots") or {}).get("pcfixe"),
+            "roots.nas": (project_config.get("roots") or {}).get("nas"),
+            "proj_pcfixe_ing": proj_pcfixe_ing,
         })
-
-    def _run_manual_split(dry_run: bool):
-        if not multi_pdf_selected:
-            st.error("Choisir un PDF multi-pièces.")
-            return
-        if not multi_pdf_local:
-            st.error("PDF multi-pièces introuvable localement. Classer d'abord les originaux.")
-            st.json(multi_pdf_source)
-            return
-        copy_info = copy_ingestion_file_to_pcfixe_party(multi_pdf_local, project_config, aff_id_ing, folder_rel_ing)
-        st.write("Copie immédiate PDF multi-pièces vers NAS / PC fixe")
-        st.json({
-            "source_laptop": copy_info.get("source_laptop"),
-            "destination_nas": copy_info.get("destination_nas"),
-            "destination_pcfixe_unc": copy_info.get("destination_pcfixe_unc"),
-            "input_path_pcfixe_transmis": copy_info.get("input_path_pcfixe"),
-            "output_dir_pcfixe": copy_info.get("output_dir_pcfixe"),
-            "nas_exists_before": copy_info.get("nas_exists_before"),
-            "nas_action": copy_info.get("nas_action"),
-            "nas_exists_after": copy_info.get("nas_exists_after"),
-            "nas_error": copy_info.get("nas_error"),
-            "pcfixe_exists_before": copy_info.get("pcfixe_exists_before"),
-            "pcfixe_action": copy_info.get("pcfixe_action"),
-            "pcfixe_exists_after": copy_info.get("pcfixe_exists_after"),
-            "pcfixe_error": copy_info.get("pcfixe_error"),
+        if multi_pdf_selected:
+            st.caption(f"PDF local : {multi_pdf_local or '(introuvable localement)'}")
+            st.caption(f"Nombre de pages détecté : {multi_pdf_total_pages or 'indéterminé'}")
+    
+        if st.button("OCR du PDF multi-pièces", key="ingestion_multi_pdf_ocr"):
+            if not multi_pdf_selected:
+                st.error("Choisir un PDF multi-pièces.")
+            elif not multi_pdf_local:
+                st.error("PDF multi-pièces introuvable dans le dossier de partie. Classer d'abord les originaux.")
+                st.json(multi_pdf_source)
+            elif not ensure_ready():
+                st.error("Serveur injoignable.")
+            else:
+                copy_info = copy_ingestion_file_to_technical_depots(multi_pdf_local, project_config, aff_id_ing)
+                st.json(copy_info)
+                if not copy_info.get("ok_for_server"):
+                    st.error("OCR bloqué : copie PC fixe impossible ou fichier indisponible côté serveur.")
+                else:
+                    input_path_pc = copy_info["chemin_transmis_serveur"]
+                    st.session_state["ingestion_multi_pdf_server_path"] = input_path_pc
+                    payload_ocr = {
+                        "input_path": input_path_pc,
+                        "output_dir": ocr_out_ing,
+                        "lang": "fra",
+                        "dpi": 300,
+                        "project_id": aff_id_ing,
+                    }
+                    try:
+                        r = requests.post(f"{SERVER_URL}/ocr", headers={"x-api-key": API_KEY}, json=payload_ocr, timeout=900)
+                        data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {"ok": False, "raw": r.text}
+                        generated_source = first_generated_ocr_source(data)
+                        if generated_source:
+                            st.session_state["ingestion_multi_pdf_ocr_csv"] = generated_source
+                            st.session_state["ingestion_detect_csv"] = generated_source
+                        log_path = write_ingestion_log(aff_root_local, {
+                            "ts": datetime.now().isoformat(timespec="seconds"),
+                            "action": "ingestion_multi_pdf_ocr",
+                            "aff_id": aff_id_ing,
+                            "transmission_id": st.session_state.get("last_transmission_id"),
+                            "date_transmission_expert": str(date_transmission_expert) if date_transmission_expert else "",
+                            "ocr_performed": True,
+                            "pdf_source_local": multi_pdf_local,
+                            "copy_info": copy_info,
+                            "payload": payload_ocr,
+                            "csv_ocr": generated_source,
+                            "response": data,
+                        }, project_config)
+                        st.success(f"OCR PDF multi-pièces terminée. Journal : {log_path}")
+                        if generated_source:
+                            st.info(f"CSV/JSON OCR du PDF multi-pièces : {generated_source}")
+                        st.json(data)
+                    except Exception as e:
+                        st.error(f"Erreur OCR PDF multi-pièces : {e}")
+    
+        if "ingestion_detect_csv" not in st.session_state:
+            st.session_state["ingestion_detect_csv"] = st.session_state.get("ingestion_multi_pdf_ocr_csv", "")
+        detect_csv_path = st.text_input("CSV OCR du PDF multi-pièces", key="ingestion_detect_csv")
+        if st.button("Détecter automatiquement les limites de pièces", key="ingestion_detect_boundaries"):
+            if not detect_csv_path.strip():
+                st.error("Renseigner le CSV OCR du PDF multi-pièces ou lancer l'OCR optionnelle de ce PDF.")
+            elif not ensure_ready():
+                st.error("Serveur injoignable.")
+            else:
+                r = requests.post(
+                    f"{SERVER_URL}/api/detect_piece_boundaries",
+                    headers={"x-api-key": API_KEY},
+                    json={"project_id": aff_id_ing, "csv_path": detect_csv_path.strip()},
+                    timeout=timeout,
+                )
+                data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {"ok": False, "raw": r.text}
+                if data.get("ok"):
+                    st.session_state["ingestion_manual_split_rows"] = split_rows_from_detected_pieces(
+                        data.get("pieces", []),
+                        st.session_state.get("ingestion_mapping_rows", []),
+                    )
+                    st.success("Limites détectées et reportées dans la table manuelle.")
+                st.json(data)
+    
+        if not st.session_state.get("ingestion_manual_split_rows"):
+            seeded_split_rows = split_rows_from_mapping(st.session_state.get("ingestion_mapping_rows", []))
+            if seeded_split_rows:
+                st.session_state["ingestion_manual_split_rows"] = seeded_split_rows
+            elif multi_pdf_selected:
+                st.session_state["ingestion_manual_split_rows"] = [blank_manual_split_row()]
+    
+        manual_table_rows = st.session_state.get("ingestion_manual_split_rows", [])
+        st.write("Diagnostic PDF multi-pièces", {
+            "pdf_multi_selected": bool(multi_pdf_selected),
+            "split_plan": st.session_state.get("ingestion_split_rows", []),
+            "split_plan_manual": st.session_state.get("ingestion_manual_split_rows", []),
+            "manual_table_rows": manual_table_rows,
+            "conditions_affichage": {
+                "table_affichee": bool(multi_pdf_selected),
+                "ocr_prealable_requis": False,
+                "plan_decoupe_non_vide_requis": False,
+                "session_state_requis": False,
+                "ligne_vide_injectee_si_aucun_plan": bool(multi_pdf_selected and len(manual_table_rows) == 1 and not manual_table_rows[0].get("numero_piece")),
+            },
         })
-        if not copy_info.get("pcfixe_exists_after") or not copy_info.get("input_path_pcfixe"):
-            st.error("Découpe bloquée : le PDF multi-pièces n'est pas disponible dans le dossier de partie côté PC fixe.")
-            st.json(copy_info)
-            return
-        input_path_pc = copy_info["input_path_pcfixe"]
-        st.session_state["ingestion_multi_pdf_server_path"] = input_path_pc
-        edited_rows_for_split = st.session_state.get("ingestion_manual_split_rows_current") or current_split_rows
-        prepared = prepare_manual_split_rows(
-            edited_rows_for_split,
+    
+        if multi_pdf_selected:
+            st.markdown("##### Découpe manuelle du PDF multi-pièces")
+            st.text_area(
+                "Pagination manuelle",
+                key="ingestion_manual_pagination_text",
+                height=220,
+                placeholder=(
+                    "numero_piece;page_debut;page_fin;libelle_final\n"
+                    "1;1;16;Piece 1\n"
+                    "2;17;18;Piece 2\n"
+                    "3;19;24;Piece 3"
+                ),
+                help="Coller une ligne par pièce au format numero_piece;page_debut;page_fin;libelle_final.",
+            )
+            if st.button("Importer la pagination saisie", key="ingestion_import_manual_pagination"):
+                parsed = parse_manual_pagination_text(st.session_state.get("ingestion_manual_pagination_text", ""))
+                title_lookup = piece_title_lookup_from_state(
+                    st.session_state.get("ingestion_mapping_rows", []),
+                    st.session_state.get("ingestion_bcp_extracted_titles", {}),
+                )
+                parsed["rows"] = apply_piece_titles_to_split_rows(parsed["rows"], title_lookup)
+                st.session_state["ingestion_manual_pagination_parse"] = parsed
+                if parsed["errors"]:
+                    st.error("Import partiel ou impossible : corriger les lignes signalées.")
+                    st.json(parsed["errors"])
+                if parsed["rows"]:
+                    st.session_state["ingestion_manual_split_rows"] = parsed["rows"]
+                    st.session_state["ingestion_manual_split_rows_current"] = parsed["rows"]
+                    st.session_state["ingestion_manual_pagination_imported_count"] = parsed["imported_line_count"]
+                    st.success(f"Pagination importée : {len(parsed['rows'])} ligne(s).")
+                    st.write("Diagnostic libellés pagination manuelle")
+                    st.json(st.session_state.get("ingestion_manual_pagination_label_diagnostics", []))
+        else:
+            st.info("Sélectionner un PDF multi-pièces pour afficher la table de découpe manuelle.")
+        current_split_rows = st.session_state.get("ingestion_manual_split_rows_current") or st.session_state.get("ingestion_manual_split_rows", [])
+        st.session_state["ingestion_manual_split_rows"] = current_split_rows
+        st.session_state["ingestion_manual_split_rows_current"] = current_split_rows
+        split_preview = prepare_manual_split_rows(
+            current_split_rows,
             multi_pdf_total_pages,
             split_output_dir_pc,
             project_config,
             aff_id_ing,
-            check_existing=not dry_run,
+            check_existing=True,
         )
-        if prepared["errors"]:
-            st.error("Découpe bloquée : erreurs dans la table.")
-            st.json(prepared["errors"])
-            return
-        active_pieces = prepared.get("pieces") or []
-        imported_count = int(st.session_state.get("ingestion_manual_pagination_imported_count") or 0)
-        parse_errors = (st.session_state.get("ingestion_manual_pagination_parse") or {}).get("errors") or []
-        if parse_errors:
-            st.error("Appel serveur bloqué : la pagination importée contient des erreurs.")
-            st.json(parse_errors)
-            return
-        if imported_count and len(active_pieces) < imported_count:
-            st.error(
-                "Appel serveur bloqué : le plan contient moins de lignes que le texte importé "
-                f"({len(active_pieces)}/{imported_count})."
-            )
-            st.json({
-                "texte_importe": st.session_state.get("ingestion_manual_pagination_text", ""),
-                "lignes_normalisees": prepared.get("rows"),
-                "pieces": active_pieces,
-            })
-            return
-        expected_count = sum(
+        expected_manual_piece_count = sum(
             1
-            for row in edited_rows_for_split
+            for row in current_split_rows
             if coerce_editor_int((row or {}).get("numero_piece")) is not None
             and coerce_editor_int((row or {}).get("page_debut")) is not None
             and coerce_editor_int((row or {}).get("page_fin")) is not None
         )
-        if expected_count and len(active_pieces) != expected_count:
-            st.error(
-                "Appel serveur bloqué : toutes les lignes visibles avec numero_piece, "
-                f"page_debut et page_fin ne sont pas reprises ({len(active_pieces)}/{expected_count})."
-            )
+        with st.expander("Debug data_editor découpe manuelle", expanded=True):
+            st.write("raw_editor_value")
+            st.json([])
+            st.write("editor_state")
             st.json({
-                "lignes_editees": edited_rows_for_split,
-                "lignes_normalisees": prepared.get("rows"),
-                "pieces": active_pieces,
+                "source": "pagination_manuelle_texte",
+                "parse": st.session_state.get("ingestion_manual_pagination_parse", {}),
+                "texte": st.session_state.get("ingestion_manual_pagination_text", ""),
             })
-            return
-        if not active_pieces:
-            st.error("Aucune ligne avec action 'découper'.")
-            return
-        if "_RAG_PC" in str(split_output_dir_pc):
-            st.error("Dossier de sortie refusé : les PDF découpés doivent être écrits dans le dossier de la partie, pas dans _RAG_PC.")
-            st.json({"output_dir_pcfixe": split_output_dir_pc, "dossier_partie_attendu": pj(proj_pcfixe_ing, folder_rel_ing)})
-            return
-        payload = {
-            "jobs": [{
-                "project_id": aff_id_ing,
-                "input_path": input_path_pc,
-                "output_dir": split_output_dir_pc,
-                "output_dir_nas": copy_info.get("output_dir_nas"),
-                "mirror_to_nas": True,
-                "pieces": active_pieces,
-                "dry_run": bool(dry_run),
-                "overwrite": False,
-            }],
-            "stop_on_error": False,
-        }
-        st.write("Payload envoyé à /api/split_pdf_batch")
-        st.json(payload)
-        try:
-            r = requests.post(
-                f"{SERVER_URL}/api/split_pdf_batch",
-                headers={"x-api-key": API_KEY},
-                json=payload,
-                timeout=max(timeout, 300 if dry_run else 600),
-            )
-            data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {"ok": False, "raw": r.text}
-            st.write("Réponse complète /api/split_pdf_batch")
-            st.json(data)
-            if data.get("ok") is False:
-                st.error(f"Erreur serveur split_pdf_batch : {data.get('error') or data}")
-            log_path = write_ingestion_log(aff_root_local, {
-                "ts": datetime.now().isoformat(timespec="seconds"),
-                "action": "ingestion_multi_pdf_split",
-                "aff_id": aff_id_ing,
-                "transmission_id": st.session_state.get("last_transmission_id"),
-                "date_transmission_expert": str(date_transmission_expert) if date_transmission_expert else "",
-                "dry_run": bool(dry_run),
-                "ocr_pdf_multi_pieces_effectuee": bool(st.session_state.get("ingestion_multi_pdf_ocr_csv")),
-                "csv_ocr_pdf_multi_pieces": st.session_state.get("ingestion_multi_pdf_ocr_csv") or "",
-                "pdf_source_local": multi_pdf_local,
-                "pdf_source_pcfixe": input_path_pc,
-                "copy_info": copy_info,
-                "pagination": prepared.get("rows"),
-                "pieces": active_pieces,
+            st.write("lignes_normalisees")
+            st.json(split_preview.get("rows"))
+            st.write("pieces_retenues")
+            st.json({
+                "expected_manual_piece_count": expected_manual_piece_count,
+                "pieces_count": len(split_preview.get("pieces") or []),
+                "pieces": split_preview.get("pieces") or [],
+            })
+            st.write("diagnostic_libelles")
+            st.json(st.session_state.get("ingestion_manual_pagination_label_diagnostics", []))
+        if current_split_rows:
+            st.dataframe(prepare_df_for_streamlit_display(split_preview.get("rows") or current_split_rows), width="stretch")
+        if split_preview["errors"]:
+            st.error("Découpe non prête : corriger les erreurs de pagination ou de sortie.")
+            st.json(split_preview["errors"])
+        if split_preview["warnings"]:
+            st.warning("Points à vérifier avant découpe.")
+            st.json(split_preview["warnings"])
+        with st.expander("Aperçu du plan de découpe", expanded=False):
+            st.json({
+                "input_path_pcfixe": multi_pdf_pc,
                 "output_dir_pcfixe": split_output_dir_pc,
-                "output_dir_unc": prepared.get("output_dir_unc"),
-                "output_dir_nas": copy_info.get("output_dir_nas"),
-                "warnings": prepared.get("warnings"),
-                "response": data,
-            }, project_config)
-            st.info(f"Journal découpe : {log_path}")
-            st.json(data)
-        except Exception as e:
-            st.error(f"Erreur découpe PDF multi-pièces : {e}")
-
-    col_split_1, col_split_2 = st.columns(2)
-    with col_split_1:
-        if st.button("Simuler la découpe", key="ingestion_split_dry_run"):
-            _run_manual_split(dry_run=True)
-    with col_split_2:
-        if st.button("Exécuter la découpe", key="ingestion_split_execute"):
-            _run_manual_split(dry_run=False)
-
-    st.info("La vectorisation RAG n'est pas lancée par cette ingestion. Utiliser ensuite les actions explicites OCR / CSV / JSON / RAG.")
-
-col_classify, col_technical = st.columns(2)
-with col_classify:
-    if uploaded_files and st.button("Valider le dépôt documentaire dans la partie sélectionnée"):
-        if not selected_party:
-            st.error("Aucune partie cible disponible.")
-        elif not date_transmission_expert:
-            st.error("Renseigner la date de transmission à l'expert dans le bloc d'ingestion.")
-        elif not type_transmission:
-            st.error("Renseigner le type de transmission dans le bloc d'ingestion.")
-        elif not auteur_transmission.strip():
-            st.error("Renseigner l'auteur ou le conseil dans le bloc d'ingestion.")
-        else:
-            try:
-                transmission_id = make_transmission_id(get_project_id(project_config, ""))
-                transmission_meta = {
-                    "transmission_id": transmission_id,
-                    "date_transmission_expert": date_transmission_expert.isoformat(),
-                    "type_transmission": type_transmission,
-                    "auteur_transmission": auteur_transmission.strip(),
-                    "reference": reference_transmission.strip(),
-                    "commentaire": commentaire_transmission.strip(),
-                    "dossier_source": "streamlit_upload",
-                }
-                event = classify_original_files_to_party(
-                    aff_root_local,
-                    get_project_id(project_config, ""),
-                    selected_party,
-                    uploaded_files,
-                    transmission_meta,
-                    selected_document_roles,
+                "output_dir_unc": split_preview.get("output_dir_unc"),
+                "output_dir_nas": split_output_dir_nas,
+                "lignes_normalisees": split_preview.get("rows"),
+                "pieces": split_preview.get("pieces"),
+            })
+    
+        def _run_manual_split(dry_run: bool):
+            if not multi_pdf_selected:
+                st.error("Choisir un PDF multi-pièces.")
+                return
+            if not multi_pdf_local:
+                st.error("PDF multi-pièces introuvable localement. Classer d'abord les originaux.")
+                st.json(multi_pdf_source)
+                return
+            copy_info = copy_ingestion_file_to_pcfixe_party(multi_pdf_local, project_config, aff_id_ing, folder_rel_ing)
+            st.write("Copie immédiate PDF multi-pièces vers NAS / PC fixe")
+            st.json({
+                "source_laptop": copy_info.get("source_laptop"),
+                "destination_nas": copy_info.get("destination_nas"),
+                "destination_pcfixe_unc": copy_info.get("destination_pcfixe_unc"),
+                "input_path_pcfixe_transmis": copy_info.get("input_path_pcfixe"),
+                "output_dir_pcfixe": copy_info.get("output_dir_pcfixe"),
+                "nas_exists_before": copy_info.get("nas_exists_before"),
+                "nas_action": copy_info.get("nas_action"),
+                "nas_exists_after": copy_info.get("nas_exists_after"),
+                "nas_error": copy_info.get("nas_error"),
+                "pcfixe_exists_before": copy_info.get("pcfixe_exists_before"),
+                "pcfixe_action": copy_info.get("pcfixe_action"),
+                "pcfixe_exists_after": copy_info.get("pcfixe_exists_after"),
+                "pcfixe_error": copy_info.get("pcfixe_error"),
+            })
+            if not copy_info.get("pcfixe_exists_after") or not copy_info.get("input_path_pcfixe"):
+                st.error("Découpe bloquée : le PDF multi-pièces n'est pas disponible dans le dossier de partie côté PC fixe.")
+                st.json(copy_info)
+                return
+            input_path_pc = copy_info["input_path_pcfixe"]
+            st.session_state["ingestion_multi_pdf_server_path"] = input_path_pc
+            edited_rows_for_split = st.session_state.get("ingestion_manual_split_rows_current") or current_split_rows
+            prepared = prepare_manual_split_rows(
+                edited_rows_for_split,
+                multi_pdf_total_pages,
+                split_output_dir_pc,
+                project_config,
+                aff_id_ing,
+                check_existing=not dry_run,
+            )
+            if prepared["errors"]:
+                st.error("Découpe bloquée : erreurs dans la table.")
+                st.json(prepared["errors"])
+                return
+            active_pieces = prepared.get("pieces") or []
+            imported_count = int(st.session_state.get("ingestion_manual_pagination_imported_count") or 0)
+            parse_errors = (st.session_state.get("ingestion_manual_pagination_parse") or {}).get("errors") or []
+            if parse_errors:
+                st.error("Appel serveur bloqué : la pagination importée contient des erreurs.")
+                st.json(parse_errors)
+                return
+            if imported_count and len(active_pieces) < imported_count:
+                st.error(
+                    "Appel serveur bloqué : le plan contient moins de lignes que le texte importé "
+                    f"({len(active_pieces)}/{imported_count})."
                 )
-                st.session_state["last_transmission_id"] = event.get("transmission_id")
-                copied_count = len(event.get("copied") or event.get("files") or [])
-                existing_count = len(event.get("skipped") or [])
-                error_count = len(event.get("errors") or [])
-                ignored_count = 0
-                summary = (
-                    f"{copied_count} fichier(s) copié(s), "
-                    f"{existing_count} fichier(s) déjà existant(s), "
-                    f"{ignored_count} fichier(s) ignoré(s), "
-                    f"{error_count} erreur(s)."
+                st.json({
+                    "texte_importe": st.session_state.get("ingestion_manual_pagination_text", ""),
+                    "lignes_normalisees": prepared.get("rows"),
+                    "pieces": active_pieces,
+                })
+                return
+            expected_count = sum(
+                1
+                for row in edited_rows_for_split
+                if coerce_editor_int((row or {}).get("numero_piece")) is not None
+                and coerce_editor_int((row or {}).get("page_debut")) is not None
+                and coerce_editor_int((row or {}).get("page_fin")) is not None
+            )
+            if expected_count and len(active_pieces) != expected_count:
+                st.error(
+                    "Appel serveur bloqué : toutes les lignes visibles avec numero_piece, "
+                    f"page_debut et page_fin ne sont pas reprises ({len(active_pieces)}/{expected_count})."
                 )
-                if error_count:
-                    st.error(summary)
-                elif copied_count:
-                    st.success(summary)
-                else:
-                    st.info(summary)
-                st.info(f"transmission_id : {event.get('transmission_id')}")
-                st.info(f"Journal transmissions : {event.get('transmissions_journal_path')}")
-                with st.expander("Journal du classement", expanded=False):
-                    st.json(event)
-            except Exception as e:
-                st.error(f"Erreur classement dans la partie : {e}")
-
-with col_technical:
-    if uploaded_files and st.button("⬆️ Envoyer au dépôt technique / OCR-RAG"):
-        for f in uploaded_files:
-            files = {"file": (f.name, f.getvalue(), "application/octet-stream")}
-            form = {
-                "project_id": get_project_id(project_config, ""),
-                "area": "rag_pc",
-                "subdir": "Depot_initial",  # Dossier cible sur le PC fixe
-                "filename": f.name,
-                "overwrite": "true"
+                st.json({
+                    "lignes_editees": edited_rows_for_split,
+                    "lignes_normalisees": prepared.get("rows"),
+                    "pieces": active_pieces,
+                })
+                return
+            if not active_pieces:
+                st.error("Aucune ligne avec action 'découper'.")
+                return
+            if "_RAG_PC" in str(split_output_dir_pc):
+                st.error("Dossier de sortie refusé : les PDF découpés doivent être écrits dans le dossier de la partie, pas dans _RAG_PC.")
+                st.json({"output_dir_pcfixe": split_output_dir_pc, "dossier_partie_attendu": pj(proj_pcfixe_ing, folder_rel_ing)})
+                return
+            payload = {
+                "jobs": [{
+                    "project_id": aff_id_ing,
+                    "input_path": input_path_pc,
+                    "output_dir": split_output_dir_pc,
+                    "output_dir_nas": copy_info.get("output_dir_nas"),
+                    "mirror_to_nas": True,
+                    "pieces": active_pieces,
+                    "dry_run": bool(dry_run),
+                    "overwrite": False,
+                }],
+                "stop_on_error": False,
             }
+            st.write("Payload envoyé à /api/split_pdf_batch")
+            st.json(payload)
             try:
-                r = requests.post(f"{SERVER_URL}/upload_file", headers={"x-api-key": API_KEY}, files=files, data=form, timeout=120)
-                st.success(f"{f.name} → {r.json().get('message','OK')}")
+                r = requests.post(
+                    f"{SERVER_URL}/api/split_pdf_batch",
+                    headers={"x-api-key": API_KEY},
+                    json=payload,
+                    timeout=max(timeout, 300 if dry_run else 600),
+                )
+                data = r.json() if r.headers.get("Content-Type", "").startswith("application/json") else {"ok": False, "raw": r.text}
+                st.write("Réponse complète /api/split_pdf_batch")
+                st.json(data)
+                if data.get("ok") is False:
+                    st.error(f"Erreur serveur split_pdf_batch : {data.get('error') or data}")
+                log_path = write_ingestion_log(aff_root_local, {
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "action": "ingestion_multi_pdf_split",
+                    "aff_id": aff_id_ing,
+                    "transmission_id": st.session_state.get("last_transmission_id"),
+                    "date_transmission_expert": str(date_transmission_expert) if date_transmission_expert else "",
+                    "dry_run": bool(dry_run),
+                    "ocr_pdf_multi_pieces_effectuee": bool(st.session_state.get("ingestion_multi_pdf_ocr_csv")),
+                    "csv_ocr_pdf_multi_pieces": st.session_state.get("ingestion_multi_pdf_ocr_csv") or "",
+                    "pdf_source_local": multi_pdf_local,
+                    "pdf_source_pcfixe": input_path_pc,
+                    "copy_info": copy_info,
+                    "pagination": prepared.get("rows"),
+                    "pieces": active_pieces,
+                    "output_dir_pcfixe": split_output_dir_pc,
+                    "output_dir_unc": prepared.get("output_dir_unc"),
+                    "output_dir_nas": copy_info.get("output_dir_nas"),
+                    "warnings": prepared.get("warnings"),
+                    "response": data,
+                }, project_config)
+                st.info(f"Journal découpe : {log_path}")
+                st.json(data)
             except Exception as e:
-                st.error(f"Erreur pour {f.name}: {e}")
+                st.error(f"Erreur découpe PDF multi-pièces : {e}")
+    
+        col_split_1, col_split_2 = st.columns(2)
+        with col_split_1:
+            if st.button("Simuler la découpe", key="ingestion_split_dry_run"):
+                _run_manual_split(dry_run=True)
+        with col_split_2:
+            if st.button("Exécuter la découpe", key="ingestion_split_execute"):
+                _run_manual_split(dry_run=False)
+    
+        st.info("La vectorisation RAG n'est pas lancée par cette ingestion. Utiliser ensuite les actions explicites OCR / CSV / JSON / RAG.")
+    
+    col_classify, col_technical = st.columns(2)
+    with col_classify:
+        if uploaded_files and st.button("Valider le dépôt documentaire dans la partie sélectionnée"):
+            if not selected_party:
+                st.error("Aucune partie cible disponible.")
+            elif not date_transmission_expert:
+                st.error("Renseigner la date de transmission à l'expert dans le bloc d'ingestion.")
+            elif not type_transmission:
+                st.error("Renseigner le type de transmission dans le bloc d'ingestion.")
+            elif not auteur_transmission.strip():
+                st.error("Renseigner l'auteur ou le conseil dans le bloc d'ingestion.")
+            else:
+                try:
+                    transmission_id = make_transmission_id(get_project_id(project_config, ""))
+                    transmission_meta = {
+                        "transmission_id": transmission_id,
+                        "date_transmission_expert": date_transmission_expert.isoformat(),
+                        "type_transmission": type_transmission,
+                        "auteur_transmission": auteur_transmission.strip(),
+                        "reference": reference_transmission.strip(),
+                        "commentaire": commentaire_transmission.strip(),
+                        "dossier_source": "streamlit_upload",
+                    }
+                    event = classify_original_files_to_party(
+                        aff_root_local,
+                        get_project_id(project_config, ""),
+                        selected_party,
+                        uploaded_files,
+                        transmission_meta,
+                        selected_document_roles,
+                    )
+                    st.session_state["last_transmission_id"] = event.get("transmission_id")
+                    copied_count = len(event.get("copied") or event.get("files") or [])
+                    existing_count = len(event.get("skipped") or [])
+                    error_count = len(event.get("errors") or [])
+                    ignored_count = 0
+                    summary = (
+                        f"{copied_count} fichier(s) copié(s), "
+                        f"{existing_count} fichier(s) déjà existant(s), "
+                        f"{ignored_count} fichier(s) ignoré(s), "
+                        f"{error_count} erreur(s)."
+                    )
+                    if error_count:
+                        st.error(summary)
+                    elif copied_count:
+                        st.success(summary)
+                    else:
+                        st.info(summary)
+                    st.info(f"transmission_id : {event.get('transmission_id')}")
+                    st.info(f"Journal transmissions : {event.get('transmissions_journal_path')}")
+                    with st.expander("Journal du classement", expanded=False):
+                        st.json(event)
+                except Exception as e:
+                    st.error(f"Erreur classement dans la partie : {e}")
+    
+    with col_technical:
+        if uploaded_files and st.button("⬆️ Envoyer au dépôt technique / OCR-RAG"):
+            for f in uploaded_files:
+                files = {"file": (f.name, f.getvalue(), "application/octet-stream")}
+                form = {
+                    "project_id": get_project_id(project_config, ""),
+                    "area": "rag_pc",
+                    "subdir": "Depot_initial",  # Dossier cible sur le PC fixe
+                    "filename": f.name,
+                    "overwrite": "true"
+                }
+                try:
+                    r = requests.post(f"{SERVER_URL}/upload_file", headers={"x-api-key": API_KEY}, files=files, data=form, timeout=120)
+                    st.success(f"{f.name} → {r.json().get('message','OK')}")
+                except Exception as e:
+                    st.error(f"Erreur pour {f.name}: {e}")
+    
+
+if page == "Pré-traitement dépôt PDF":
+    current_pdf_cohort = current_pdf_cohort if "current_pdf_cohort" in locals() else {}
+    render_classement_originaux_depot_technique(current_pdf_cohort)
 
 st.markdown("## Captations (laptop → NAS)")
 
