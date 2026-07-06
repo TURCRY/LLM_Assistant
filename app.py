@@ -7684,10 +7684,10 @@ elif page == "Pré-traitement dépôt PDF":
     splits_dir_default = pj(proj_pcfixe, "Splits")  # nouveau sous-dossier simple
     input_default = ""  # fichier précis saisi par l'utilisateur
 
-    input_path  = st.text_input("PDF source (chemin VU par le serveur)", value=input_default)
-    output_dir  = st.text_input("Dossier de sortie (PC fixe)", value=splits_dir_default)
-    code_partie = st.text_input("Code partie (ex: 03)", value="")
-    prefix      = st.text_input("Préfixe n° avocat", value="PIECE")
+    input_path  = st.text_input("PDF source (chemin VU par le serveur)", value=input_default, key=f"split_pdf_source_server_{project_id}")
+    output_dir  = st.text_input("Dossier de sortie (PC fixe)", value=splits_dir_default, key=f"split_output_dir_pc_{project_id}")
+    code_partie = st.text_input("Code partie (ex: 03)", value="", key=f"split_code_partie_{project_id}")
+    prefix      = st.text_input("Préfixe n° avocat", value="PIECE", key=f"split_prefix_avocat_{project_id}")
 
     # =====================================================
 
@@ -7718,13 +7718,36 @@ elif page == "Pré-traitement dépôt PDF":
 
     col = st.columns(4)
     with col[0]:
-        dire_pdf = st.selectbox("Dire (optionnel)", ["(aucun)"] + pdfs, index=1 if len(pdfs)>0 else 0)
+        dire_pdf = st.selectbox("Dire (optionnel)", ["(aucun)"] + pdfs, index=1 if len(pdfs)>0 else 0, key=f"dire_pdf_select_{project_id}")
     with col[1]:
-        bord_pdf = st.selectbox("Bordereau (optionnel)", ["(aucun)"] + pdfs, index=2 if len(pdfs)>1 else 0)
+        bord_pdf = st.selectbox("Bordereau (optionnel)", ["(aucun)"] + pdfs, index=2 if len(pdfs)>1 else 0, key=f"bord_pdf_select_{project_id}")
     with col[2]:
-        do_ocr = st.checkbox("OCR côté serveur (immédiat)", value=True)
+        do_ocr = st.checkbox("OCR côté serveur (immédiat)", value=True, key=f"dire_bord_do_ocr_{project_id}")
     with col[3]:
-        max_piece_no = st.number_input("Max n° pièce", min_value=1, max_value=500, value=200, step=1)
+        max_piece_no = st.number_input("Max n° pièce", min_value=1, max_value=500, value=200, step=1, key=f"dire_bord_max_piece_no_{project_id}")
+
+    analysis_scope = st.selectbox(
+        "Documents à analyser",
+        ["Dire + Bordereau", "Dire seulement", "Bordereau seulement"],
+        key=f"dire_bord_analysis_scope_{project_id}",
+    )
+    page_cols = st.columns(2)
+    with page_cols[0]:
+        dire_pages_spec = st.text_input(
+            "Pages utiles Dire",
+            value="",
+            placeholder="ex. 1-3, 8",
+            key=f"dire_pages_spec_{project_id}",
+            disabled=analysis_scope == "Bordereau seulement",
+        )
+    with page_cols[1]:
+        bord_pages_spec = st.text_input(
+            "Pages utiles Bordereau",
+            value="",
+            placeholder="ex. 8 ou 7-9",
+            key=f"bord_pages_spec_{project_id}",
+            disabled=analysis_scope == "Dire seulement",
+        )
 
     def _write_log_event(event: dict):
         try:
@@ -7736,7 +7759,101 @@ elif page == "Pré-traitement dépôt PDF":
         except Exception:
             pass
 
-    if st.button("🔎 Analyser Dire/Bordereau"):
+    def _parse_user_pages(spec: str, page_count: int) -> list[int]:
+        pages: list[int] = []
+        for raw in re.split(r"[,; ]+", (spec or "").strip()):
+            if not raw:
+                continue
+            if "-" in raw:
+                left, right = raw.split("-", 1)
+                if not left.strip().isdigit() or not right.strip().isdigit():
+                    raise ValueError(f"Page invalide : {raw}")
+                start, end = int(left), int(right)
+                if start > end:
+                    start, end = end, start
+                pages.extend(range(start, end + 1))
+            else:
+                if not raw.isdigit():
+                    raise ValueError(f"Page invalide : {raw}")
+                pages.append(int(raw))
+
+        unique_pages: list[int] = []
+        for page_no in pages:
+            if page_no < 1 or page_no > page_count:
+                raise ValueError(f"Page {page_no} hors limites (1-{page_count})")
+            if page_no not in unique_pages:
+                unique_pages.append(page_no)
+        return unique_pages
+
+    def _guided_pdf_name(pdf_name: str, pages: list[int]) -> str:
+        safe_stem = re.sub(r'[<>:"/\\|?*]+', "_", Path(pdf_name).stem).strip(" ._")
+        return f"{safe_stem}_pages_user_{'_'.join(str(p) for p in pages)}.pdf"
+
+    def _extract_guided_pdf(pdf_path: str, pages_spec: str) -> tuple[str, dict]:
+        if not (pages_spec or "").strip():
+            return pdf_path, {"guided": False, "source_pdf": pdf_path}
+        if fitz is None:
+            st.warning("PyMuPDF / fitz indisponible : limitation par pages désactivée pour ce document.")
+            return pdf_path, {"guided": False, "source_pdf": pdf_path, "warning": "fitz indisponible"}
+
+        src = Path(pdf_path)
+        with fitz.open(str(src)) as doc:
+            page_count = doc.page_count
+            user_pages = _parse_user_pages(pages_spec, page_count)
+            guided_dir = Path(depot_dir).joinpath("_Guided_Analysis")
+            guided_dir.mkdir(parents=True, exist_ok=True)
+            guided_pdf = guided_dir / _guided_pdf_name(src.name, user_pages)
+
+            out = fitz.open()
+            for user_page in user_pages:
+                out.insert_pdf(doc, from_page=user_page - 1, to_page=user_page - 1)
+            out.save(str(guided_pdf))
+            out.close()
+
+        st.caption(
+            f"PDF ciblé créé : {guided_pdf} | pages utilisateur {user_pages} | "
+            f"index internes {[p - 1 for p in user_pages]}"
+        )
+        return str(guided_pdf), {
+            "guided": True,
+            "source_pdf": str(src),
+            "guided_pdf": str(guided_pdf),
+            "page_count": page_count,
+            "user_pages": user_pages,
+            "internal_indexes": [p - 1 for p in user_pages],
+        }
+
+    def _pcfixe_pdf_path_for(pdf_path_local: str, pdf_name: str) -> str:
+        local_path = Path(pdf_path_local)
+        if local_path.parent.name == "_Guided_Analysis":
+            return pj(proj_root_pc, "AA_Expert_Admin", "Depot_initial", "_Guided_Analysis", local_path.name)
+        return pj(proj_root_pc, "AA_Expert_Admin", "Depot_initial", pdf_name)
+
+    def _ensure_pdf_available_for_pcfixe(pdf_path_pc: str, pdf_path_local: str) -> dict:
+        result = {"pc_path": pdf_path_pc, "local_path": pdf_path_local, "copied": False}
+        try:
+            if Path(pdf_path_pc).exists():
+                result["exists_pc"] = True
+                return result
+        except Exception:
+            pass
+
+        local_src = Path(pdf_path_local)
+        if not local_src.exists():
+            result["error"] = f"Fichier local introuvable : {local_src}"
+            return result
+
+        try:
+            dst = Path(pdf_path_pc)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(local_src), str(dst))
+            result["copied"] = True
+            st.info(f"Copie vers PC fixe effectuée : {local_src} → {dst}")
+        except Exception as exc:
+            result["error"] = f"Copie vers PC fixe impossible : {exc}"
+        return result
+
+    if st.button("🔎 Analyser Dire/Bordereau", key=f"analyze_dire_bord_{project_id}"):
         if not ensure_server_ready(MAC_PCFIXE, SERVER_IP, int(SERVER_PORT)):
             st.error("Serveur KO"); st.stop()
 
@@ -7746,6 +7863,8 @@ elif page == "Pré-traitement dépôt PDF":
         # Chemins VUS PAR LE PC fixe
         dire_path_pc = pj(proj_root_pc, "AA_Expert_Admin", "Depot_initial", dire_pdf) if dire_pdf != "(aucun)" else None
         bord_path_pc = pj(proj_root_pc, "AA_Expert_Admin", "Depot_initial", bord_pdf) if bord_pdf != "(aucun)" else None
+        dire_path_local = str(Path(depot_dir) / dire_pdf) if dire_pdf != "(aucun)" else None
+        bord_path_local = str(Path(depot_dir) / bord_pdf) if bord_pdf != "(aucun)" else None
 
         ocr_out_dir_pc = pj(proj_root_pc, "AD_Expert_Traitements", "_OCR_Texte")
 
@@ -7792,15 +7911,145 @@ elif page == "Pré-traitement dépôt PDF":
                 return {"csv_path": csv_path}
             return None
 
+        def _read_ocr_csv_text_lines(csv_path: str) -> list[str]:
+            rows: list[str] = []
+            with open(csv_path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
+                reader = csv.DictReader(f, delimiter=";")
+                if reader.fieldnames and "text" in reader.fieldnames:
+                    for row in reader:
+                        rows.append(str(row.get("text") or "").strip())
+                    return rows
+
+            with open(csv_path, "r", encoding="utf-8-sig", errors="replace", newline="") as f:
+                reader = csv.reader(f, delimiter=";")
+                for row in reader:
+                    if not row:
+                        rows.append("")
+                    elif len(row) >= 3:
+                        rows.append(str(row[2] or "").strip())
+                    else:
+                        rows.append(str(row[-1] or "").strip())
+            return rows
+
+        def _normalized_piece_line(text: str) -> str:
+            raw = unicodedata.normalize("NFKD", text or "")
+            asciiish = "".join(ch for ch in raw if not unicodedata.combining(ch)).lower()
+            asciiish = re.sub(r"[^a-z0-9#]+", " ", asciiish)
+            return compact_spaces(asciiish)
+
+        def _piece_number_from_line(text: str) -> tuple[int | None, str]:
+            raw = (text or "").strip()
+            norm = _normalized_piece_line(raw)
+            match = re.search(r"\bpiece\s*(?:n|no|num(?:ero)?|#)?\s*0*(\d{1,3})\b\s*(.*)$", norm, re.IGNORECASE)
+            if not match:
+                return None, ""
+            number = int(match.group(1))
+            tail = ""
+            tail_match = re.search(r"[:\-–—]\s*(.+)$", raw)
+            if tail_match:
+                tail = tail_match.group(1).strip()
+            return number, tail
+
+        def _ignore_ocr_title_line(text: str) -> bool:
+            value = (text or "").strip()
+            if not value:
+                return True
+            norm = _normalized_piece_line(value)
+            if norm in {"bordereau de pieces", "bordereau des pieces"}:
+                return True
+            if re.fullmatch(r"\d{1,3}", norm):
+                return True
+            if re.fullmatch(r"piece\s*(?:n|no|num(?:ero)?|#)?\s*0*\d{1,3}", norm):
+                return True
+            return False
+
+        def _title_groups_after_markers(lines: list[str]) -> list[str]:
+            groups: list[str] = []
+            current: list[str] = []
+            for line in lines:
+                if _ignore_ocr_title_line(line):
+                    if current:
+                        groups.append(compact_spaces(" ".join(current)))
+                        current = []
+                    continue
+                current.append(line.strip())
+            if current:
+                groups.append(compact_spaces(" ".join(current)))
+            return [g for g in groups if g]
+
+        def _fallback_piece_titles_from_ocr_csv(csv_paths: list[str]) -> dict[int, str]:
+            out: dict[int, str] = {}
+            for csv_path in csv_paths:
+                try:
+                    lines = _read_ocr_csv_text_lines(csv_path)
+                except Exception:
+                    continue
+
+                markers: list[tuple[int, int, str]] = []
+                direct_titles: dict[int, str] = {}
+                for idx, line in enumerate(lines):
+                    number, tail = _piece_number_from_line(line)
+                    if number is None:
+                        continue
+                    markers.append((idx, number, tail))
+                    if tail and not _ignore_ocr_title_line(tail):
+                        direct_titles[number] = tail
+
+                if not markers:
+                    continue
+
+                for number, title in direct_titles.items():
+                    out.setdefault(number, compact_spaces(title))
+
+                unresolved = [number for _, number, tail in markers if number not in out and not tail]
+                if unresolved:
+                    after_last_marker = lines[markers[-1][0] + 1:]
+                    groups = _title_groups_after_markers(after_last_marker)
+                    for number, title in zip(unresolved, groups):
+                        out.setdefault(number, title)
+
+                for pos, (idx, number, tail) in enumerate(markers):
+                    if number in out:
+                        continue
+                    next_idx = markers[pos + 1][0] if pos + 1 < len(markers) else len(lines)
+                    groups = _title_groups_after_markers(lines[idx + 1:next_idx])
+                    if groups:
+                        out[number] = groups[0]
+
+            return {k: v for k, v in sorted(out.items()) if v}
+
         try:
             with st.spinner("OCR (si demandé) puis interprétation…"):
-                for label, pdf_path_pc in (("dire", dire_path_pc), ("bordereau", bord_path_pc)):
+                selected_docs = []
+                if analysis_scope in ("Dire seulement", "Dire + Bordereau"):
+                    selected_docs.append(("dire", dire_pdf, dire_path_local, dire_path_pc, dire_pages_spec))
+                if analysis_scope in ("Bordereau seulement", "Dire + Bordereau"):
+                    selected_docs.append(("bordereau", bord_pdf, bord_path_local, bord_path_pc, bord_pages_spec))
+
+                for label, pdf_name, pdf_path_local, pdf_path_pc, pages_spec in selected_docs:
                     if not pdf_path_pc:
                         continue
+                    if not pdf_path_local:
+                        continue
+
+                    prepared_local, guided_info = _extract_guided_pdf(pdf_path_local, pages_spec)
+                    prepared_pc = _pcfixe_pdf_path_for(prepared_local, pdf_name)
+                    availability = _ensure_pdf_available_for_pcfixe(prepared_pc, prepared_local)
+                    if availability.get("error"):
+                        raise RuntimeError(availability["error"])
+
+                    pdf_path_pc = prepared_pc
                     src = _maybe_ocr(pdf_path_pc)
                     if src:
                         sources.append(src)
-                        ocr_results.append({"type": label, "input_pdf": pdf_path_pc, **src})
+                        ocr_results.append({
+                            "type": label,
+                            "input_pdf": pdf_path_pc,
+                            "local_pdf": prepared_local,
+                            "guided": guided_info,
+                            "pcfixe_availability": availability,
+                            **src,
+                        })
 
                 if not sources:
                     st.warning("Aucune source exploitable (ni OCR, ni CSV existant).")
@@ -7820,10 +8069,28 @@ elif page == "Pré-traitement dépôt PDF":
                 data = r.json() if r.headers.get("Content-Type","").startswith("application/json") else {"ok": False, "raw": r.text}
 
             if data.get("ok"):
-                st.session_state.piece_title_suggestions = {
+                piece_title_suggestions = {
                     int(k): v for k, v in (data.get("pieces") or {}).items()
                     if str(k).isdigit()
                 }
+                fallback_info = None
+                if not piece_title_suggestions:
+                    csv_paths = [
+                        str((src or {}).get("csv_path") or "")
+                        for src in sources
+                        if (src or {}).get("csv_path")
+                    ]
+                    fallback_titles = _fallback_piece_titles_from_ocr_csv(csv_paths)
+                    if fallback_titles:
+                        piece_title_suggestions = fallback_titles
+                        fallback_info = {
+                            "mode": "local_ocr_csv",
+                            "csv_paths": csv_paths,
+                            "count": len(fallback_titles),
+                        }
+                        st.info("Extraction serveur vide, fallback local OCR appliqué.")
+
+                st.session_state.piece_title_suggestions = piece_title_suggestions
                 st.session_state.default_code_partie = data.get("code_partie") or ""
                 # compat : date ou date_transmission selon versions
                 st.session_state.default_date_tx = data.get("date_transmission") or data.get("date") or ""
@@ -7838,6 +8105,7 @@ elif page == "Pré-traitement dépôt PDF":
                         "code_partie": st.session_state.default_code_partie,
                         "date": st.session_state.default_date_tx,
                         "used_sources": data.get("used_sources"),
+                        "fallback": fallback_info,
                     }
                 })
 
@@ -7862,10 +8130,11 @@ elif page == "Pré-traitement dépôt PDF":
     edited = st.data_editor(
         prepare_df_for_streamlit_display(rows),
         num_rows="dynamic",
-        width="stretch"
+        width="stretch",
+        key=f"split_rows_editor_{project_id}",
     )
 
-    if st.button("Préparer le split (dry-run)"):
+    if st.button("Préparer le split (dry-run)", key=f"prepare_split_dry_run_{project_id}"):
         pieces = build_pieces_payload(
             edited,
             st.session_state.get("piece_title_suggestions", {}),
@@ -7890,7 +8159,7 @@ elif page == "Pré-traitement dépôt PDF":
 
         st.json(r.json())
 
-    if st.button("Exécuter le split"):
+    if st.button("Exécuter le split", key=f"execute_split_{project_id}"):
         pieces = build_pieces_payload(
             edited,
             st.session_state.get("piece_title_suggestions", {}),
@@ -7917,14 +8186,14 @@ elif page == "Pré-traitement dépôt PDF":
         st.json(r.json())
 
 
-    csv_path_unc = st.text_input("CSV OCR (chemin vu PC fixe)", value="")
+    csv_path_unc = st.text_input("CSV OCR (chemin vu PC fixe)", value="", key=f"detect_csv_path_pcfixe_{project_id}")
     payload = {
         "project_id": affaire_id,
         "csv_path": csv_path_unc  # chemin côté PC fixe
     }
 
 
-    if st.button("🔍 Détecter automatiquement les pièces"):
+    if st.button("🔍 Détecter automatiquement les pièces", key=f"detect_piece_boundaries_{project_id}"):
         
         r = requests.post(
             f"{SERVER_URL}/api/detect_piece_boundaries",
@@ -7955,7 +8224,7 @@ elif page == "Pré-traitement dépôt PDF":
     if not pdfs:
         st.info("Aucun PDF dans le dépôt initial.")
     else:
-        sel = st.selectbox("Choisir un PDF à découper", [p.name for p in pdfs])
+        sel = st.selectbox("Choisir un PDF à découper", [p.name for p in pdfs], key=f"guided_split_pdf_select_{project_id}")
         this_pdf = next(p for p in pdfs if p.name == sel)
 
         # --- Aperçu de pages (optionnel) ---
@@ -7978,26 +8247,28 @@ elif page == "Pré-traitement dépôt PDF":
         # --- Métadonnées communes ---
         col_meta = st.columns(3)
         with col_meta[0]:
-            code_partie = st.text_input("Code partie", value="03")
+            code_partie = st.text_input("Code partie", value="03", key=f"guided_split_code_partie_initial_{project_id}")
         with col_meta[1]:
-            date_tx = st.date_input("Date transmission", value=date.today())
+            date_tx = st.date_input("Date transmission", value=date.today(), key=f"guided_split_date_initial_{project_id}")
         with col_meta[2]:
             first_piece_no = st.number_input("Numéro de la 1ʳᵉ pièce (offset)", min_value=1, value=1,
-                                            help="Ex : fichier 8 → commence à 8 si ce fichier contient les pièces 8–13")
+                                            help="Ex : fichier 8 → commence à 8 si ce fichier contient les pièces 8–13",
+                                            key=f"guided_split_first_piece_no_{project_id}")
             
         suggest = st.session_state.get("piece_title_suggestions", {})  # {no:int -> titre:str}
 
         # --- Déclaration des pièces (pages de début + libellés provisoires) ---
         st.markdown("### Définir les pièces contenues dans ce PDF")
-        n = st.number_input("Nombre de pièces dans ce fichier", min_value=1, value=1, step=1)
+        n = st.number_input("Nombre de pièces dans ce fichier", min_value=1, value=1, step=1, key=f"guided_split_piece_count_{project_id}")
         starts, titles = [], []
         for i in range(int(n)):
             c1, c2 = st.columns([1, 3])
             with c1:
-                starts.append(st.number_input(f"Début pièce {first_piece_no + i} (page)", min_value=1, value=(i*2+1)))
+                starts.append(st.number_input(f"Début pièce {first_piece_no + i} (page)", min_value=1, value=(i*2+1), key=f"guided_split_start_page_{project_id}_{i}"))
             with c2:
                 titles.append(st.text_input(f"Libellé proposé (pièce {first_piece_no + i})",
-                                            value=f"Pièce {first_piece_no + i}"))
+                                            value=f"Pièce {first_piece_no + i}",
+                                            key=f"guided_split_title_{project_id}_{i}"))
 
         # Validation simple (pages strictement croissantes)
         def _valid(lst): return all(lst[i] < lst[i+1] for i in range(len(lst)-1))
@@ -8007,11 +8278,11 @@ elif page == "Pré-traitement dépôt PDF":
         # Construction des 'pieces' au bon numéro (avec offset)
         # starts = [pages de début] ; no_piece = first_piece_no+i
         # nb_pages = doc.page_count (si fitz) sinon demander à l'utilisateur ou lire côté serveur
-        rename_prefix = st.text_input("Préfixe n° avocat", value="PIECE")
+        rename_prefix = st.text_input("Préfixe n° avocat", value="PIECE", key=f"guided_split_prefix_avocat_{project_id}")
 
         # nb_pages une fois
         if fitz is None:
-            nb_pages = st.number_input("Nombre total de pages (PyMuPDF absent)", min_value=1, value=1)
+            nb_pages = st.number_input("Nombre total de pages (PyMuPDF absent)", min_value=1, value=1, key=f"guided_split_nb_pages_manual_{project_id}")
         else:
             nb_pages = doc.page_count
 
@@ -8045,35 +8316,35 @@ elif page == "Pré-traitement dépôt PDF":
 
         input_path_pc = pj(proj_pcfixe, "AA_Expert_Admin", "Depot_initial", this_pdf.name)
 
-        st.text_input("Chemin (PC fixe) du PDF à découper", value=input_path_pc, disabled=True)
-        st.text_input("Dossier de sortie (PC fixe)", value=out_dir_pc, disabled=True)
+        st.text_input("Chemin (PC fixe) du PDF à découper", value=input_path_pc, disabled=True, key=f"guided_split_pdf_pc_path_{project_id}")
+        st.text_input("Dossier de sortie (PC fixe)", value=out_dir_pc, disabled=True, key=f"guided_split_out_dir_pc_{project_id}")
         
 
         default_cp = st.session_state.get("default_code_partie", "03") or "03"
         default_dt = st.session_state.get("default_date_tx", "")  # peut être "YYYY-MM-DD"
         with col_meta[0]:
-            code_partie = st.text_input("Code partie", value=default_cp)
+            code_partie = st.text_input("Code partie", value=default_cp, key=f"guided_split_code_partie_{project_id}")
         with col_meta[1]:
             try:
                 dt_init = date.fromisoformat(default_dt) if default_dt else date.today()
             except Exception:
                 dt_init = date.today()
-            date_tx = st.date_input("Date transmission", value=dt_init)
+            date_tx = st.date_input("Date transmission", value=dt_init, key=f"guided_split_date_{project_id}")
         
         # Options d’exécution
         col_opt = st.columns(3)
         with col_opt[0]:
-            do_dry = st.checkbox("Simulation (dry-run)", value=True)
+            do_dry = st.checkbox("Simulation (dry-run)", value=True, key=f"guided_split_dry_run_{project_id}")
         with col_opt[1]:
-            rename_prefix = st.text_input("Préfixe n° avocat", value="PIECE")
+            rename_prefix = st.text_input("Préfixe n° avocat", value="PIECE", key=f"batch_guided_prefix_avocat_{project_id}")
         with col_opt[2]:
-            strategy = st.selectbox("Stratégie de numérotation", ["global", "triplet"], index=0)
+            strategy = st.selectbox("Stratégie de numérotation", ["global", "triplet"], index=0, key=f"guided_split_strategy_{project_id}")
 
         # Empiler dans un batch guidé
         if "guided_jobs" not in st.session_state:
             st.session_state.guided_jobs = []
 
-        if st.button("➕ Ajouter ce fichier au batch"):
+        if st.button("➕ Ajouter ce fichier au batch", key=f"guided_split_add_to_batch_{project_id}"):
             if int(n) > 1 and not _valid(starts):
                 st.error("Corrige d’abord l’ordre des pages de début.")
             else:
@@ -8103,7 +8374,7 @@ elif page == "Pré-traitement dépôt PDF":
 
             c = st.columns(2)
             with c[0]:
-                if st.button("🧪 Simuler tout (dry-run forcé)"):
+                if st.button("🧪 Simuler tout (dry-run forcé)", key=f"guided_split_simulate_all_{project_id}"):
                     sim = {"jobs": [], "stop_on_error": False}
                     for j in st.session_state.guided_jobs:
                         j2 = dict(j); j2["dry_run"] = True
@@ -8115,7 +8386,7 @@ elif page == "Pré-traitement dépôt PDF":
                     st.write(r.json())
 
             with c[1]:
-                if st.button("✂️ Exécuter le batch (respecte dry-run par job)"):
+                if st.button("✂️ Exécuter le batch (respecte dry-run par job)", key=f"guided_split_execute_batch_{project_id}"):
                     payload = {"jobs": st.session_state.guided_jobs, "stop_on_error": False}
                     if not ensure_server_ready(MAC_PCFIXE, SERVER_IP, int(SERVER_PORT)):
                         st.error("Serveur KO"); st.stop()
@@ -8159,6 +8430,7 @@ with st.expander("📄 Format du JSON attendu", expanded=False):
 
 # petit util pour proposer un template à télécharger
 import io, json as _json, datetime as _dt
+batch_project_id = get_project_id(project_config, "") or "projet"
 templ = {
     "jobs": [
         {
@@ -8183,7 +8455,7 @@ st.download_button("📥 Télécharger un template JSON", data=buf,
                    file_name=f"batch_template_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                    mime="application/json")
 
-uploaded = st.file_uploader("Dépose ici ton JSON de jobs", type=["json"], accept_multiple_files=False)
+uploaded = st.file_uploader("Dépose ici ton JSON de jobs", type=["json"], accept_multiple_files=False, key=f"batch_split_jobs_upload_{batch_project_id}")
 
 batch_data = None
 if uploaded is not None:
@@ -8216,7 +8488,7 @@ if uploaded is not None:
 colb1, colb2 = st.columns(2)
 
 with colb1:
-    if st.button("🧪 Simuler tout le lot (dry-run forcé)"):
+    if st.button("🧪 Simuler tout le lot (dry-run forcé)", key=f"batch_split_simulate_all_{batch_project_id}"):
         if batch_data is None:
             st.warning("Charge d'abord un JSON de jobs.")
         else:
@@ -8246,7 +8518,7 @@ with colb1:
                 st.error(f"Exception : {e}")
 
 with colb2:
-    if st.button("✂️ Exécuter le lot (respecte dry_run par job)"):
+    if st.button("✂️ Exécuter le lot (respecte dry_run par job)", key=f"batch_split_execute_all_{batch_project_id}"):
         if batch_data is None:
             st.warning("Charge d'abord un JSON de jobs.")
         else:
@@ -8286,23 +8558,24 @@ with colb2:
 st.markdown("## 🏗️ Générer un JSON de batch depuis un dossier")
 st.caption("Scanne un dossier (tel qu'il est VU par le PC fixe) pour fabriquer un fichier JSON de jobs batch.")
 
-base_dir = st.text_input("Dossier source (VU par le PC fixe)", value="")
+base_dir = st.text_input("Dossier source (VU par le PC fixe)", value="", key=f"batch_generator_base_dir_{batch_project_id}")
 out_mode = st.radio(
     "Mode de génération",
     ["Chaque PDF = 1 pièce (pas de split)", "Multi-pièces (je remplirai les pages plus tard)"],
-    horizontal=False
+    horizontal=False,
+    key=f"batch_generator_out_mode_{batch_project_id}",
 )
-code_partie_default = st.text_input("Code partie par défaut (ex: 03)", value="")
-numero_prefix_default = st.text_input("Préfixe n° avocat par défaut", value="PIECE")
-strategy_default = st.selectbox("Stratégie par défaut", ["global", "triplet"], index=0)
-stop_on_error_default = st.checkbox("stop_on_error (arrêter au premier échec)", value=False)
+code_partie_default = st.text_input("Code partie par défaut (ex: 03)", value="", key=f"batch_generator_code_partie_{batch_project_id}")
+numero_prefix_default = st.text_input("Préfixe n° avocat par défaut", value="PIECE", key=f"batch_generator_prefix_avocat_{batch_project_id}")
+strategy_default = st.selectbox("Stratégie par défaut", ["global", "triplet"], index=0, key=f"batch_generator_strategy_{batch_project_id}")
+stop_on_error_default = st.checkbox("stop_on_error (arrêter au premier échec)", value=False, key=f"batch_generator_stop_on_error_{batch_project_id}")
 project_id_default = get_project_id(project_config)
 
 # Option: dossier de sortie relatif à chaque PDF (par défaut, 'Splits' à côté du PDF)
-rel_splits_name = st.text_input("Nom du sous-dossier de sortie (créé à côté de chaque PDF)", value="Splits")
+rel_splits_name = st.text_input("Nom du sous-dossier de sortie (créé à côté de chaque PDF)", value="Splits", key=f"batch_generator_rel_splits_name_{batch_project_id}")
 
 # Scan local (côté laptop) du dossier saisi
-gen_btn = st.button("📦 Scanner & Générer l'aperçu")
+gen_btn = st.button("📦 Scanner & Générer l'aperçu", key=f"batch_generator_scan_{batch_project_id}")
 
 import io, os as _os, json as _json, datetime as _dt
 def _list_pdfs(root: str):
@@ -8369,7 +8642,8 @@ if batch_preview:
         "📥 Télécharger le JSON batch (dry-run)",
         data=buf,
         file_name=f"batch_from_folder_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-        mime="application/json"
+        mime="application/json",
+        key=f"batch_generator_download_{batch_project_id}",
     )
 
     st.info("Tu peux charger ce JSON juste au-dessus dans 'Traitement en lot (batch)' ➜ 'Simuler tout le lot (dry-run forcé)'.\n"
@@ -8387,6 +8661,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             "Dépose tes fichiers ici",
             type=["pdf", "docx", "txt", "jpg", "jpeg", "png", "tif", "tiff"],
             accept_multiple_files=True,
+            key=f"classement_originaux_uploads_{project_id}",
         )
     st.caption("Images acceptées comme pièces : jpg, jpeg, png, tif, tiff. HEIC non proposé ici.")
     
@@ -8407,10 +8682,11 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             party_options,
             format_func=source_code_label,
             index=default_party_index,
+            key=f"classement_originaux_partie_cible_{project_id}",
             )
     
     with st.expander("Ingestion des pièces d'une partie", expanded=False):
-        st.text_input("Affaire", value=get_project_id(project_config, ""), disabled=True)
+        st.text_input("Affaire", value=get_project_id(project_config, ""), disabled=True, key=f"ingestion_affaire_display_{project_id}")
         source_summary = load_transmission_source_summary(aff_root_local, project_config)
         with st.expander("Synthèse des transmissions documentaires", expanded=False):
             st.json({
