@@ -1,0 +1,14 @@
+{
+  "job_id": "deepseek_ocr_2025-J47_102_assignation_page_8_20260706_120000",
+  "type": "deepseek_ocr",
+  "project_id": "2025-J47",
+  "source_pdf": "C:\\Affaires\\2025-J47\\AA_Expert_Admin\\Depot_initial\\_Guided_Analysis\\102 Assignation délivrée à 3F_pages_user_8.pdf",
+  "pages": [8],
+  "output_dir": "C:\\Affaires\\2025-J47\\AD_Expert_Traitements\\_OCR_Dire_Bordereau\\102 Assignation délivrée à 3F_pages_user_8",
+  "png_dir": "C:\\Affaires\\2025-J47\\AD_Expert_Traitements\\_OCR_Dire_Bordereau\\_pages_png\\102 Assignation délivrée à 3F_pages_user_8",
+  "tile_count": 2,
+  "postprocess": true,
+  "retry_glitch_pages": true,
+  "tile_glitch_pages": true,
+  "fallback_tesseract_pages": false
+}
