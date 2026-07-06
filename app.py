@@ -7749,6 +7749,14 @@ elif page == "Pré-traitement dépôt PDF":
             disabled=analysis_scope == "Dire seulement",
         )
 
+    ocr_engine = st.selectbox(
+        "Moteur OCR",
+        ["OCR standard / Tesseract", "DeepSeekOCR avancé"],
+        key=f"dire_bord_ocr_engine_{project_id}",
+    )
+    if ocr_engine == "DeepSeekOCR avancé":
+        st.info("DeepSeekOCR est préparé en dry-run uniquement dans ce lot : aucun OCR n'est lancé.")
+
     def _write_log_event(event: dict):
         try:
             log_dir = pj(aff_root_local, "AA_Expert_Admin", "_Logs")
@@ -7853,7 +7861,146 @@ elif page == "Pré-traitement dépôt PDF":
             result["error"] = f"Copie vers PC fixe impossible : {exc}"
         return result
 
+    def prepare_deepseek_ocr_paths(
+        cfg: dict,
+        aff_id: str,
+        laptop_aff_root: str,
+        source_pdf_local: str,
+        pdf_name: str,
+        pages_spec: str,
+    ) -> dict:
+        src = Path(source_pdf_local)
+        pages: list[int] = []
+        page_count = None
+        guided_error = ""
+        use_guided_pdf = bool((pages_spec or "").strip())
+
+        if use_guided_pdf:
+            if fitz is None:
+                guided_error = "PyMuPDF / fitz indisponible : pages non validées en dry-run."
+            elif src.exists():
+                try:
+                    with fitz.open(str(src)) as doc:
+                        page_count = doc.page_count
+                        pages = _parse_user_pages(pages_spec, page_count)
+                except Exception as exc:
+                    guided_error = f"Pages non validées en dry-run : {exc}"
+            else:
+                guided_error = f"PDF source introuvable côté laptop : {src}"
+        elif fitz is not None and src.exists():
+            try:
+                with fitz.open(str(src)) as doc:
+                    page_count = doc.page_count
+                    pages = list(range(1, page_count + 1))
+            except Exception:
+                pages = []
+
+        if use_guided_pdf and pages:
+            effective_pdf_local = Path(depot_dir).joinpath("_Guided_Analysis", _guided_pdf_name(src.name, pages))
+            pdf_rel = pj("AA_Expert_Admin", "Depot_initial", "_Guided_Analysis", effective_pdf_local.name)
+        else:
+            effective_pdf_local = src
+            pdf_rel = pj("AA_Expert_Admin", "Depot_initial", pdf_name)
+
+        pcfixe_server_root = pcfixe_local_root_for_server(cfg, aff_id)
+        pcfixe_unc_root = pcfixe_unc_root_for_laptop(cfg, aff_id)
+        ocr_rel_root = pj("AD_Expert_Traitements", "_OCR_Dire_Bordereau")
+        stem = re.sub(r'[<>:"/\\|?*]+', "_", effective_pdf_local.stem).strip(" ._") or "document"
+        png_rel_dir = pj(ocr_rel_root, "_pages_png", stem)
+        output_rel_dir = pj(ocr_rel_root, stem)
+        planned_pages = pages or [1]
+        planned_png_names = [f"page_{idx + 1:04d}.png" for idx, _ in enumerate(planned_pages)]
+
+        return {
+            "source_pdf_laptop": str(src),
+            "pdf_guided_used_or_planned_laptop": str(effective_pdf_local),
+            "pdf_pcfixe_server": pj(pcfixe_server_root, pdf_rel),
+            "pdf_pcfixe_unc": pj(pcfixe_unc_root, pdf_rel),
+            "pages_requested": pages_spec or "",
+            "pages_user": pages,
+            "page_count": page_count,
+            "guided_error": guided_error,
+            "png_dir_laptop": pj(laptop_aff_root, png_rel_dir),
+            "png_dir_pcfixe_unc": pj(pcfixe_unc_root, png_rel_dir),
+            "png_dir_pcfixe_server": pj(pcfixe_server_root, png_rel_dir),
+            "output_dir_laptop": pj(laptop_aff_root, output_rel_dir),
+            "output_dir_pcfixe_unc": pj(pcfixe_unc_root, output_rel_dir),
+            "output_dir_pcfixe_server": pj(pcfixe_server_root, output_rel_dir),
+            "planned_png_files_pcfixe_server": [pj(pcfixe_server_root, png_rel_dir, name) for name in planned_png_names],
+            "planned_png_files_pcfixe_unc": [pj(pcfixe_unc_root, png_rel_dir, name) for name in planned_png_names],
+        }
+
+    def build_deepseek_batch_payload(paths_info: dict) -> dict:
+        return {
+            "image_paths": paths_info.get("planned_png_files_pcfixe_server") or [],
+            "output_dir": paths_info.get("output_dir_pcfixe_server") or "",
+            "postprocess": True,
+            "retry_glitch_pages": True,
+            "tile_glitch_pages": True,
+            "fallback_tesseract_pages": True,
+            "tile_count": 2,
+        }
+
+    def render_deepseek_dry_run(paths_info: dict, payload: dict):
+        st.markdown("#### Dry-run DeepSeekOCR")
+        if paths_info.get("guided_error"):
+            st.warning(paths_info["guided_error"])
+        st.write("PDF source laptop :", paths_info.get("source_pdf_laptop") or "")
+        st.write("PDF guidé utilisé/prévu :", paths_info.get("pdf_guided_used_or_planned_laptop") or "")
+        st.write("Pages demandées :", paths_info.get("pages_requested") or "(document complet)")
+        if paths_info.get("page_count") is not None:
+            st.write("Nombre de pages détecté :", paths_info.get("page_count"))
+        if paths_info.get("pages_user"):
+            st.write("Pages utilisateur validées :", paths_info.get("pages_user"))
+        st.write("Dossier PNG prévu laptop :", paths_info.get("png_dir_laptop") or "")
+        st.write("Dossier PNG prévu PC fixe UNC :", paths_info.get("png_dir_pcfixe_unc") or "")
+        st.write("Dossier PNG prévu PC fixe local :", paths_info.get("png_dir_pcfixe_server") or "")
+        st.write("Dossier de sortie prévu laptop :", paths_info.get("output_dir_laptop") or "")
+        st.write("Dossier de sortie prévu PC fixe UNC :", paths_info.get("output_dir_pcfixe_unc") or "")
+        st.write("Dossier de sortie prévu PC fixe local :", paths_info.get("output_dir_pcfixe_server") or "")
+        st.write("PDF PC fixe local qui serait utilisé :", paths_info.get("pdf_pcfixe_server") or "")
+        st.write("PDF PC fixe UNC correspondant :", paths_info.get("pdf_pcfixe_unc") or "")
+        st.caption(f"Endpoint prévu : {SERVER_URL}/ocr_deepseek_batch")
+        st.json(payload)
+
     if st.button("🔎 Analyser Dire/Bordereau", key=f"analyze_dire_bord_{project_id}"):
+        if ocr_engine == "DeepSeekOCR avancé":
+            selected_docs_deepseek = []
+            if analysis_scope in ("Dire seulement", "Dire + Bordereau"):
+                selected_docs_deepseek.append(("dire", dire_pdf, dire_pages_spec))
+            if analysis_scope in ("Bordereau seulement", "Dire + Bordereau"):
+                selected_docs_deepseek.append(("bordereau", bord_pdf, bord_pages_spec))
+
+            dry_run_docs = []
+            for label, pdf_name, pages_spec in selected_docs_deepseek:
+                if pdf_name == "(aucun)":
+                    continue
+                pdf_path_local = str(Path(depot_dir) / pdf_name)
+                paths_info = prepare_deepseek_ocr_paths(
+                    project_config,
+                    project_id,
+                    aff_root_local,
+                    pdf_path_local,
+                    pdf_name,
+                    pages_spec,
+                )
+                dry_run_docs.append({
+                    "type": label,
+                    "paths": paths_info,
+                    "payload": build_deepseek_batch_payload(paths_info),
+                })
+
+            if not dry_run_docs:
+                st.warning("Aucun document sélectionné pour le dry-run DeepSeekOCR.")
+                st.stop()
+
+            st.info("Dry-run DeepSeekOCR : aucune conversion PNG, aucun appel /ocr_deepseek_batch, aucun OCR lancé.")
+            st.caption(f"Racine PC fixe locale calculée : {pcfixe_local_root_for_server(project_config, project_id)}")
+            for item in dry_run_docs:
+                st.markdown(f"### {item['type'].capitalize()}")
+                render_deepseek_dry_run(item["paths"], item["payload"])
+            st.stop()
+
         if not ensure_server_ready(MAC_PCFIXE, SERVER_IP, int(SERVER_PORT)):
             st.error("Serveur KO"); st.stop()
 
