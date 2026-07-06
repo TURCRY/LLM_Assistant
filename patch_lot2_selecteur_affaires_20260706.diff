@@ -1,0 +1,182 @@
+diff --git a/app.py b/app.py
+index c3a5af2..83c95aa 100644
+--- a/app.py
++++ b/app.py
+@@ -235,6 +235,10 @@ PROJETS_INDEX_PATH = os.getenv(
+     "PROJETS_INDEX_PATH",
+     r"C:\LLM_Assistant\config\projets_index.json"
+ )
++SERVER_PROJETS_INDEX_PATH = os.getenv(
++    "SERVER_PROJETS_INDEX_PATH",
++    r"\\192.168.0.155\GPT4all_local\config\projets_index.json"
++)
+ # Racine des données (miroir NAS sur PC fixe ; Laptop via Syncthing sélectif)
+ 
+ def iter_project_config_candidates(project_id: str, projets_index_path: str | None = None):
+@@ -300,6 +304,42 @@ def find_project_config_path(project_id: str, projets_index_path: str | None = N
+             return candidate
+     return None
+ 
++def read_projects_index(path: str | Path) -> list[dict]:
++    try:
++        data = json.loads(Path(path).read_text(encoding="utf-8-sig"))
++    except Exception:
++        return []
++    return data if isinstance(data, list) else []
++
++def project_index_sources() -> list[tuple[str, list[dict]]]:
++    sources = []
++    seen = set()
++    for label, path in (
++        ("serveur", SERVER_PROJETS_INDEX_PATH),
++        ("local", PROJETS_INDEX_PATH),
++    ):
++        key = str(path).lower()
++        if key in seen:
++            continue
++        seen.add(key)
++        items = read_projects_index(path)
++        if items:
++            sources.append((label, items))
++    return sources
++
++def indexed_project_by_id(project_id: str) -> dict:
++    wanted = (project_id or "").strip().lower()
++    if not wanted:
++        return {}
++    for _label, items in project_index_sources():
++        for item in items:
++            if not isinstance(item, dict):
++                continue
++            for key in ("id", "id_projet"):
++                if str(item.get(key) or "").strip().lower() == wanted:
++                    return item
++    return {}
++
+ # =========================
+ # Utilitaires JSON
+ # =========================
+@@ -571,6 +611,13 @@ def get_path(cfg, rel_key, context="laptop"):
+ def list_affaires_ids():
+     ids = set()
+     try:
++        for _label, items in project_index_sources():
++            for item in items:
++                if not isinstance(item, dict):
++                    continue
++                aff_id = (item.get("id") or item.get("id_projet") or "").strip()
++                if re.match(r"^\d{4}-[A-Z]\d{2}$", aff_id):
++                    ids.add(aff_id)
+         for p in glob.glob(os.path.join(AFFAIRES_ROOT, "*-*")):
+             name = os.path.basename(p)
+             # Ajuste la regex si tu as d'autres types : 2025-J38 / 2025-M26 / etc.
+@@ -585,6 +632,95 @@ def list_affaires_ids():
+         pass
+     return sorted(ids)
+ 
++def affaire_select_label(aff_id: str) -> str:
++    aff_id = str(aff_id or "").strip()
++    if not aff_id or aff_id.startswith("➕") or "Créer une nouvelle affaire" in aff_id:
++        return aff_id
++
++    root = Path(AFFAIRES_ROOT) / aff_id
++    cfg_path = root / "_Config" / "project_config.json"
++    parties_path = root / "_Config" / "parties.json"
++    indexed_project = indexed_project_by_id(aff_id)
++
++    def read_json_safe(path: Path, default):
++        try:
++            return json.loads(path.read_text(encoding="utf-8-sig"))
++        except Exception:
++            return default
++
++    def clean_text(value) -> str:
++        return str(value or "").strip()
++
++    def meaningful(value) -> str:
++        text = clean_text(value)
++        low = text.lower()
++        if not text or low == aff_id.lower():
++            return ""
++        if re.fullmatch(r"test\s+" + re.escape(aff_id.split("-", 1)[-1]).lower(), low):
++            return ""
++        return text
++
++    def short_party_name(value) -> str:
++        text = clean_text(value)
++        if not text:
++            return ""
++        parts = text.split()
++        company_suffixes = {"SA", "SAS", "SARL", "SASU", "SCI", "SNC", "ASSURANCES"}
++        if len(parts) >= 2 and parts[-1].upper() in company_suffixes:
++            return " ".join(parts[:-1])
++        if len(parts) >= 2 and parts[-1].isupper() and not parts[0].isupper():
++            return parts[-1]
++        if len(parts) >= 2 and parts[0].isupper() and not any(ch.isdigit() for ch in parts[0]) and not parts[-1].isupper():
++            return parts[0]
++        return text
++
++    def parties_label() -> tuple[str, bool]:
++        data = read_json_safe(parties_path, {})
++        parties = data.get("parties") if isinstance(data, dict) else []
++        parties = [p for p in (parties or []) if clean_text((p or {}).get("nom"))]
++        if len(parties) < 2:
++            return "", bool(parties)
++        first = parties[0]
++        first_attorney = clean_text(first.get("avocat") or first.get("conseil") or first.get("representant")).lower()
++        second = parties[1]
++        if first_attorney:
++            for candidate in parties[1:]:
++                candidate_attorney = clean_text(candidate.get("avocat") or candidate.get("conseil") or candidate.get("representant")).lower()
++                if candidate_attorney and candidate_attorney != first_attorney:
++                    second = candidate
++                    break
++        left = short_party_name(first.get("nom"))
++        right = short_party_name(second.get("nom"))
++        return (f"{left} c {right}" if left and right else ""), True
++
++    if not cfg_path.exists():
++        if root.exists():
++            return f"{aff_id} — dossier seul — à initialiser"
++        return f"{aff_id} — à initialiser"
++
++    cfg = read_json_safe(cfg_path, {})
++    label = ""
++    label = meaningful(indexed_project.get("nom"))
++    for key in ("nom_affaire", "titre", "libelle", "affaire", "project_name"):
++        if label:
++            break
++        label = meaningful((cfg or {}).get(key))
++        if label:
++            break
++
++    fallback_label, has_parties = parties_label()
++    if not label and fallback_label:
++        label = fallback_label
++
++    juridiction = (cfg or {}).get("juridiction") or {}
++    has_juridiction_min = bool(
++        clean_text(juridiction.get("nom") or juridiction.get("tribunal_cour") or juridiction.get("tribunal"))
++        and clean_text(juridiction.get("numero_rg") or juridiction.get("rg") or juridiction.get("numero_dossier_admin") or juridiction.get("numero_dossier"))
++        and clean_text(juridiction.get("date_ordonnance"))
++    )
++    status = "complet" if has_juridiction_min and has_parties else "à compléter"
++    return f"{aff_id} — {label or 'config sans nom'} — {status}"
++
+ 
+ def ensure_dirs(*paths):
+     for d in paths:
+@@ -5811,7 +5947,12 @@ if last and last in affaires:
+ else:
+     default_index = 0 if affaires else len(options) - 1
+ 
+-selection = st.selectbox("📁 Sélectionner une affaire :", options, index=default_index)
++selection = st.selectbox(
++    "📁 Sélectionner une affaire :",
++    options,
++    index=default_index,
++    format_func=affaire_select_label,
++)
+ 
+ aff_root_local = None
+ project_config = None
