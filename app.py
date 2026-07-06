@@ -392,9 +392,9 @@ def source_code_label(source: dict) -> str:
 
 def build_juridiction_reference(juridiction: dict) -> str:
     j = juridiction or {}
-    ordre = (j.get("ordre") or "").strip().lower()
+    ordre = (j.get("type_metier") or j.get("ordre") or j.get("juridiction") or "").strip().lower()
     parts = []
-    if ordre == "administratif":
+    if ordre.startswith("admin"):
         if j.get("numero_dossier_admin"):
             parts.append(f"N° Dossier {j.get('numero_dossier_admin')}")
     else:
@@ -407,6 +407,8 @@ def build_juridiction_reference(juridiction: dict) -> str:
     if not parts and j.get("numero_dossier_admin"):
         parts.append(f"N° Dossier {j.get('numero_dossier_admin')}")
     lieu = " ".join([v for v in [j.get("type"), j.get("ville")] if v])
+    if not lieu:
+        lieu = " ".join([v for v in [j.get("juridiction_technique"), j.get("tribunal_cour")] if v])
     label = " / ".join(parts)
     return " - ".join([v for v in [lieu, label] if v]).strip()
 
@@ -6051,8 +6053,7 @@ else:
 
     st.markdown("### ⚖️ Juridiction")
     juridiction_cfg = ensure_juridiction_config(project_config)
-    with st.expander("Métadonnées principales de la juridiction", expanded=False):
-        st.write("Debug juridiction")
+    with st.expander("Diagnostic juridiction", expanded=False):
         st.json(project_config.get("_juridiction_debug") or {
             "juridiction_loaded_from_project_config": juridiction_cfg,
             "juridiction_loaded_from_infos_projet": {},
@@ -6060,66 +6061,132 @@ else:
             "config_path_used": chemin_config,
             "infos_projet_path_used": "",
         })
-        juridiction_widget_defaults = {
-            "juridiction_nom": juridiction_cfg.get("nom", ""),
-            "juridiction_ordre": juridiction_cfg.get("ordre", ""),
-            "juridiction_type": juridiction_cfg.get("type", ""),
-            "juridiction_ville": juridiction_cfg.get("ville", ""),
-            "juridiction_numero_rg": juridiction_cfg.get("numero_rg", ""),
-            "juridiction_numero_portalis": juridiction_cfg.get("numero_portalis", ""),
-            "juridiction_numero_mi": juridiction_cfg.get("numero_mi", ""),
-            "juridiction_numero_dossier_admin": juridiction_cfg.get("numero_dossier_admin", ""),
-            "juridiction_observations": juridiction_cfg.get("observations", ""),
-        }
-        ordre_options = ["", "judiciaire", "administratif"]
-        type_options = ["", "TJ", "TA", "CA", "CAA", "autre"]
-        if juridiction_widget_defaults["juridiction_ordre"] not in ordre_options:
-            juridiction_widget_defaults["juridiction_ordre"] = ""
-        if juridiction_widget_defaults["juridiction_type"] not in type_options:
-            juridiction_widget_defaults["juridiction_type"] = ""
-        if st.session_state.get("juridiction_loaded_aff_id") != affaire_id:
-            for key, value in juridiction_widget_defaults.items():
-                st.session_state[key] = value
-            st.session_state["juridiction_loaded_aff_id"] = affaire_id
-        else:
-            for key, value in juridiction_widget_defaults.items():
-                if key not in st.session_state:
-                    st.session_state[key] = value
-        col_j1, col_j2 = st.columns(2)
+
+    def _first_text(*values) -> str:
+        for value in values:
+            text = safe_text(value)
+            if text:
+                return text
+        return ""
+
+    affaire_nom_default = _first_text(
+        project_config.get("nom_affaire"),
+        project_config.get("titre"),
+        project_config.get("libelle"),
+        project_config.get("affaire"),
+        project_config.get("project_name"),
+    )
+    type_metier_raw = _first_text(
+        juridiction_cfg.get("type_metier"),
+        juridiction_cfg.get("ordre"),
+        juridiction_cfg.get("juridiction"),
+    ).lower()
+    type_metier_default = "Administratif" if type_metier_raw.startswith("admin") else "Judiciaire"
+    juridiction_tech_options = ["TJ", "TC", "CA", "TA", "CAA", "CE", "autre"]
+    juridiction_tech_default = _first_text(juridiction_cfg.get("type"), juridiction_cfg.get("juridiction_technique"))
+    if juridiction_tech_default not in juridiction_tech_options:
+        juridiction_tech_default = "autre" if juridiction_tech_default else "TJ"
+
+    with st.expander("Métadonnées juridictionnelles", expanded=True):
+        nom_affaire_next = st.text_input("Nom de l'affaire", value=affaire_nom_default, key=f"juridiction_nom_affaire_{affaire_id}")
+        col_j0, col_j1 = st.columns(2)
+        with col_j0:
+            type_metier_next = st.selectbox(
+                "Type métier",
+                ["Judiciaire", "Administratif"],
+                index=1 if type_metier_default == "Administratif" else 0,
+                key=f"juridiction_type_metier_{affaire_id}",
+            )
         with col_j1:
-            j_nom = st.text_input("Nom de la juridiction", key="juridiction_nom")
-            j_ordre = st.selectbox(
-                "Ordre",
-                ordre_options,
-                key="juridiction_ordre",
+            juridiction_tech_next = st.selectbox(
+                "Juridiction technique",
+                juridiction_tech_options,
+                index=juridiction_tech_options.index(juridiction_tech_default),
+                key=f"juridiction_technique_{affaire_id}",
             )
-            j_type = st.selectbox(
-                "Type",
-                type_options,
-                key="juridiction_type",
-            )
-            j_ville = st.text_input("Ville", key="juridiction_ville")
+
+        col_j2, col_j3 = st.columns(2)
         with col_j2:
-            j_numero_rg = st.text_input("N° RG", key="juridiction_numero_rg")
-            j_numero_portalis = st.text_input("N° Portalis", key="juridiction_numero_portalis")
-            j_numero_mi = st.text_input("N° MI", key="juridiction_numero_mi")
-            j_numero_dossier_admin = st.text_input("N° Dossier administratif", key="juridiction_numero_dossier_admin")
-        j_observations = st.text_area("Observations", key="juridiction_observations")
-        juridiction_next = {
-            "nom": j_nom.strip(),
-            "ordre": j_ordre.strip(),
-            "type": j_type.strip(),
-            "ville": j_ville.strip(),
-            "numero_rg": j_numero_rg.strip(),
-            "numero_portalis": j_numero_portalis.strip(),
-            "numero_mi": j_numero_mi.strip(),
-            "numero_dossier_admin": j_numero_dossier_admin.strip(),
-            "observations": j_observations.strip(),
-        }
+            tribunal_cour_next = st.text_input(
+                "Tribunal / cour",
+                value=_first_text(juridiction_cfg.get("tribunal_cour"), juridiction_cfg.get("nom"), juridiction_cfg.get("tribunal"), juridiction_cfg.get("cour")),
+                key=f"juridiction_tribunal_cour_{affaire_id}",
+            )
+            chambre_next = st.text_input("Chambre", value=_first_text(juridiction_cfg.get("chambre")), key=f"juridiction_chambre_{affaire_id}")
+        with col_j3:
+            magistrat_next = st.text_input(
+                "Magistrat chargé du contrôle des expertises" if type_metier_next == "Judiciaire" else "Magistrat / rapporteur",
+                value=_first_text(juridiction_cfg.get("magistrat_controle_expertises"), juridiction_cfg.get("magistrat_controle"), juridiction_cfg.get("magistrat"), juridiction_cfg.get("rapporteur")),
+                key=f"juridiction_magistrat_{affaire_id}",
+            )
+
+        if type_metier_next == "Judiciaire":
+            col_j4, col_j5, col_j6 = st.columns(3)
+            with col_j4:
+                numero_rg_next = st.text_input("RG", value=_first_text(juridiction_cfg.get("numero_rg"), juridiction_cfg.get("rg")), key=f"juridiction_numero_rg_{affaire_id}")
+            with col_j5:
+                numero_portalis_next = st.text_input("N° Portalis", value=_first_text(juridiction_cfg.get("numero_portalis"), juridiction_cfg.get("portalis")), key=f"juridiction_numero_portalis_{affaire_id}")
+            with col_j6:
+                numero_mi_next = st.text_input("N° MI", value=_first_text(juridiction_cfg.get("numero_mi"), juridiction_cfg.get("mi"), juridiction_cfg.get("numero_MI"), juridiction_cfg.get("numero_mission_instruction")), key=f"juridiction_numero_mi_{affaire_id}")
+            numero_dossier_admin_next = _first_text(juridiction_cfg.get("numero_dossier_admin"), juridiction_cfg.get("numero_dossier"))
+        else:
+            numero_rg_next = _first_text(juridiction_cfg.get("numero_rg"), juridiction_cfg.get("rg"))
+            numero_portalis_next = _first_text(juridiction_cfg.get("numero_portalis"), juridiction_cfg.get("portalis"))
+            numero_mi_next = _first_text(juridiction_cfg.get("numero_mi"), juridiction_cfg.get("mi"), juridiction_cfg.get("numero_MI"), juridiction_cfg.get("numero_mission_instruction"))
+            numero_dossier_admin_next = st.text_input(
+                "N° dossier administratif",
+                value=_first_text(juridiction_cfg.get("numero_dossier_admin"), juridiction_cfg.get("numero_dossier")),
+                key=f"juridiction_numero_dossier_admin_{affaire_id}",
+            )
+
+        col_j7, col_j8, col_j9 = st.columns(3)
+        with col_j7:
+            date_ordonnance_next = st.text_input("Date de l'ordonnance", value=_first_text(juridiction_cfg.get("date_ordonnance")), key=f"juridiction_date_ordonnance_{affaire_id}")
+        with col_j8:
+            date_consignation_next = st.text_input("Date de consignation", value=_first_text(juridiction_cfg.get("date_consignation")), key=f"juridiction_date_consignation_{affaire_id}")
+        with col_j9:
+            date_limite_next = st.text_input(
+                "Date limite de dépôt du rapport",
+                value=_first_text(juridiction_cfg.get("date_limite_depot_rapport"), juridiction_cfg.get("date_limite_rapport")),
+                key=f"juridiction_date_limite_{affaire_id}",
+            )
+        mission_next = st.text_area(
+            "Mission / résumé de mission",
+            value=_first_text(juridiction_cfg.get("mission_resume"), juridiction_cfg.get("mission")),
+            height=180,
+            key=f"juridiction_mission_resume_{affaire_id}",
+        )
+        observations_next = st.text_area("Observations", value=_first_text(juridiction_cfg.get("observations")), key=f"juridiction_observations_{affaire_id}")
+
+        juridiction_next = dict(juridiction_cfg)
+        juridiction_next.update({
+            "type_metier": type_metier_next,
+            "ordre": type_metier_next.lower(),
+            "juridiction": type_metier_next,
+            "type": juridiction_tech_next,
+            "juridiction_technique": juridiction_tech_next,
+            "tribunal_cour": tribunal_cour_next.strip(),
+            "nom": tribunal_cour_next.strip(),
+            "chambre": chambre_next.strip(),
+            "numero_rg": numero_rg_next.strip(),
+            "numero_portalis": numero_portalis_next.strip(),
+            "numero_mi": numero_mi_next.strip(),
+            "numero_dossier_admin": numero_dossier_admin_next.strip(),
+            "magistrat_controle_expertises": magistrat_next.strip(),
+            "date_ordonnance": date_ordonnance_next.strip(),
+            "date_consignation": date_consignation_next.strip(),
+            "date_limite_depot_rapport": date_limite_next.strip(),
+            "mission_resume": mission_next.strip(),
+            "observations": observations_next.strip(),
+        })
         juridiction_next["reference_affaire_juridiction"] = build_juridiction_reference(juridiction_next)
         st.text_input("Référence affaire juridiction", value=juridiction_next["reference_affaire_juridiction"], disabled=True)
         if st.button("💾 Enregistrer la juridiction"):
             try:
+                cfg_path = Path(chemin_config)
+                backup_path = cfg_path.with_name(f"{cfg_path.name}.{datetime.now():%Y%m%d_%H%M%S}.bak")
+                shutil.copy2(cfg_path, backup_path)
+                project_config["nom_affaire"] = nom_affaire_next.strip()
                 project_config["juridiction"] = juridiction_next
                 project_config.pop("_juridiction_debug", None)
                 save_json(chemin_config, project_config)
@@ -6129,8 +6196,10 @@ else:
                     "juridiction_saved_to_project_config": True,
                     "config_path_used": chemin_config,
                     "infos_projet_path_used": "",
+                    "backup_path": str(backup_path),
                 }
                 st.success("Métadonnées juridiction enregistrées dans project_config.json.")
+                st.caption(f"Sauvegarde créée : {backup_path}")
                 st.json(project_config["_juridiction_debug"])
             except Exception as e:
                 st.error(f"Erreur enregistrement juridiction : {e}")
