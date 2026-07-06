@@ -1,0 +1,80 @@
+diff --git a/app.py b/app.py
+index cbc9537..f39f9a3 100644
+--- a/app.py
++++ b/app.py
+@@ -7963,6 +7963,67 @@ elif page == "Pré-traitement dépôt PDF":
+         st.caption(f"Endpoint prévu : {SERVER_URL}/ocr_deepseek_batch")
+         st.json(payload)
+ 
++    def build_deepseek_ocr_job_id(project_id_value: str, source_pdf_stem: str) -> str:
++        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
++        raw = f"deepseek_ocr_{project_id_value}_{source_pdf_stem}_{stamp}"
++        ascii_raw = unicodedata.normalize("NFKD", raw)
++        ascii_raw = "".join(ch for ch in ascii_raw if not unicodedata.combining(ch))
++        return re.sub(r"[^A-Za-z0-9_.-]+", "_", ascii_raw).strip("_")
++
++    def build_deepseek_ocr_job(project_id_value: str, paths_info: dict) -> dict:
++        source_pdf = paths_info.get("pdf_pcfixe_server") or ""
++        pages = paths_info.get("pages_user") or [1]
++        job_id = build_deepseek_ocr_job_id(project_id_value, Path(source_pdf).stem or "document")
++        return {
++            "job_id": job_id,
++            "type": "deepseek_ocr",
++            "project_id": project_id_value,
++            "source_pdf": source_pdf,
++            "pages": [int(p) for p in pages],
++            "output_dir": paths_info.get("output_dir_pcfixe_server") or "",
++            "png_dir": paths_info.get("png_dir_pcfixe_server") or "",
++            "tile_count": 2,
++            "postprocess": True,
++            "retry_glitch_pages": True,
++            "tile_glitch_pages": True,
++            "fallback_tesseract_pages": False,
++        }
++
++    def pcfixe_jobs_queued_unc() -> str:
++        return r"\\192.168.0.155\Affaires\_jobs\queued"
++
++    def write_deepseek_ocr_job(job: dict, queued_dir_unc: str) -> str:
++        queued_dir = Path(queued_dir_unc)
++        queued_dir.mkdir(parents=True, exist_ok=True)
++        safe_job_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(job.get("job_id") or "deepseek_ocr_job")).strip("_")
++        target = queued_dir / f"{safe_job_id}.json"
++        if target.exists():
++            target = queued_dir / f"{safe_job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
++        target.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
++        return str(target)
++
++    deepseek_state_key = f"deepseek_ocr_dry_run_docs_{project_id}"
++    if ocr_engine == "DeepSeekOCR avancé" and st.session_state.get(deepseek_state_key):
++        st.markdown("#### Job PC fixe DeepSeekOCR")
++        queued_dir_unc = pcfixe_jobs_queued_unc()
++        st.caption(f"Queue cible : {queued_dir_unc}")
++        if st.button("Déposer le job DeepSeekOCR PC fixe", key=f"submit_deepseek_ocr_job_{project_id}"):
++            created_jobs = []
++            try:
++                for item in st.session_state.get(deepseek_state_key, []):
++                    job = build_deepseek_ocr_job(project_id, item.get("paths") or {})
++                    created_path = write_deepseek_ocr_job(job, queued_dir_unc)
++                    created_jobs.append({"job_id": job["job_id"], "json_path": created_path, "job": job})
++            except Exception as exc:
++                st.error(f"Dépôt du job DeepSeekOCR impossible : {exc}")
++            else:
++                st.success(f"{len(created_jobs)} job(s) DeepSeekOCR déposé(s) dans la queue PC fixe.")
++                st.info("Rappel : le spooler DeepSeekOCR PC fixe est actuellement validé en simulation côté draft.")
++                for created in created_jobs:
++                    st.write("job_id :", created["job_id"])
++                    st.write("JSON créé :", created["json_path"])
++                    st.json(created["job"])
++
+     if st.button("🔎 Analyser Dire/Bordereau", key=f"analyze_dire_bord_{project_id}"):
+         if ocr_engine == "DeepSeekOCR avancé":
+             selected_docs_deepseek = []
+@@ -7994,6 +8055,7 @@ elif page == "Pré-traitement dépôt PDF":
+                 st.warning("Aucun document sélectionné pour le dry-run DeepSeekOCR.")
+                 st.stop()
+ 
++            st.session_state[deepseek_state_key] = dry_run_docs
+             st.info("Dry-run DeepSeekOCR : aucune conversion PNG, aucun appel /ocr_deepseek_batch, aucun OCR lancé.")
+             st.caption(f"Racine PC fixe locale calculée : {pcfixe_local_root_for_server(project_config, project_id)}")
+             for item in dry_run_docs:
