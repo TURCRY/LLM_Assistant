@@ -1,22 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-seed_captation.py (Laptop) — wrapper d'exécution du .bat de propagation "fichiers lourds"
+Local abstraction for captation seeding.
 
-But:
-- Exécuter run_all_from_jpg_v3.bat depuis un dossier ...\\Photos\\JPG
-- Forcer par défaut la destination NAS: \\192.168.1.20\\volume1\\Affaires
-- Capturer stdout/stderr, code retour, et écrire un log JSON dans:
-  \\192.168.1.20\\volume1\\Affaires\\<ID_AFFAIRE>\\AA_Expert_Admin\\_Logs\\seed_captation.jsonl
-
-Usage (exemples):
-  python seed_captation.py --affaire 2025-J46 --cwd "D:\\Captations\\Accedit 06 11 2025\\Photos\\JPG"
-  python seed_captation.py --affaire 2025-J46 --cwd "%CD%"
-  python seed_captation.py --affaire 2025-J46 --cwd "%CD%" --root-dst "\\\\192.168.0.155\\Affaires" --mode PCFIXE
-
-Pré-requis:
-- run_all_from_jpg_v3.bat dans C:\\LLM_Assistant\\tools\\sync\\
-- Le .bat doit accepter: run_all_from_jpg_v3.bat <ID_AFFAIRE> [ROOT_DST] [MODE]
-  (si vous n'avez pas encore modifié le .bat, adaptez la commande ci-dessous)
+The Streamlit UI calls this wrapper, not a versioned .bat directly.  The
+default backend is the current operational chain:
+run_all_from_jpg_v5.bat.
 """
 
 from __future__ import annotations
@@ -27,14 +15,12 @@ import os
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 
-DEFAULT_ROOT_DST_NAS = r"\\192.168.1.20\volume1\Affaires"
-DEFAULT_MODE = "NAS"
-DEFAULT_BAT = r"C:\LLM_Assistant\tools\sync\run_all_from_jpg_v3.bat"
-LOCAL_LOG_DIR = Path(r"C:\LLM_Assistant\tools\sync\logs")
-
+DEFAULT_ROOT_DST_NAS = r"\\192.168.1.20\Affaires"
+DEFAULT_MODE = "FULL"
+BACKEND_LABEL = "run_all_from_jpg_v5"
 
 
 def now_iso() -> str:
@@ -45,173 +31,227 @@ def is_jpg_folder(cwd: Path) -> bool:
     return cwd.is_dir() and cwd.name.lower() == "jpg"
 
 
-def safe_mkdir(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+def safe_mkdir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
 
 
-def write_jsonl_line(path: Path, obj: Dict[str, Any]) -> None:
+def write_jsonl_line(path: Path, obj: dict[str, Any]) -> None:
     safe_mkdir(path.parent)
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-def run_bat(
-    bat_path: Path,
-    affaire_id: str,
-    root_dst: str,
-    mode: str,
-    cwd: Path,
-    photos_csv_path: str,
-    timeout_s: Optional[int] = None,
-) -> Tuple[int, str, str]:
 
-    """
-    Exécute le .bat en fixant le working directory sur le dossier JPG.
-    Retourne: (returncode, stdout, stderr)
-    """
-    if not bat_path.exists():
-        raise FileNotFoundError(f".bat introuvable: {bat_path}")
-
-    # Important: sous Windows, exécuter via cmd.exe /c
-    cmd = [
-        "cmd.exe",
-        "/c",
-        str(bat_path),
-        affaire_id,
-        root_dst,
-        mode,
-        photos_csv_path,
+def default_bat_candidates() -> list[Path]:
+    here = Path(__file__).resolve().parent
+    workspace = Path(r"C:\CodexWorkspace")
+    return [
+        Path(os.getenv("CAPTATION_SEED_BAT", "")) if os.getenv("CAPTATION_SEED_BAT") else None,
+        here / "run_all_from_jpg_v5.bat",
+        here / "run_all_from_JPG_v5.bat",
+        here.parent / "compression_photos" / "run_all_from_jpg_v5.bat",
+        Path(r"C:\LLM_Assistant\tools\sync\run_all_from_jpg_v5.bat"),
+        Path(r"C:\LLM_Assistant\tools\sync\run_all_from_JPG_v5.bat"),
+        Path(r"C:\LLM_Assistant\tools\compression_photos\run_all_from_jpg_v5.bat"),
+        workspace
+        / "_codex_context"
+        / "gpt4all_local_context"
+        / "scripts"
+        / "copie_photos_laptop_vers_PCfixe"
+        / "run_all_from_jpg_v5.bat",
+        workspace
+        / "_codex_context"
+        / "gpt4all_local_context"
+        / "docs"
+        / "app_reference"
+        / "synchronisation"
+        / "laptop-naspcfixe"
+        / "copie_gros_fichiers"
+        / "run_all_from_jpg_v5.bat",
+        workspace / "copie_gros_fichiers" / "codex_proposal" / "run_all_from_jpg_v5.bat",
     ]
 
-    proc = subprocess.run(
-        cmd,
-        cwd=str(cwd),
-        capture_output=True,
-        text=True,
-        timeout=timeout_s,
-        shell=False,
+
+def resolve_backend_bat(explicit_bat: str = "") -> Path:
+    if explicit_bat.strip():
+        path = Path(explicit_bat).expanduser()
+        if path.exists():
+            return path.resolve()
+        raise FileNotFoundError(f".bat introuvable: {path}")
+
+    candidates = [p for p in default_bat_candidates() if p is not None]
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate.resolve()
+        except OSError:
+            continue
+
+    checked = "\n".join(f"- {p}" for p in candidates)
+    raise FileNotFoundError(
+        "Aucun backend de seed captation trouve. "
+        "Definir CAPTATION_SEED_BAT ou installer run_all_from_jpg_v5.bat.\n"
+        f"Chemins testes:\n{checked}"
     )
-    return proc.returncode, proc.stdout, proc.stderr
 
 
 def default_local_log_path(affaire_id: str) -> Path:
-    # Log sur la destination (NAS par défaut), dans l’affaire
-    # \\...\Affaires\<ID>\AA_Expert_Admin\_Logs\seed_captation.jsonl
-    return Path(r"C:\LLM_Assistant\tools\sync\logs") / f"seed_captation_{affaire_id}.jsonl"
+    return Path(__file__).resolve().parent / "logs" / f"seed_captation_{affaire_id}.jsonl"
 
-def main() -> int:
-    p = argparse.ArgumentParser()
-    p.add_argument("--affaire", required=True, help="ID affaire (ex: 2025-J46)")
-    p.add_argument(
-        "--cwd",
-        default=os.getcwd(),
-        help="Dossier de travail: doit être ...\\Photos\\JPG (par défaut: dossier courant)",
-    )
-    p.add_argument("--bat", default=DEFAULT_BAT, help="Chemin du .bat à exécuter")
-    p.add_argument(
-        "--root-dst",
-        default=DEFAULT_ROOT_DST_NAS,
-        help=r"Destination UNC (NAS par défaut). Ex: \\192.168.1.20\volume1\Affaires",
-    )
-    p.add_argument(
-        "--mode",
-        default=DEFAULT_MODE,
-        help="Mode indicatif (NAS|PCFIXE|...). Sert au log et (optionnel) au .bat.",
-    )
-    p.add_argument("--timeout", type=int, default=0, help="Timeout secondes (0 = pas de timeout)")
-    p.add_argument(
-        "--log-path",
-        default="",
-        help="Chemin log JSONL. Si vide: log dans AA_Expert_Admin/_Logs sur la destination.",
-    )
-    p.add_argument("--photos-csv-path", required=True, help="chemin vers le csv des photos")
 
-    args = p.parse_args()
+def build_command(bat_path: Path, affaire_id: str) -> list[str]:
+    return ["cmd.exe", "/c", str(bat_path), affaire_id]
 
+
+def validate_inputs(args: argparse.Namespace, bat_path: Path) -> dict[str, Any]:
     affaire_id = args.affaire.strip()
     cwd = Path(args.cwd).resolve()
-    
-    photos_csv = Path(args.photos_csv_path).resolve()
-    if not photos_csv.exists():
-        raise SystemExit(f"ERREUR: --photos-csv-path introuvable: {photos_csv}")
+    photos_csv = Path(args.photos_csv_path).resolve() if args.photos_csv_path else None
 
-    bat_path = Path(args.bat).resolve()
-    root_dst = args.root_dst.strip()
-    mode = args.mode.strip()
-    timeout_s = None if args.timeout <= 0 else int(args.timeout)
+    errors: list[str] = []
+    warnings: list[str] = []
 
+    if not affaire_id:
+        errors.append("--affaire est requis")
     if not is_jpg_folder(cwd):
-        raise SystemExit(
-            f"ERREUR: --cwd doit pointer vers un dossier nommé 'JPG'. Reçu: {cwd}"
+        errors.append(f"--cwd doit pointer vers un dossier nomme 'JPG': {cwd}")
+    if not bat_path.exists():
+        errors.append(f"backend introuvable: {bat_path}")
+    if photos_csv and not photos_csv.exists():
+        warnings.append(f"--photos-csv-path introuvable: {photos_csv}")
+
+    root_dst = args.root_dst.strip()
+    mode = args.mode.strip().upper()
+    if root_dst and root_dst != DEFAULT_ROOT_DST_NAS:
+        warnings.append(
+            "--root-dst est conserve pour compatibilite UI, mais le backend v5 "
+            "utilise ses racines operationnelles internes."
+        )
+    if mode not in {"FULL", "NAS", "PCFIXE"}:
+        warnings.append("--mode non standard; valeurs attendues: FULL, NAS, PCFIXE")
+    elif mode in {"NAS", "PCFIXE"}:
+        warnings.append(
+            "--mode est informatif avec le backend v5: la chaine actuelle copie NAS puis PC fixe."
         )
 
-    if mode.upper() not in {"NAS", "PCFIXE"}:
-        raise SystemExit("ERREUR: --mode doit valoir NAS ou PCFIXE")
-    mode = mode.upper()
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "affaire": affaire_id,
+        "cwd": str(cwd),
+        "photos_csv_path": str(photos_csv) if photos_csv else "",
+        "backend_label": BACKEND_LABEL,
+        "backend_bat": str(bat_path),
+        "root_dst_ui": root_dst,
+        "mode_ui": mode,
+        "operational_roots": {
+            "nas": r"\\192.168.1.20\Affaires",
+            "pcfixe_wifi": r"\\192.168.0.155\Affaires",
+            "pcfixe_rj45": r"\\192.168.0.120\Affaires",
+        },
+    }
 
-    log_path = Path(args.log_path) if args.log_path else default_local_log_path(affaire_id)
 
-    # Évènement "start"
-    start_evt: Dict[str, Any] = {
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--affaire", required=True, help="ID affaire, ex: 2025-J46")
+    parser.add_argument(
+        "--cwd",
+        default=os.getcwd(),
+        help=r"Dossier de travail, normalement ...\photos\JPG",
+    )
+    parser.add_argument(
+        "--bat",
+        default="",
+        help="Backend .bat explicite. Par defaut: resolution de run_all_from_jpg_v5.bat.",
+    )
+    parser.add_argument(
+        "--root-dst",
+        default=DEFAULT_ROOT_DST_NAS,
+        help=r"Valeur UI historique. Backend v5: racines operationnelles internes.",
+    )
+    parser.add_argument(
+        "--mode",
+        default=DEFAULT_MODE,
+        help="Valeur UI historique/informative: FULL, NAS ou PCFIXE.",
+    )
+    parser.add_argument("--timeout", type=int, default=0, help="Timeout secondes (0 = aucun)")
+    parser.add_argument("--log-path", default="", help="Chemin log JSONL optionnel")
+    parser.add_argument("--photos-csv-path", default="", help="Chemin du CSV photos, optionnel")
+    parser.add_argument("--dry-run", action="store_true", help="Verifie et affiche sans executer")
+
+    args = parser.parse_args()
+    bat_path = resolve_backend_bat(args.bat)
+    preflight = validate_inputs(args, bat_path)
+    command = build_command(bat_path, preflight["affaire"])
+    preflight["command"] = command
+    preflight["dry_run"] = bool(args.dry_run)
+
+    log_path = Path(args.log_path) if args.log_path else default_local_log_path(preflight["affaire"])
+    write_jsonl_line(log_path, {"ts": now_iso(), "event": "seed_captation_preflight", **preflight})
+
+    print("=== Captation seed preflight ===")
+    print(json.dumps(preflight, ensure_ascii=False, indent=2))
+
+    if not preflight["ok"]:
+        return 2
+
+    if args.dry_run:
+        print("DRY-RUN: aucune copie lancee.")
+        return 0
+
+    timeout_s = None if args.timeout <= 0 else int(args.timeout)
+    start_evt = {
         "ts": now_iso(),
         "event": "seed_captation_start",
-        "affaire": affaire_id,
-        "mode": mode,
-        "root_dst": root_dst,
-        "cwd": str(cwd),
-        "bat": str(bat_path),
-        "user": os.environ.get("USERNAME", ""),
-        "host": os.environ.get("COMPUTERNAME", ""),
+        "backend_label": BACKEND_LABEL,
+        "backend_bat": str(bat_path),
+        "command": command,
+        "cwd": preflight["cwd"],
     }
     write_jsonl_line(log_path, start_evt)
 
-    # Exécution
-    rc = 999
-    out = ""
-    err = ""
     try:
-        rc, out, err = run_bat(
-            bat_path=bat_path,
-            affaire_id=affaire_id,
-            root_dst=root_dst,
-            mode=mode,
-            cwd=cwd,
-            photos_csv_path=args.photos_csv_path,
-            timeout_s=timeout_s,
+        proc = subprocess.run(
+            command,
+            cwd=preflight["cwd"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            shell=False,
         )
-
-    except subprocess.TimeoutExpired as e:
+        rc = proc.returncode
+        out = proc.stdout or ""
+        err = proc.stderr or ""
+    except subprocess.TimeoutExpired as exc:
         rc = 124
-        out = (e.stdout or "")
-        err = (e.stderr or "") + f"\n[TIMEOUT] {e}"
-    except Exception as e:
+        out = exc.stdout or ""
+        err = (exc.stderr or "") + f"\n[TIMEOUT] {exc}"
+    except Exception as exc:
         rc = 125
-        err = f"[EXCEPTION] {type(e).__name__}: {e}"
+        out = ""
+        err = f"[EXCEPTION] {type(exc).__name__}: {exc}"
 
-    # Évènement "end"
-    end_evt: Dict[str, Any] = {
-        "ts": now_iso(),
-        "event": "seed_captation_end",
-        "affaire": affaire_id,
-        "mode": mode,
-        "root_dst": root_dst,
-        "cwd": str(cwd),
-        "bat": str(bat_path),
-        "returncode": rc,
-        # On logge stdout/stderr tronqués pour éviter des logs énormes.
-        "stdout_tail": out[-8000:] if out else "",
-        "stderr_tail": err[-8000:] if err else "",
-    }
-    write_jsonl_line(log_path, end_evt)
+    write_jsonl_line(
+        log_path,
+        {
+            "ts": now_iso(),
+            "event": "seed_captation_end",
+            "backend_label": BACKEND_LABEL,
+            "backend_bat": str(bat_path),
+            "returncode": rc,
+            "stdout_tail": out[-8000:] if out else "",
+            "stderr_tail": err[-8000:] if err else "",
+        },
+    )
 
-    # Sortie console (utile en direct)
-    print(f"[{now_iso()}] seed_captation: affaire={affaire_id} mode={mode} rc={rc}")
+    print(f"[{now_iso()}] seed_captation: backend={BACKEND_LABEL} affaire={preflight['affaire']} rc={rc}")
     if err:
         print("---- stderr (tail) ----")
         print(err[-4000:])
     if out:
         print("---- stdout (tail) ----")
         print(out[-4000:])
-
     return int(rc)
 
 
