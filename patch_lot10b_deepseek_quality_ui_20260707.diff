@@ -1,0 +1,266 @@
+diff --git a/app.py b/app.py
+index f39f9a3..2132e6e 100644
+--- a/app.py
++++ b/app.py
+@@ -7992,6 +7992,9 @@ elif page == "Pré-traitement dépôt PDF":
+     def pcfixe_jobs_queued_unc() -> str:
+         return r"\\192.168.0.155\Affaires\_jobs\queued"
+ 
++    def pcfixe_jobs_root_unc() -> str:
++        return r"\\192.168.0.155\Affaires\_jobs"
++
+     def write_deepseek_ocr_job(job: dict, queued_dir_unc: str) -> str:
+         queued_dir = Path(queued_dir_unc)
+         queued_dir.mkdir(parents=True, exist_ok=True)
+@@ -8002,7 +8005,156 @@ elif page == "Pré-traitement dépôt PDF":
+         target.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+         return str(target)
+ 
++    def pcfixe_server_path_to_jobs_unc(path_value: str) -> str:
++        raw = _norm(path_value)
++        prefix = _norm(r"C:\Affaires")
++        if raw.lower().startswith(prefix.lower()):
++            rel = raw[len(prefix):].strip("\\/ ")
++            return pj(r"\\192.168.0.155\Affaires", rel)
++        return path_value or ""
++
++    def _read_json_file_best_effort(path_value: str) -> dict:
++        try:
++            p = Path(path_value)
++            if p.exists():
++                return json.loads(p.read_text(encoding="utf-8-sig"))
++        except Exception:
++            return {}
++        return {}
++
++    def _first_existing_path(*path_values: str) -> str:
++        for path_value in path_values:
++            if not path_value:
++                continue
++            unc_path = pcfixe_server_path_to_jobs_unc(path_value)
++            try:
++                if Path(unc_path).exists():
++                    return unc_path
++            except Exception:
++                continue
++        return ""
++
++    def find_deepseek_ocr_job_status(job_id: str) -> dict:
++        result = {"job_id": job_id, "status": "introuvable", "job_path": "", "job": {}, "logs": []}
++        safe_job_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(job_id or "")).strip("_")
++        if not safe_job_id:
++            return result
++
++        root = Path(pcfixe_jobs_root_unc())
++        for status in ("queued", "running", "done", "failed"):
++            status_dir = root / status
++            try:
++                matches = sorted(status_dir.glob(f"{safe_job_id}*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
++            except Exception:
++                matches = []
++            if matches:
++                job_path = str(matches[0])
++                result.update({"status": status, "job_path": job_path, "job": _read_json_file_best_effort(job_path)})
++                break
++
++        logs_dir = root / "logs"
++        try:
++            result["logs"] = [str(p) for p in sorted(logs_dir.glob(f"*{safe_job_id}*"), key=lambda p: p.stat().st_mtime, reverse=True)]
++        except Exception:
++            result["logs"] = []
++        return result
++
++    def discover_deepseek_ocr_jobs_for_project(project_id_value: str) -> list[dict]:
++        jobs: list[dict] = []
++        root = Path(pcfixe_jobs_root_unc())
++        for status in ("done", "queued", "running", "failed"):
++            status_dir = root / status
++            try:
++                candidates = list(status_dir.glob("deepseek_ocr*.json"))
++            except Exception:
++                candidates = []
++            for job_path in candidates:
++                job = _read_json_file_best_effort(str(job_path))
++                if (job.get("type") or "") != "deepseek_ocr":
++                    continue
++                if (job.get("project_id") or "") != project_id_value:
++                    continue
++                try:
++                    mtime = job_path.stat().st_mtime
++                except Exception:
++                    mtime = 0
++                jobs.append({
++                    "job_id": str(job.get("job_id") or job_path.stem),
++                    "status": status,
++                    "job_path": str(job_path),
++                    "job": job,
++                    "mtime": mtime,
++                })
++        jobs.sort(key=lambda item: item.get("mtime") or 0, reverse=True)
++        return jobs
++
++    def load_deepseek_ocr_done_result(job_status: dict) -> dict:
++        job = job_status.get("job") or {}
++        output_dir_unc = pcfixe_server_path_to_jobs_unc(str(job.get("output_dir") or ""))
++        job_id = str(job_status.get("job_id") or job.get("job_id") or "")
++
++        manifest_path = ""
++        final_md_path = ""
++        final_txt_path = ""
++        try:
++            out_dir = Path(output_dir_unc)
++            if out_dir.exists():
++                manifests = sorted(out_dir.glob(f"{job_id}*.final_manifest.json"), key=lambda p: p.stat().st_mtime, reverse=True)
++                if not manifests:
++                    manifests = sorted(out_dir.glob("*.final_manifest.json"), key=lambda p: p.stat().st_mtime, reverse=True)
++                if manifests:
++                    manifest_path = str(manifests[0])
++        except Exception:
++            pass
++
++        manifest = _read_json_file_best_effort(manifest_path) if manifest_path else {}
++        final_md_path = _first_existing_path(
++            str(manifest.get("final_md_path") or manifest.get("final_md") or manifest.get("md") or ""),
++            str(manifest.get("final_markdown_path") or manifest.get("markdown_path") or ""),
++        )
++        final_txt_path = _first_existing_path(
++            str(manifest.get("final_txt_path") or manifest.get("final_txt") or manifest.get("txt") or ""),
++            str(manifest.get("final_text_path") or manifest.get("text_path") or ""),
++        )
++
++        if output_dir_unc:
++            try:
++                out_dir = Path(output_dir_unc)
++                if not final_md_path:
++                    md_matches = sorted(out_dir.glob(f"{job_id}*.final.md"), key=lambda p: p.stat().st_mtime, reverse=True)
++                    if not md_matches:
++                        md_matches = sorted(out_dir.glob("*.final.md"), key=lambda p: p.stat().st_mtime, reverse=True)
++                    if md_matches:
++                        final_md_path = str(md_matches[0])
++                if not final_txt_path:
++                    txt_matches = sorted(out_dir.glob(f"{job_id}*.final.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
++                    if not txt_matches:
++                        txt_matches = sorted(out_dir.glob("*.final.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
++                    if txt_matches:
++                        final_txt_path = str(txt_matches[0])
++            except Exception:
++                pass
++
++        preview_path = final_md_path or final_txt_path
++        preview = ""
++        if preview_path:
++            try:
++                preview = Path(preview_path).read_text(encoding="utf-8-sig", errors="replace")[:1000]
++            except Exception as exc:
++                preview = f"Lecture extrait impossible : {exc}"
++
++        return {
++            "manifest_path": manifest_path,
++            "manifest": manifest,
++            "final_md_path": final_md_path,
++            "final_txt_path": final_txt_path,
++            "warnings": manifest.get("warnings") or manifest.get("warning") or [],
++            "metrics": manifest.get("metrics") or {},
++            "preview": preview,
++        }
++
+     deepseek_state_key = f"deepseek_ocr_dry_run_docs_{project_id}"
++    deepseek_last_job_key = f"deepseek_ocr_last_job_id_{project_id}"
+     if ocr_engine == "DeepSeekOCR avancé" and st.session_state.get(deepseek_state_key):
+         st.markdown("#### Job PC fixe DeepSeekOCR")
+         queued_dir_unc = pcfixe_jobs_queued_unc()
+@@ -8020,10 +8172,94 @@ elif page == "Pré-traitement dépôt PDF":
+                 st.success(f"{len(created_jobs)} job(s) DeepSeekOCR déposé(s) dans la queue PC fixe.")
+                 st.info("Rappel : le spooler DeepSeekOCR PC fixe est actuellement validé en simulation côté draft.")
+                 for created in created_jobs:
++                    st.session_state[deepseek_last_job_key] = created["job_id"]
+                     st.write("job_id :", created["job_id"])
+                     st.write("JSON créé :", created["json_path"])
+                     st.json(created["job"])
+ 
++    if ocr_engine == "DeepSeekOCR avancé":
++        st.markdown("#### Suivi du job DeepSeekOCR")
++        discovered_jobs = discover_deepseek_ocr_jobs_for_project(project_id)
++        discovered_default = discovered_jobs[0]["job_id"] if discovered_jobs else ""
++        last_job_default = st.session_state.get(deepseek_last_job_key) or discovered_default
++        selected_job_from_dropdown = ""
++        if discovered_jobs:
++            labels = [
++                f"{item['job_id']} — {item['status']}"
++                for item in discovered_jobs
++            ]
++            selected_label = st.selectbox(
++                "Jobs DeepSeekOCR trouvés pour cette affaire",
++                ["(saisie manuelle)"] + labels,
++                index=1 if labels else 0,
++                key=f"deepseek_ocr_found_jobs_{project_id}",
++            )
++            if selected_label != "(saisie manuelle)":
++                selected_idx = labels.index(selected_label)
++                last_job_default = discovered_jobs[selected_idx]["job_id"]
++                selected_job_from_dropdown = last_job_default
++        else:
++            st.caption("Aucun job DeepSeekOCR trouvé automatiquement pour cette affaire.")
++
++        last_job_id = st.text_input(
++            "Dernier job_id DeepSeekOCR",
++            value=last_job_default,
++            key=f"deepseek_ocr_follow_job_id_{project_id}",
++        )
++        if selected_job_from_dropdown:
++            last_job_id = selected_job_from_dropdown
++        if st.button("Vérifier le résultat DeepSeekOCR", key=f"check_deepseek_ocr_result_{project_id}"):
++            status = find_deepseek_ocr_job_status(last_job_id)
++            st.write("job_id :", status.get("job_id") or "")
++            st.write("statut :", status.get("status") or "")
++            st.write("job JSON :", status.get("job_path") or "")
++
++            if status.get("status") in {"queued", "running"}:
++                st.info("Job DeepSeekOCR en attente ou en cours côté PC fixe.")
++            elif status.get("status") == "failed":
++                st.error("Job DeepSeekOCR en échec côté PC fixe.")
++                if status.get("logs"):
++                    st.write("Logs disponibles :")
++                    for log_path in status["logs"][:10]:
++                        st.write(log_path)
++            elif status.get("status") == "done":
++                result = load_deepseek_ocr_done_result(status)
++                st.success("Job DeepSeekOCR terminé.")
++                st.write("final_md_path :", result.get("final_md_path") or "")
++                st.write("final_txt_path :", result.get("final_txt_path") or "")
++                st.write("manifest_path :", result.get("manifest_path") or "")
++                manifest = result.get("manifest") or {}
++                if manifest:
++                    st.markdown("#### Qualité OCR DeepSeek")
++                    leading_noise_removed = bool(manifest.get("leading_noise_removed"))
++                    quality_warning = bool(manifest.get("quality_warning"))
++                    detected_numbers = manifest.get("bordereau_piece_numbers_detected") or []
++                    missing_numbers = manifest.get("bordereau_missing_piece_numbers") or []
++                    removed_text = str(manifest.get("leading_noise_removed_text") or "").strip()
++
++                    st.write("Bruit initial supprimé :", "oui" if leading_noise_removed else "non")
++                    if removed_text:
++                        st.write("Texte supprimé :", removed_text)
++                    st.write("Pièces détectées :", ", ".join(str(n) for n in detected_numbers) if detected_numbers else "(aucune)")
++                    st.write("Pièces manquantes :", ", ".join(str(n) for n in missing_numbers) if missing_numbers else "(aucune)")
++                    st.write("quality_warning :", "oui" if quality_warning else "non")
++                    if quality_warning:
++                        st.warning("OCR DeepSeek à vérifier : pièces manquantes détectées.")
++                    if leading_noise_removed:
++                        st.info("Un texte parasite initial a été supprimé avant fusion.")
++                if result.get("warnings"):
++                    st.warning(json.dumps(result["warnings"], ensure_ascii=False, indent=2))
++                if result.get("metrics"):
++                    st.write("Métriques :")
++                    st.json(result["metrics"])
++                if result.get("manifest"):
++                    with st.expander("Manifest final DeepSeekOCR", expanded=False):
++                        st.json(result["manifest"])
++                if result.get("preview"):
++                    st.text_area("Extrait OCR final", value=result["preview"], height=240, key=f"deepseek_ocr_preview_{project_id}")
++            else:
++                st.warning("Job DeepSeekOCR introuvable dans queued/running/done/failed.")
++
+     if st.button("🔎 Analyser Dire/Bordereau", key=f"analyze_dire_bord_{project_id}"):
+         if ocr_engine == "DeepSeekOCR avancé":
+             selected_docs_deepseek = []
