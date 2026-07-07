@@ -8720,9 +8720,42 @@ elif page == "Pré-traitement dépôt PDF":
         key=f"split_rows_editor_{project_id}",
     )
 
+    def prepare_deepseek_split_rows_for_dry_run(editor_rows):
+        source_rows = editor_rows.to_dict("records") if hasattr(editor_rows, "to_dict") else list(editor_rows or [])
+        out = []
+        for row in source_rows:
+            item = dict(row or {})
+            if compact_spaces(item.get("etat") or "").lower() == "manquante":
+                continue
+            numero_piece = item.get("numero_piece") or item.get("numero")
+            title = compact_spaces(item.get("editable_title") or item.get("titre_propose") or "")
+            item["numero"] = numero_piece
+            item["numero_piece"] = numero_piece
+            if title:
+                item["editable_title"] = title
+            out.append(item)
+        return out
+
     if st.button("Préparer le split (dry-run)", key=f"prepare_split_dry_run_{project_id}"):
+        edited_rows_for_dry_run = edited.to_dict("records") if hasattr(edited, "to_dict") else list(edited or [])
+        uses_deepseek_table = any(
+            compact_spaces((row or {}).get("origine") or "") == "DeepSeekOCR"
+            or "titre_propose" in (row or {})
+            or compact_spaces((row or {}).get("etat") or "") in {"OCR", "manquante"}
+            for row in edited_rows_for_dry_run
+        )
+        rows_for_payload = prepare_deepseek_split_rows_for_dry_run(edited) if uses_deepseek_table else edited
+        if uses_deepseek_table:
+            st.info("Le dry-run utilise les titres validés du tableau DeepSeekOCR.")
+            missing_pages = any(
+                not (row or {}).get("start_page") or not (row or {}).get("end_page")
+                for row in rows_for_payload
+            )
+            if missing_pages:
+                st.warning("Ces pièces sont déjà séparées : utiliser le mode renommage/classement, pas le split.")
+                st.stop()
         pieces = build_pieces_payload(
-            edited,
+            rows_for_payload,
             st.session_state.get("piece_title_suggestions", {}),
             prefix="PIECE"
         )
