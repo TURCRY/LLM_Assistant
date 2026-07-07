@@ -1,0 +1,61 @@
+diff --git a/app.py b/app.py
+index 787da64..cc30e67 100644
+--- a/app.py
++++ b/app.py
+@@ -9384,12 +9384,55 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+             piece_names = st.multiselect("Fichiers de pièces", file_labels, key="ingestion_pieces")
+             multi_pdf_name = st.selectbox("PDF unique multi-pièces", ["(aucun)"] + file_labels, key="ingestion_multi_pdf")
+     
++        def split_table_validated_titles() -> dict[int, str]:
++            rows = [dict(row or {}) for row in (st.session_state.get("split_rows") or [])]
++            editor_state = st.session_state.get(f"split_rows_editor_{project_id}")
++            if isinstance(editor_state, dict):
++                for raw_idx, changes in (editor_state.get("edited_rows") or {}).items():
++                    try:
++                        idx = int(raw_idx)
++                    except Exception:
++                        continue
++                    if 0 <= idx < len(rows) and isinstance(changes, dict):
++                        rows[idx].update(changes)
++                deleted = set()
++                for raw_idx in editor_state.get("deleted_rows") or []:
++                    try:
++                        deleted.add(int(raw_idx))
++                    except Exception:
++                        pass
++                if deleted:
++                    rows = [row for idx, row in enumerate(rows) if idx not in deleted]
++                for added in editor_state.get("added_rows") or []:
++                    if isinstance(added, dict):
++                        rows.append(dict(added))
++            elif hasattr(editor_state, "to_dict"):
++                rows = editor_state.to_dict("records")
++            elif isinstance(editor_state, list):
++                rows = [dict(row or {}) for row in editor_state if isinstance(row, dict)]
++
++            lookup: dict[int, str] = {}
++            for row in rows:
++                numero = coerce_editor_int((row or {}).get("numero_piece") or (row or {}).get("numero"))
++                if numero is None:
++                    continue
++                title = compact_spaces((row or {}).get("editable_title") or (row or {}).get("titre_propose") or "")
++                if title:
++                    lookup[numero] = title
++            return lookup
++
+         if st.button("Préparer renommage des pièces séparées", key=f"prepare_renaming_separated_pieces_{project_id}"):
+             suggestions = st.session_state.get("piece_title_suggestions") or {}
++            validated_titles = split_table_validated_titles()
+             dry_rows = []
+             for name in piece_names or []:
+                 numero_piece, _sub_piece = detect_piece_ref_from_filename(name)
+-                libelle_ocr = compact_spaces(suggestions.get(numero_piece) or suggestions.get(str(numero_piece)) or "") if numero_piece is not None else ""
++                libelle_ocr = compact_spaces(
++                    validated_titles.get(numero_piece)
++                    or suggestions.get(numero_piece)
++                    or suggestions.get(str(numero_piece))
++                    or ""
++                ) if numero_piece is not None else ""
+                 if numero_piece is None:
+                     action = "à vérifier"
+                     target_name = ""
