@@ -1,0 +1,23 @@
+diff --git a/app.py b/app.py
+index 44c8711..3b81942 100644
+--- a/app.py
++++ b/app.py
+@@ -7686,7 +7686,17 @@ elif page == "Pré-traitement dépôt PDF":
+ 
+     input_path  = st.text_input("PDF source (chemin VU par le serveur)", value=input_default, key=f"split_pdf_source_server_{project_id}")
+     output_dir  = st.text_input("Dossier de sortie (PC fixe)", value=splits_dir_default, key=f"split_output_dir_pc_{project_id}")
+-    code_partie = st.text_input("Code partie (ex: 03)", value="", key=f"split_code_partie_{project_id}")
++    code_partie = party_code(
++        current_pdf_cohort.get("code_partie")
++        or selected_cohort_party.get("code_partie")
++        or ""
++    )
++    st.text_input(
++        "Code partie déduit du déposant",
++        value=code_partie,
++        key=f"split_code_partie_{project_id}",
++        disabled=True,
++    )
+     prefix      = st.text_input("Préfixe n° avocat", value="PIECE", key=f"split_prefix_avocat_{project_id}")
+ 
+     # =====================================================
