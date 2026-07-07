@@ -30,6 +30,8 @@ import subprocess
 import traceback
 import uuid
 import getpass
+from urllib.parse import urlparse
+from server_locator import resolve_flask_base_url, request_with_endpoint_fallback
 
 try:
     from docx import Document
@@ -195,9 +197,9 @@ AFFAIRES_ROOT = Path(r"C:\Affaires")
 
 
 
-# ---------- choose server IP ----------
-# hard override if you want to force an address
+# ---------- choose server endpoint ----------
 enforce = os.getenv("ENFORCE_SERVER_IP", "").strip()
+extra_candidates = [f"http://{enforce}:{PORT}"] if enforce else []
 disable_vpn_auto = (os.getenv("DISABLE_VPN_AUTODETECT", "0") == "1")
 
 if enforce:
@@ -214,6 +216,10 @@ else:
 
 SERVER_URL = f"http://{SERVER_IP}:{PORT}"
 SERVER_PORT = PORT
+SERVER_URL = resolve_flask_base_url(extra_candidates=extra_candidates)
+_server_parsed = urlparse(SERVER_URL)
+SERVER_IP = _server_parsed.hostname or SERVER_IP_ENV
+SERVER_PORT = str(_server_parsed.port or PORT)
 
 print(f"[ENV] MACHINE IP locale={LOCAL_IP} → Serveur ciblé : {SERVER_URL}")
 print(f"[ENV] MAC_PCFIXE={MAC_PCFIXE or '(absente/invalide)'}")
@@ -1202,10 +1208,9 @@ def save_json(path: str, data):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 def req(path: str, payload=None, method="POST", timeout=600):
-    url = f"{SERVER_URL}{path}"
-    r = requests.request(
+    r = request_with_endpoint_fallback(
         method,
-        url,
+        path,
         headers={"x-api-key": API_KEY},  # Content-Type pas nécessaire avec json=
         json=(payload or {}),
         timeout=timeout

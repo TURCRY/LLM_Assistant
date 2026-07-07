@@ -17,7 +17,11 @@ import shutil
 import requests
 import streamlit as st
 from pathlib import Path
+import sys
 from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from server_locator import resolve_flask_base_url
 
 load_dotenv()  # charge .env local si présent
 
@@ -71,7 +75,7 @@ with st.expander("⚙️ Paramètres serveur", expanded=True):
     with col1:
         server_base_url = st.text_input(
             "URL du serveur Flask",
-            value=get_env_default("ASR_SERVER_URL", "http://192.168.0.155:5050"),
+            value=get_env_default("ASR_SERVER_URL", resolve_flask_base_url()),
             help="Ex: http://PC-FIXE:5050"
         )
         api_key = st.text_input(
