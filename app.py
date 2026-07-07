@@ -8153,8 +8153,83 @@ elif page == "Pré-traitement dépôt PDF":
             "preview": preview,
         }
 
+    def extract_piece_titles_from_deepseek_markdown(text: str) -> dict:
+        lines = (text or "").splitlines()
+        piece_re = re.compile(
+            r"\bpi[eèéê]ce\s*(?:n\s*[°ºo]?|no|num(?:e|é)ro|#)?\s*0*(\d{1,3})\b\s*(?:[:;|\-–—]\s*)?(.*)$",
+            re.IGNORECASE,
+        )
+
+        def clean_title(value: str) -> str:
+            title = str(value or "").strip()
+            title = re.sub(r"^[|:\-–—\s]+", "", title)
+            title = re.sub(r"[|`*_]+", " ", title)
+            return compact_spaces(title).strip(" .;:-")
+
+        def ignored_line(value: str) -> bool:
+            raw = str(value or "").strip()
+            if not raw:
+                return True
+            if re.fullmatch(r"\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?", raw):
+                return True
+            norm = unicodedata.normalize("NFKD", raw)
+            norm = "".join(ch for ch in norm if not unicodedata.combining(ch)).lower()
+            norm = compact_spaces(re.sub(r"[^a-z0-9]+", " ", norm))
+            if norm in {"bordereau de pieces", "bordereau des pieces"}:
+                return True
+            if norm.startswith("page ") and len(norm) <= 12:
+                return True
+            return False
+
+        def match_piece(value: str):
+            return piece_re.search(str(value or ""))
+
+        def table_cells(value: str) -> list[str]:
+            raw = str(value or "").strip()
+            if "|" not in raw:
+                return []
+            return [cell.strip() for cell in raw.strip("|").split("|") if cell.strip()]
+
+        def following_title(start_idx: int) -> str:
+            for next_line in lines[start_idx + 1:]:
+                if ignored_line(next_line):
+                    continue
+                cells = table_cells(next_line)
+                candidates = cells if cells else [next_line]
+                for candidate in candidates:
+                    if match_piece(candidate):
+                        return ""
+                    title = clean_title(candidate)
+                    if title:
+                        return title
+            return ""
+
+        pieces: dict[int, str] = {}
+        for idx, line in enumerate(lines):
+            if ignored_line(line):
+                continue
+
+            cells = table_cells(line)
+            candidates = cells if cells else [line]
+            for cell_idx, candidate in enumerate(candidates):
+                match = match_piece(candidate)
+                if not match:
+                    continue
+                number = int(match.group(1))
+                title = clean_title(match.group(2) or "")
+                if not title and cell_idx + 1 < len(candidates):
+                    title = clean_title(candidates[cell_idx + 1])
+                if not title:
+                    title = following_title(idx)
+                if title:
+                    pieces.setdefault(number, title)
+                break
+
+        return dict(sorted(pieces.items()))
+
     deepseek_state_key = f"deepseek_ocr_dry_run_docs_{project_id}"
     deepseek_last_job_key = f"deepseek_ocr_last_job_id_{project_id}"
+    deepseek_last_result_key = f"deepseek_ocr_last_result_{project_id}"
     if ocr_engine == "DeepSeekOCR avancé" and st.session_state.get(deepseek_state_key):
         st.markdown("#### Job PC fixe DeepSeekOCR")
         queued_dir_unc = pcfixe_jobs_queued_unc()
@@ -8224,6 +8299,7 @@ elif page == "Pré-traitement dépôt PDF":
                         st.write(log_path)
             elif status.get("status") == "done":
                 result = load_deepseek_ocr_done_result(status)
+                st.session_state[deepseek_last_result_key] = {"status": status, "result": result}
                 st.success("Job DeepSeekOCR terminé.")
                 st.write("final_md_path :", result.get("final_md_path") or "")
                 st.write("final_txt_path :", result.get("final_txt_path") or "")
@@ -8259,6 +8335,35 @@ elif page == "Pré-traitement dépôt PDF":
                     st.text_area("Extrait OCR final", value=result["preview"], height=240, key=f"deepseek_ocr_preview_{project_id}")
             else:
                 st.warning("Job DeepSeekOCR introuvable dans queued/running/done/failed.")
+
+        saved_deepseek_result = st.session_state.get(deepseek_last_result_key) or {}
+        if saved_deepseek_result.get("result"):
+            st.markdown("#### Extraction pièces depuis DeepSeekOCR")
+            if st.button("Extraire les pièces depuis le résultat DeepSeekOCR", key=f"extract_deepseek_ocr_pieces_{project_id}"):
+                result = saved_deepseek_result.get("result") or {}
+                manifest = result.get("manifest") or {}
+                source_path = result.get("final_md_path") or result.get("final_txt_path") or ""
+                if not source_path:
+                    st.error("Aucun final.md/final.txt disponible pour l'extraction DeepSeekOCR.")
+                else:
+                    try:
+                        text = Path(source_path).read_text(encoding="utf-8-sig", errors="replace")
+                        extracted = extract_piece_titles_from_deepseek_markdown(text)
+                    except Exception as exc:
+                        st.error(f"Extraction DeepSeekOCR impossible : {exc}")
+                    else:
+                        st.session_state.piece_title_suggestions = extracted
+                        if bool(manifest.get("quality_warning")):
+                            st.warning("Extraction possible, mais OCR DeepSeek signale une anomalie qualité.")
+                        st.success(f"{len(extracted)} pièce(s) extraite(s) depuis le résultat DeepSeekOCR.")
+                        rows = [
+                            {"numero_piece": number, "libelle_retenu": title}
+                            for number, title in extracted.items()
+                        ]
+                        if rows:
+                            st.dataframe(prepare_df_for_streamlit_display(rows), width="stretch")
+                        else:
+                            st.warning("Aucune pièce détectée dans le résultat DeepSeekOCR.")
 
     if st.button("🔎 Analyser Dire/Bordereau", key=f"analyze_dire_bord_{project_id}"):
         if ocr_engine == "DeepSeekOCR avancé":
