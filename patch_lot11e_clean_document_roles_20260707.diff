@@ -1,0 +1,212 @@
+diff --git a/app.py b/app.py
+index cc30e67..85bd5e5 100644
+--- a/app.py
++++ b/app.py
+@@ -1653,6 +1653,7 @@ def classify_original_files_to_party(
+                 "reason": "destination existe déjà",
+                 "destination_stat": file_stat_record(dst),
+                 **role_meta,
++                **label_meta,
+                 **page_meta,
+             })
+             continue
+@@ -2027,6 +2028,12 @@ DOCUMENT_ROLE_ALIASES = {
+     "pdf_multi_pieces": "pdf_multi_pieces",
+     "pdf_multi_pièces": "pdf_multi_pieces",
+     "multi_pdf": "pdf_multi_pieces",
++    "ordonnance": "ordonnance_decision",
++    "decision": "ordonnance_decision",
++    "décision": "ordonnance_decision",
++    "ordonnance_decision": "ordonnance_decision",
++    "autre": "autre",
++    "autres": "autre",
+ }
+ 
+ def normalize_document_role(value) -> str:
+@@ -2044,6 +2051,10 @@ def document_type_from_role(role: str) -> str:
+         return "bcp"
+     if role == "piece":
+         return "piece"
++    if role == "ordonnance_decision":
++        return "decision"
++    if role == "autre":
++        return "autre"
+     if role == "pdf_multi_pieces":
+         return "pdf_multi_pieces"
+     return ""
+@@ -2064,7 +2075,7 @@ def item_document_role(item: dict, fallback: str = "") -> str:
+         or fallback
+     )
+ 
+-def build_ingestion_document_roles(dire_name: str, bcp_name: str, piece_names: list[str], multi_pdf_name: str) -> dict[str, str]:
++def build_ingestion_document_roles(dire_name: str, bcp_name: str, piece_names: list[str], multi_pdf_name: str, other_names: list[str] | None = None) -> dict[str, str]:
+     roles = {}
+     if dire_name and dire_name != "(aucun)":
+         roles[Path(dire_name).name] = "lettre_dire"
+@@ -2075,6 +2086,9 @@ def build_ingestion_document_roles(dire_name: str, bcp_name: str, piece_names: l
+             roles[Path(name).name] = "piece"
+     if multi_pdf_name and multi_pdf_name != "(aucun)":
+         roles[Path(multi_pdf_name).name] = "pdf_multi_pieces"
++    for name in other_names or []:
++        if name and name != "(aucun)":
++            roles[Path(name).name] = "autre"
+     return roles
+ 
+ def infer_document_role_from_item(item: dict, record: dict | None = None) -> tuple[str, str]:
+@@ -3910,6 +3924,7 @@ def copy_ingestion_uploaded_originals(
+     transmission_meta: dict | None = None,
+     cfg: dict | None = None,
+     document_roles: dict[str, str] | None = None,
++    document_labels: dict[str, str] | None = None,
+ ) -> dict:
+     folder_rel = (party.get("folder_rel") or "").strip()
+     if not folder_rel:
+@@ -3930,11 +3945,19 @@ def copy_ingestion_uploaded_originals(
+     source_root_checks = ensure_source_roots(source_roots) if source_type == "juridiction" else {}
+     copied, skipped, errors = [], [], []
+     document_roles = {Path(str(k)).name: normalize_document_role(v) for k, v in (document_roles or {}).items()}
++    document_labels = {Path(str(k)).name: compact_spaces(v or "") for k, v in (document_labels or {}).items()}
+     for file_obj in selected_files or []:
+         src_name = Path(file_obj.name).name
+         if not src_name:
+             continue
+-        role_meta = file_role_payload(document_roles.get(src_name, ""), "ui_ingestion")
++        role = document_roles.get(src_name, "")
++        role_meta = file_role_payload(role, "manual_other" if normalize_document_role(role) == "autre" else "ui_ingestion")
++        label_meta = {}
++        if document_labels.get(src_name):
++            label_meta = {
++                "libelle_final": document_labels[src_name],
++                "libelle_affichage": document_labels[src_name],
++            }
+         dst = dst_dir / src_name
+         if dst.exists():
+             page_meta = file_page_count_record(dst)
+@@ -3946,6 +3969,7 @@ def copy_ingestion_uploaded_originals(
+                 "reason": "destination existe déjà",
+                 "destination_stat": file_stat_record(dst),
+                 **role_meta,
++                **label_meta,
+                 **page_meta,
+             })
+             continue
+@@ -3962,6 +3986,7 @@ def copy_ingestion_uploaded_originals(
+                 "upload_size": len(file_bytes),
+                 "destination_stat": file_stat_record(dst),
+                 **role_meta,
++                **label_meta,
+                 **page_meta,
+             })
+         except Exception as e:
+@@ -9384,6 +9409,25 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+             piece_names = st.multiselect("Fichiers de pièces", file_labels, key="ingestion_pieces")
+             multi_pdf_name = st.selectbox("PDF unique multi-pièces", ["(aucun)"] + file_labels, key="ingestion_multi_pdf")
+     
++        assigned_for_other = {
++            name for name in [dire_name, bcp_name, multi_pdf_name, *piece_names]
++            if name and name != "(aucun)"
++        }
++        other_options = [name for name in file_labels if name not in assigned_for_other]
++        other_docs_key = "ingestion_other_docs"
++        if other_docs_key in st.session_state:
++            st.session_state[other_docs_key] = [
++                name for name in (st.session_state.get(other_docs_key) or [])
++                if name in other_options
++            ]
++        other_names = st.multiselect(
++            "Autres documents",
++            other_options,
++            default=other_options,
++            key=other_docs_key,
++        )
++        separated_pieces_dry_run_key = f"separated_pieces_rename_dry_run_{project_id}"
++
+         def split_table_validated_titles() -> dict[int, str]:
+             rows = [dict(row or {}) for row in (st.session_state.get("split_rows") or [])]
+             editor_state = st.session_state.get(f"split_rows_editor_{project_id}")
+@@ -9451,17 +9495,75 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                 })
+ 
+             if dry_rows:
++                st.session_state[separated_pieces_dry_run_key] = dry_rows
+                 st.info("Dry-run uniquement : aucune copie, aucun renommage, aucune écriture SQLite.")
+                 st.dataframe(prepare_df_for_streamlit_display(dry_rows), width="stretch")
+             else:
+                 st.warning("Aucun fichier de pièce sélectionné pour le dry-run de renommage.")
+ 
+         selected_names = []
+-        for name in [dire_name, bcp_name, multi_pdf_name, *piece_names]:
++        for name in [dire_name, bcp_name, multi_pdf_name, *piece_names, *other_names]:
+             if name and name != "(aucun)" and name not in selected_names:
+                 selected_names.append(name)
+         selected_uploads = [uploaded_by_name[name] for name in selected_names if name in uploaded_by_name]
+-        selected_document_roles = build_ingestion_document_roles(dire_name, bcp_name, piece_names, multi_pdf_name)
++        selected_document_roles = build_ingestion_document_roles(dire_name, bcp_name, piece_names, multi_pdf_name, other_names=other_names)
++
++        qualification_rows = []
++        title_lookup_for_summary = split_table_validated_titles()
++        title_lookup_for_summary.update({
++            coerce_editor_int(k): v
++            for k, v in (st.session_state.get("piece_title_suggestions") or {}).items()
++            if coerce_editor_int(k) is not None and coerce_editor_int(k) not in title_lookup_for_summary
++        })
++        separated_piece_rows_by_name = {
++            Path(str(row.get("fichier_source") or "")).name: row
++            for row in (st.session_state.get(separated_pieces_dry_run_key) or [])
++            if compact_spaces(row.get("action") or "") == "classer"
++        }
++        for filename in separated_piece_rows_by_name:
++            selected_document_roles[filename] = "piece"
++        for name in selected_names:
++            role = normalize_document_role(selected_document_roles.get(Path(name).name, ""))
++            numero_piece, _sub_piece = detect_piece_ref_from_filename(name) if role == "piece" else (None, "")
++            libelle = compact_spaces(title_lookup_for_summary.get(numero_piece) or "") if numero_piece is not None else ""
++            dry_piece_row = separated_piece_rows_by_name.get(Path(name).name)
++            if dry_piece_row:
++                role = "piece"
++                numero_piece = coerce_editor_int(dry_piece_row.get("numero_piece"))
++                target_stem = compact_spaces(Path(str(dry_piece_row.get("nom_cible_propose") or "")).stem)
++                fallback_title = compact_spaces(f"PIECE n°{numero_piece} {dry_piece_row.get('libelle_ocr') or ''}")
++                libelle = target_stem or fallback_title
++            if role != "piece" and not libelle:
++                libelle = strip_file_title(name)
++            qualification_rows.append({
++                "fichier_source": name,
++                "role": role,
++                "type": document_type_from_role(role),
++                "numero_piece": numero_piece or "",
++                "libelle_retenu": libelle,
++                "action": "classer" if role else "à vérifier",
++            })
++        if qualification_rows:
++            st.markdown("#### Synthèse avant validation documentaire")
++            edited_qualification = st.data_editor(
++                prepare_df_for_streamlit_display(qualification_rows),
++                width="stretch",
++                key=f"ingestion_qualification_summary_{project_id}",
++                column_config={
++                    "fichier_source": st.column_config.TextColumn("fichier_source", disabled=True),
++                    "role": st.column_config.TextColumn("role", disabled=True),
++                    "type": st.column_config.TextColumn("type", disabled=True),
++                    "numero_piece": st.column_config.TextColumn("numero_piece", disabled=True),
++                    "libelle_retenu": st.column_config.TextColumn("libelle_retenu"),
++                    "action": st.column_config.TextColumn("action", disabled=True),
++                },
++            )
++            qualification_rows = data_editor_rows(edited_qualification)
++        selected_document_labels = {
++            Path(str(row.get("fichier_source") or "")).name: compact_spaces(row.get("libelle_retenu") or "")
++            for row in qualification_rows
++            if compact_spaces(row.get("libelle_retenu") or "")
++        }
+     
+         if st.button("Valider le dépôt documentaire et copier les originaux", key="ingestion_copy_originals"):
+             if not ingestion_party:
+@@ -9496,6 +9598,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                         transmission_meta,
+                         project_config,
+                         selected_document_roles,
++                        selected_document_labels,
+                     )
+                     st.session_state["last_ingestion_event"] = event
+                     st.session_state["last_transmission_id"] = event.get("transmission_id")
