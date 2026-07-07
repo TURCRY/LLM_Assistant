@@ -8227,6 +8227,37 @@ elif page == "Pré-traitement dépôt PDF":
 
         return dict(sorted(pieces.items()))
 
+    def deepseek_split_rows_from_piece_titles(titles: dict, manifest: dict) -> list[dict]:
+        detected_numbers = {
+            int(n) for n in (manifest.get("bordereau_piece_numbers_detected") or [])
+            if str(n).strip().isdigit()
+        }
+        missing_numbers = {
+            int(n) for n in (manifest.get("bordereau_missing_piece_numbers") or [])
+            if str(n).strip().isdigit()
+        }
+        title_numbers = {
+            int(n) for n in (titles or {}).keys()
+            if str(n).strip().isdigit()
+        }
+        all_numbers = sorted(title_numbers | detected_numbers | missing_numbers)
+
+        rows = []
+        for number in all_numbers:
+            title = compact_spaces((titles or {}).get(number) or "")
+            state = "manquante" if number in missing_numbers and not title else "OCR"
+            rows.append({
+                "numero": number,
+                "numero_piece": number,
+                "titre_propose": title,
+                "editable_title": title,
+                "origine": "DeepSeekOCR",
+                "etat": state,
+                "start_page": None,
+                "end_page": None,
+            })
+        return rows
+
     deepseek_state_key = f"deepseek_ocr_dry_run_docs_{project_id}"
     deepseek_last_job_key = f"deepseek_ocr_last_job_id_{project_id}"
     deepseek_last_result_key = f"deepseek_ocr_last_result_{project_id}"
@@ -8353,6 +8384,9 @@ elif page == "Pré-traitement dépôt PDF":
                         st.error(f"Extraction DeepSeekOCR impossible : {exc}")
                     else:
                         st.session_state.piece_title_suggestions = extracted
+                        split_rows = deepseek_split_rows_from_piece_titles(extracted, manifest)
+                        if split_rows:
+                            st.session_state.split_rows = split_rows
                         if bool(manifest.get("quality_warning")):
                             st.warning("Extraction possible, mais OCR DeepSeek signale une anomalie qualité.")
                         st.success(f"{len(extracted)} pièce(s) extraite(s) depuis le résultat DeepSeekOCR.")
@@ -8364,6 +8398,8 @@ elif page == "Pré-traitement dépôt PDF":
                             st.dataframe(prepare_df_for_streamlit_display(rows), width="stretch")
                         else:
                             st.warning("Aucune pièce détectée dans le résultat DeepSeekOCR.")
+                        if split_rows:
+                            st.info("Le tableau Découpage des pièces a été prérempli avec les résultats DeepSeekOCR.")
 
     if st.button("🔎 Analyser Dire/Bordereau", key=f"analyze_dire_bord_{project_id}"):
         if ocr_engine == "DeepSeekOCR avancé":
