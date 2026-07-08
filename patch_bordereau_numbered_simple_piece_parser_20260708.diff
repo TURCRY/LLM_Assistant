@@ -1,0 +1,335 @@
+diff --git a/app.py b/app.py
+index 1105fd9..23cc258 100644
+--- a/app.py
++++ b/app.py
+@@ -4190,6 +4190,25 @@ def strip_file_title(filename: str) -> str:
+     stem = re.sub(r"[_\-]+", " ", stem)
+     return compact_spaces(stem)
+ 
++def fallback_piece_title_from_filename(filename: str, numero_piece: int | None = None) -> str:
++    stem = Path(filename or "").stem
++    stem = re.sub(r"^\s*\d+\s+", "", stem)
++    if numero_piece is not None:
++        stem = re.sub(
++            rf"(?i)^\s*pi[eèé]ce\s*(?:n\s*[°ºo]?\s*)?0*{int(numero_piece)}\b\s*[-–—_:.)]*\s*",
++            "",
++            stem,
++            count=1,
++        )
++    else:
++        stem = re.sub(
++            r"(?i)^\s*pi[eèé]ce\s*(?:n\s*[°ºo]?\s*)?0*\d{1,4}\b\s*[-–—_:.)]*\s*",
++            "",
++            stem,
++            count=1,
++        )
++    return compact_spaces(stem.strip(" \t\r\n-_–—:.()"))
++
+ def detect_piece_ref_from_filename(filename: str) -> tuple[int | None, str]:
+     match = PIECE_FILE_RE.search(filename or "")
+     if not match:
+@@ -8370,6 +8389,88 @@ elif page == "Pré-traitement dépôt PDF":
+             "preview_total_chars": preview_total_chars,
+         }
+ 
++    def _log_path_by_suffix(job_status: dict, suffix: str) -> str:
++        for log_path in job_status.get("logs") or []:
++            if str(log_path or "").lower().endswith(suffix.lower()):
++                return str(log_path)
++        return ""
++
++    def _read_text_file_best_effort(path_value: str) -> str:
++        try:
++            path = Path(path_value)
++            if path.exists():
++                return path.read_text(encoding="utf-8-sig", errors="replace")
++        except Exception:
++            return ""
++        return ""
++
++    def _first_useful_stderr_line(stderr_text: str) -> str:
++        fallback = ""
++        for raw_line in str(stderr_text or "").splitlines():
++            line = compact_spaces(raw_line)
++            if not line:
++                continue
++            if not fallback:
++                fallback = line
++            if re.search(r"(?i)(error|exception|traceback|échou|echou|failed|introuvable)", line):
++                return line
++        return fallback
++
++    def deepseek_job_error_details(job_status: dict) -> dict:
++        manifest_path = _log_path_by_suffix(job_status, ".manifest.json")
++        stderr_path = _log_path_by_suffix(job_status, ".stderr.log")
++        stdout_path = _log_path_by_suffix(job_status, ".stdout.log")
++        exitcode_path = _log_path_by_suffix(job_status, ".exitcode.txt")
++        command_path = _log_path_by_suffix(job_status, ".command.txt")
++        manifest = _read_json_file_best_effort(manifest_path) if manifest_path else {}
++        stderr_text = _read_text_file_best_effort(stderr_path)
++        stdout_text = _read_text_file_best_effort(stdout_path)
++        command_text = _read_text_file_best_effort(command_path)
++        exit_code = compact_spaces(_read_text_file_best_effort(exitcode_path))
++        if not exit_code and manifest.get("exit_code") is not None:
++            exit_code = str(manifest.get("exit_code"))
++        return {
++            "manifest_path": manifest_path,
++            "stderr_path": stderr_path,
++            "stdout_path": stdout_path,
++            "exitcode_path": exitcode_path,
++            "command_path": command_path,
++            "manifest": manifest,
++            "stderr_text": stderr_text,
++            "stdout_text": stdout_text,
++            "command_text": command_text,
++            "exit_code": exit_code,
++            "first_stderr_line": _first_useful_stderr_line(stderr_text),
++        }
++
++    def render_deepseek_failed_status(job_status: dict) -> None:
++        details = deepseek_job_error_details(job_status)
++        st.error(f"Job DeepSeekOCR en échec côté PC fixe : {job_status.get('job_id') or ''}")
++        st.write("job_id :", job_status.get("job_id") or "")
++        st.write("statut :", job_status.get("status") or "")
++        st.write("exit_code :", details.get("exit_code") or "")
++        st.write("job JSON :", job_status.get("job_path") or "")
++        st.write("manifest :", details.get("manifest_path") or "")
++        st.write("stderr.log :", details.get("stderr_path") or "")
++        if details.get("first_stderr_line"):
++            st.write("Première ligne utile stderr :", details["first_stderr_line"])
++        with st.expander("Afficher les détails d'erreur", expanded=False):
++            if details.get("manifest"):
++                st.markdown("##### manifest.json")
++                st.json(details["manifest"])
++            if details.get("command_text"):
++                st.markdown("##### command.txt")
++                st.code(details["command_text"], language="text")
++            if details.get("stderr_text"):
++                st.markdown("##### stderr.log")
++                st.code(details["stderr_text"], language="text")
++            if details.get("stdout_text"):
++                st.markdown("##### stdout.log")
++                st.code(details["stdout_text"], language="text")
++            if job_status.get("job"):
++                st.markdown("##### job JSON")
++                st.json(job_status["job"])
++
+     def extract_piece_titles_from_deepseek_markdown(text: str) -> dict:
+         lines = (text or "").splitlines()
+         piece_re = re.compile(
+@@ -8377,6 +8478,8 @@ elif page == "Pré-traitement dépôt PDF":
+             re.IGNORECASE,
+         )
+ 
++        simple_numbered_piece_re = re.compile(r"^\s*0*(\d{1,4})\s*[.)/:;\-–—]\s+(.+)$")
++
+         def normalized_line(value: str) -> str:
+             norm = unicodedata.normalize("NFKD", str(value or ""))
+             norm = "".join(ch for ch in norm if not unicodedata.combining(ch)).lower()
+@@ -8423,6 +8526,14 @@ elif page == "Pré-traitement dépôt PDF":
+             norm = normalized_line(value)
+             return "vous trouverez ci joint" in norm or "suite a votre demande" in norm
+ 
++        def has_bordereau_context(value: str) -> bool:
++            norm = normalized_line(value)
++            if "nouvelles pieces" in norm:
++                return True
++            if "pieces communiquees" in norm or "piece communiquee" in norm:
++                return True
++            return "bordereau" in norm and "pieces" in norm
++
+         def looks_like_unnumbered_attachment(value: str) -> bool:
+             norm = normalized_line(value)
+             if len(norm) < 6:
+@@ -8455,6 +8566,27 @@ elif page == "Pré-traitement dépôt PDF":
+                 parts.append(clean_title(raw))
+             return clean_title(" ".join(part for part in parts if part))
+ 
++        def collect_simple_numbered_title(start_idx: int, first_title: str) -> str:
++            parts = [clean_title(first_title)] if clean_title(first_title) else []
++            for next_line in lines[start_idx + 1:]:
++                raw = str(next_line or "")
++                if not raw.strip():
++                    if parts:
++                        break
++                    continue
++                if raw.lstrip().startswith("## Page"):
++                    break
++                if has_bordereau_context(raw):
++                    break
++                if simple_numbered_piece_re.match(raw) or match_piece(raw) or is_bullet_line(raw):
++                    break
++                if table_cells(raw):
++                    break
++                title = clean_title(raw)
++                if title:
++                    parts.append(title)
++            return clean_title(" ".join(part for part in parts if part))
++
+         def following_title(start_idx: int) -> str:
+             for next_line in lines[start_idx + 1:]:
+                 if ignored_line(next_line):
+@@ -8473,9 +8605,15 @@ elif page == "Pré-traitement dépôt PDF":
+         unnumbered: list[dict] = []
+         seen_unnumbered: set[str] = set()
+         attachment_context_remaining = 0
++        bordereau_context_remaining = 0
+         for idx, line in enumerate(lines):
+             if has_attachment_context(line):
+                 attachment_context_remaining = 12
++            if has_bordereau_context(line):
++                bordereau_context_remaining = 80
++                if attachment_context_remaining > 0:
++                    attachment_context_remaining -= 1
++                continue
+ 
+             if is_bullet_line(line):
+                 title = collect_bullet_title(idx)
+@@ -8499,8 +8637,22 @@ elif page == "Pré-traitement dépôt PDF":
+             if ignored_line(line):
+                 if attachment_context_remaining > 0:
+                     attachment_context_remaining -= 1
++                if bordereau_context_remaining > 0:
++                    bordereau_context_remaining -= 1
+                 continue
+ 
++            if bordereau_context_remaining > 0:
++                simple_match = simple_numbered_piece_re.match(str(line or ""))
++                if simple_match:
++                    number = int(simple_match.group(1))
++                    title = collect_simple_numbered_title(idx, simple_match.group(2) or "")
++                    if title:
++                        pieces.setdefault(number, title)
++                    bordereau_context_remaining -= 1
++                    if attachment_context_remaining > 0:
++                        attachment_context_remaining -= 1
++                    continue
++
+             cells = table_cells(line)
+             candidates = cells if cells else [line]
+             for cell_idx, candidate in enumerate(candidates):
+@@ -8518,6 +8670,8 @@ elif page == "Pré-traitement dépôt PDF":
+                 break
+             if attachment_context_remaining > 0:
+                 attachment_context_remaining -= 1
++            if bordereau_context_remaining > 0:
++                bordereau_context_remaining -= 1
+ 
+         out: dict[int | str, str | list[dict]] = dict(sorted(pieces.items()))
+         if unnumbered:
+@@ -8526,6 +8680,8 @@ elif page == "Pré-traitement dépôt PDF":
+ 
+     def deepseek_split_rows_from_piece_titles(titles: dict, manifest: dict) -> list[dict]:
+         unnumbered_rows = list((titles or {}).get("__unnumbered__") or [])
++        source_method = compact_spaces((manifest or {}).get("source_method") or (manifest or {}).get("metrics", {}).get("source_method") or "")
++        numbered_origin = "bordereau / native_pdf_text" if source_method == "native_pdf_text" else "bordereau OCR"
+         detected_numbers = {
+             int(n) for n in (manifest.get("bordereau_piece_numbers_detected") or [])
+             if str(n).strip().isdigit()
+@@ -8549,7 +8705,7 @@ elif page == "Pré-traitement dépôt PDF":
+                 "numero_piece": number,
+                 "titre_propose": title,
+                 "editable_title": title,
+-                "origine": "DeepSeekOCR",
++                "origine": numbered_origin,
+                 "etat": state,
+                 "start_page": None,
+                 "end_page": None,
+@@ -8727,16 +8883,24 @@ elif page == "Pré-traitement dépôt PDF":
+                 f"{item['job_id']} — {item['status']}"
+                 for item in discovered_jobs
+             ]
++            default_index = 1
++            if last_job_default:
++                for idx, item in enumerate(discovered_jobs, start=1):
++                    if item.get("job_id") == last_job_default:
++                        default_index = idx
++                        break
+             selected_label = st.selectbox(
+                 "Jobs DeepSeekOCR trouvés pour cette affaire",
+                 ["(saisie manuelle)"] + labels,
+-                index=1 if labels else 0,
++                index=default_index if labels else 0,
+                 key=f"deepseek_ocr_found_jobs_{project_id}",
+             )
+             if selected_label != "(saisie manuelle)":
+                 selected_idx = labels.index(selected_label)
+-                last_job_default = discovered_jobs[selected_idx]["job_id"]
+-                selected_job_from_dropdown = last_job_default
++                dropdown_job_id = discovered_jobs[selected_idx]["job_id"]
++                if not (session_last_job and session_last_job in current_job_ids):
++                    last_job_default = dropdown_job_id
++                    selected_job_from_dropdown = last_job_default
+         else:
+             st.caption("Aucun job DeepSeekOCR correspondant à la sélection courante.")
+ 
+@@ -8746,6 +8910,9 @@ elif page == "Pré-traitement dépôt PDF":
+             and st.session_state.get(deepseek_follow_job_widget_key) not in current_job_ids
+         ):
+             st.session_state[deepseek_follow_job_widget_key] = last_job_default
++        if session_last_job and session_last_job in current_job_ids:
++            st.session_state[deepseek_follow_job_widget_key] = session_last_job
++            last_job_default = session_last_job
+         last_job_id = st.text_input(
+             "Dernier job_id DeepSeekOCR",
+             value=last_job_default,
+@@ -8765,11 +8932,7 @@ elif page == "Pré-traitement dépôt PDF":
+             if status.get("status") in {"queued", "running"}:
+                 st.info("Job DeepSeekOCR en attente ou en cours côté PC fixe.")
+             elif status.get("status") == "failed":
+-                st.error("Job DeepSeekOCR en échec côté PC fixe.")
+-                if status.get("logs"):
+-                    st.write("Logs disponibles :")
+-                    for log_path in status["logs"][:10]:
+-                        st.write(log_path)
++                render_deepseek_failed_status(status)
+             elif status.get("status") == "done":
+                 result = load_deepseek_ocr_done_result(status)
+                 st.session_state[deepseek_last_result_key] = {"signature": ocr_current_signature, "status": status, "result": result}
+@@ -10061,6 +10224,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+             for name in piece_names or []:
+                 numero_piece, _sub_piece = detect_piece_ref_from_filename(name)
+                 used_unnumbered_fallback = False
++                dry_row_origin = ""
+                 libelle_ocr = compact_spaces(
+                     validated_titles.get(numero_piece)
+                     or suggestions.get(numero_piece)
+@@ -10078,6 +10242,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                     fallback_libelle_ocr = compact_spaces(unnumbered_row.get("titre_valide") or "")
+                     if fallback_libelle_ocr:
+                         used_unnumbered_fallback = True
++                        dry_row_origin = "OCR dire / native_pdf_text"
+                         libelle_ocr = fallback_libelle_ocr
+                         validated_numero_piece = coerce_editor_int(unnumbered_row.get("numero_valide"))
+                         if validated_numero_piece is not None:
+@@ -10089,8 +10254,19 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                             else f"{sanitize_filename(libelle_ocr)}{Path(name).suffix}"
+                         )
+                     else:
+-                        action = "à vérifier"
+-                        target_name = ""
++                        filename_libelle = fallback_piece_title_from_filename(name, numero_piece)
++                        if filename_libelle:
++                            libelle_ocr = filename_libelle
++                            dry_row_origin = "nom_fichier"
++                            action = "classer"
++                            target_name = (
++                                f"PIECE n°{numero_piece} {sanitize_filename(libelle_ocr)}.pdf"
++                                if numero_piece is not None
++                                else f"{sanitize_filename(libelle_ocr)}{Path(name).suffix}"
++                            )
++                        else:
++                            action = "à vérifier"
++                            target_name = ""
+                 elif libelle_ocr:
+                     action = "classer"
+                     target_name = f"PIECE n°{numero_piece} {sanitize_filename(libelle_ocr)}.pdf"
+@@ -10103,7 +10279,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                     "libelle_ocr": libelle_ocr,
+                     "nom_cible_propose": target_name,
+                     "action": action,
+-                    "origine": "OCR dire / native_pdf_text" if used_unnumbered_fallback else "",
++                    "origine": dry_row_origin if used_unnumbered_fallback or dry_row_origin else "",
+                 })
+ 
+             if dry_rows:
