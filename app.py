@@ -12111,12 +12111,14 @@ if page == "Pré-traitement dépôt PDF":
     current_pdf_cohort = current_pdf_cohort if "current_pdf_cohort" in locals() else {}
     render_classement_originaux_depot_technique(current_pdf_cohort)
 
-st.markdown("## Captations (laptop → NAS)")
+st.markdown("## Captations (préparation JPG/audio)")
 
-affaire_id = st.text_input("ID affaire", placeholder="2025-J46").strip()
-
-root_dst = st.text_input("Destination NAS", value=ROOT_DST_DEFAULT)
-mode = st.selectbox("Mode", ["NAS", "PCFIXE"], index=0)
+affaire_id = st.text_input(
+    "ID affaire",
+    value=get_project_id(project_config, ""),
+    placeholder="2025-J46",
+    key="captation_seed_affaire_id",
+).strip()
 
 if affaire_id:
     captations = list_captations(affaire_id)
@@ -12129,42 +12131,91 @@ if affaire_id:
         f'{c["id_captation"]}  | JPG=OK | WAV={c["wav_count"]}'
         for c in captations
     ]
-    idx = st.selectbox("Choisir id_captation", range(len(labels)), format_func=lambda i: labels[i])
+    idx = st.selectbox(
+        "Choisir id_captation",
+        range(len(labels)),
+        format_func=lambda i: labels[i],
+        key="captation_seed_id_captation",
+    )
     capt = captations[idx]
 
-    photos_dir = Path(capt["jpg_dir"]).parent  # ...\photos
+    jpg_dir = Path(st.text_input(
+        "Dossier source JPG/JPEG",
+        value=str(capt["jpg_dir"]),
+        key=f"captation_seed_jpg_dir_{affaire_id}_{capt['id_captation']}",
+    ).strip())
+    audio_dir = Path(st.text_input(
+        "Dossier audio associé",
+        value=str(capt["audio_dir"]),
+        key=f"captation_seed_audio_dir_{affaire_id}_{capt['id_captation']}",
+    ).strip())
 
-    csv_candidates = sorted(
-        photos_dir.glob("*.csv"),
-        key=lambda p: (p.name.lower() != "photos.csv", -p.stat().st_mtime)
+    photos_dir = jpg_dir.parent
+    expected_audio_dir = photos_dir.parent / "audio"
+    photos_csv_path = photos_dir / "photos.csv"
+    photos_batch_path = photos_dir / "photos_batch.csv"
+    infos_path = (
+        AFFAIRES_ROOT
+        / affaire_id
+        / "AF_Expert_ASR"
+        / "transcriptions"
+        / capt["id_captation"]
+        / "infos_projet.json"
     )
-    if not photos_csv_path.exists():
-        st.error("CSV introuvable")
 
-    if not csv_candidates:
-        st.warning("Aucun CSV trouvé dans le dossier photos.")
-        st.stop()
+    jpg_files = (
+        list(jpg_dir.glob("*.jpg")) + list(jpg_dir.glob("*.JPG"))
+        + list(jpg_dir.glob("*.jpeg")) + list(jpg_dir.glob("*.JPEG"))
+        if jpg_dir.is_dir()
+        else []
+    )
+    source_ok = (
+        jpg_dir.is_dir()
+        and jpg_dir.name.lower() == "jpg"
+        and photos_dir.name == "photos"
+        and bool(jpg_files)
+        and audio_dir == expected_audio_dir
+        and audio_dir.is_dir()
+    )
 
-    csv_labels = [
-        f"{p.name} — {int(p.stat().st_size/1024)} KB — {datetime.fromtimestamp(p.stat().st_mtime):%Y-%m-%d %H:%M:%S}"
-        for p in csv_candidates
-    ]
-    csv_idx = st.selectbox("Choisir le CSV photos", range(len(csv_labels)), format_func=lambda i: csv_labels[i])
-    photos_csv_path = csv_candidates[csv_idx]
-    st.write("📄 CSV sélectionné :", str(photos_csv_path))
+    st.write("📄 photos.csv :", str(photos_csv_path), "✅" if photos_csv_path.exists() else "à produire")
+    st.write("📄 photos_batch.csv :", str(photos_batch_path), "✅" if photos_batch_path.exists() else "à produire")
+    st.write("📄 infos_projet.json :", str(infos_path), "✅" if infos_path.exists() else "à produire/copier")
 
-    st.write("📂 Dossier JPG :", str(capt["jpg_dir"]))
-    st.write("🎧 Dossier audio :", str(capt["audio_dir"]))
+    if jpg_dir.name.lower() != "jpg" or photos_dir.name != "photos":
+        st.error("Le dossier source doit respecter …\\<id_captation>\\photos\\JPG.")
+    elif not jpg_files:
+        st.error("Aucune image JPG/JPEG trouvée dans le dossier source.")
+    if audio_dir != expected_audio_dir:
+        st.error(f"Le dossier audio associé attendu est : {expected_audio_dir}")
+    elif not audio_dir.is_dir():
+        st.error("Le dossier audio associé n’existe pas.")
 
-    if st.button("🚀 Seed vers NAS"):
+    if infos_path.exists():
+        infos_seed = load_json(str(infos_path), {})
+        declared_photos = str(infos_seed.get("fichier_photos") or "").strip()
+        declared_batch = str(infos_seed.get("fichier_photos_batch") or "").strip()
+        if declared_photos and Path(declared_photos) != photos_csv_path:
+            st.warning(f"infos_projet.json référence un autre photos.csv : {declared_photos}")
+        if declared_batch and Path(declared_batch) != photos_batch_path:
+            st.warning(f"infos_projet.json référence un autre photos_batch.csv : {declared_batch}")
+
+    prepare_only = st.checkbox(
+        "Préparer seulement (dry-run)",
+        value=True,
+        key="captation_seed_dry_run",
+    )
+    if st.button("🚀 Préparer / lancer run_all_from_jpg_v5", disabled=not source_ok):
         cmd = [
             sys.executable, SEED_SCRIPT,
             "--affaire", affaire_id,
-            "--cwd", str(capt["jpg_dir"]),
-            "--root-dst", root_dst,
-            "--mode", mode,
+            "--cwd", str(jpg_dir),
+            "--root-dst", ROOT_DST_DEFAULT,
+            "--mode", "FULL",
             "--photos-csv-path", str(photos_csv_path),
         ]
+        if prepare_only:
+            cmd.append("--dry-run")
 
         with st.spinner("Propagation en cours..."):
             proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -12176,6 +12227,6 @@ if affaire_id:
             st.error(proc.stderr)
 
         if proc.returncode == 0:
-            st.success("Seed terminé.")
+            st.success("Préparation validée." if prepare_only else "Pipeline captation terminé.")
         else:
-            st.error("Seed en échec (voir stderr et log JSONL sur NAS).")
+            st.error("Pipeline captation en échec (voir stderr et log JSONL).")
