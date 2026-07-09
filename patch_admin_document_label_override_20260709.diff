@@ -1,0 +1,143 @@
+diff --git a/app.py b/app.py
+index 3f12af1..eb56467 100644
+--- a/app.py
++++ b/app.py
+@@ -2538,6 +2538,12 @@ def piece_label_with_reference(doc: dict, label: str) -> str:
+ def document_display_label(doc: dict) -> str:
+     reject_values = [doc.get("reference")]
+     if doc.get("numero_piece"):
++        corrected_label = normalize_document_label(
++            doc.get("libelle_corrige"),
++            reject_values=reject_values,
++        )
++        if corrected_label:
++            return piece_label_with_reference(doc, corrected_label)
+         if doc.get("source_log_action") == "ingestion_contradictoire_mapping_validated" and doc.get("libelle_affichage"):
+             label = normalize_document_label(doc.get("libelle_affichage"), reject_values=reject_values)
+         else:
+@@ -2929,6 +2935,30 @@ def append_documents_registry_overrides(aff_root_local: str, cfg: dict | None, r
+         f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+     return str(path)
+ 
++def append_targeted_document_label_correction(
++    aff_root_local: str,
++    cfg: dict | None,
++    row: dict,
++    old_label: str,
++    new_label: str,
++    reason: str,
++) -> str:
++    path = documents_registry_overrides_path(aff_root_local, cfg)
++    event = {
++        "ts": datetime.now().isoformat(timespec="seconds"),
++        "action": "document_label_targeted_correction",
++        "aff_id": get_project_id(cfg or {}, ""),
++        "expert_doc_id": compact_spaces(row.get("expert_doc_id") or ""),
++        "ancien_libelle": compact_spaces(old_label or ""),
++        "nouveau_libelle": compact_spaces(new_label or ""),
++        "motif": compact_spaces(reason or ""),
++        "utilisateur_machine": user_machine_label(),
++        "rows": [row],
++    }
++    with path.open("a", encoding="utf-8") as f:
++        f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
++    return str(path)
++
+ def apply_document_registry_overrides(docs: list[dict], overrides: dict) -> list[dict]:
+     for doc in docs or []:
+         expert_doc_id = compact_spaces(doc.get("expert_doc_id") or "")
+@@ -7734,6 +7764,94 @@ elif page == "Administration":
+     with col[2]:
+         st.json({"SERVER_IP": SERVER_IP, "SERVER_PORT": SERVER_PORT, "MAC_PCFIXE": MAC_PCFIXE})
+ 
++    st.markdown("### Correction ciblée d’un libellé documentaire")
++    st.text_input(
++        "Affaire",
++        value=get_project_id(project_config, ""),
++        disabled=True,
++        key="admin_label_correction_affaire",
++    )
++    try:
++        admin_records = load_transmission_records(aff_root_local, project_config)
++        admin_registry_rows = build_documents_registry(
++            admin_records,
++            get_project_id(project_config, ""),
++            aff_root_local,
++            project_config,
++        )
++        admin_rows_by_id = {
++            compact_spaces(row.get("expert_doc_id") or ""): row
++            for row in admin_registry_rows
++            if valid_expert_doc_id(row.get("expert_doc_id") or "")
++        }
++        admin_expert_doc_ids = sorted(admin_rows_by_id)
++        if not admin_expert_doc_ids:
++            st.info("Aucun document expert disponible pour cette affaire.")
++        else:
++            selected_expert_doc_id = st.selectbox(
++                "N° document expert",
++                admin_expert_doc_ids,
++                key="admin_label_correction_expert_doc_id",
++            )
++            selected_registry_row = admin_rows_by_id[selected_expert_doc_id]
++            old_label = compact_spaces(selected_registry_row.get("libelle") or "")
++            st.text_area(
++                "Ancien libellé retenu",
++                value=old_label,
++                disabled=True,
++                key=f"admin_label_correction_old_{selected_expert_doc_id}",
++            )
++            new_label = st.text_area(
++                "Nouveau libellé retenu",
++                value=compact_spaces(selected_registry_row.get("libelle_corrige") or old_label),
++                key=f"admin_label_correction_new_{selected_expert_doc_id}",
++            )
++            correction_reason = st.text_area(
++                "Motif de la correction",
++                value="",
++                key=f"admin_label_correction_reason_{selected_expert_doc_id}",
++            )
++            if st.button(
++                "Enregistrer la correction ciblée",
++                key=f"admin_label_correction_save_{selected_expert_doc_id}",
++                type="primary",
++            ):
++                clean_new_label = compact_spaces(new_label or "")
++                clean_reason = compact_spaces(correction_reason or "")
++                if not clean_new_label:
++                    st.error("Le nouveau libellé est obligatoire.")
++                elif clean_new_label == old_label:
++                    st.error("Le nouveau libellé est identique au libellé actuel.")
++                elif not clean_reason:
++                    st.error("Le motif de la correction est obligatoire.")
++                else:
++                    existing_override = dict(
++                        load_documents_registry_overrides(aff_root_local, project_config).get(selected_expert_doc_id)
++                        or {}
++                    )
++                    merged_override = {
++                        **existing_override,
++                        "expert_doc_id": selected_expert_doc_id,
++                        "registry_fingerprint": compact_spaces(
++                            selected_registry_row.get("registry_fingerprint")
++                            or existing_override.get("registry_fingerprint")
++                            or ""
++                        ),
++                        "libelle_corrige": clean_new_label,
++                    }
++                    correction_log_path = append_targeted_document_label_correction(
++                        aff_root_local,
++                        project_config,
++                        merged_override,
++                        old_label,
++                        clean_new_label,
++                        clean_reason,
++                    )
++                    st.success("Correction ciblée journalisée.")
++                    st.caption(f"Journal : {correction_log_path}")
++    except Exception as exc:
++        st.error(f"Impossible de charger l’outil de correction ciblée : {exc}")
++
+ elif page == "Pré-traitement dépôt PDF":
+     st.subheader("📄 Pré-traitement dépôt — PDF multi-pièces")
+     project_id  = get_project_id(project_config)
