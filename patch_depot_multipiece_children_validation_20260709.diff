@@ -1,0 +1,914 @@
+diff --git a/app.py b/app.py
+index 23cc258..32003df 100644
+--- a/app.py
++++ b/app.py
+@@ -1,4 +1,4 @@
+-# app_v1_1.py - Version nettoyée, modulaire et fonctionnelle
++﻿# app_v1_1.py - Version nettoyée, modulaire et fonctionnelle
+ from __future__ import annotations
+ 
+ import socket
+@@ -3930,6 +3930,7 @@ def copy_ingestion_uploaded_originals(
+     cfg: dict | None = None,
+     document_roles: dict[str, str] | None = None,
+     document_labels: dict[str, str] | None = None,
++    document_parent_sources: dict[str, str] | None = None,
+ ) -> dict:
+     folder_rel = (party.get("folder_rel") or "").strip()
+     if not folder_rel:
+@@ -3951,6 +3952,11 @@ def copy_ingestion_uploaded_originals(
+     copied, skipped, errors = [], [], []
+     document_roles = {Path(str(k)).name: normalize_document_role(v) for k, v in (document_roles or {}).items()}
+     document_labels = {Path(str(k)).name: compact_spaces(v or "") for k, v in (document_labels or {}).items()}
++    document_parent_sources = {
++        Path(str(k)).name: Path(str(v)).name
++        for k, v in (document_parent_sources or {}).items()
++        if compact_spaces(v or "")
++    }
+     for file_obj in selected_files or []:
+         src_name = Path(file_obj.name).name
+         if not src_name:
+@@ -3963,6 +3969,12 @@ def copy_ingestion_uploaded_originals(
+                 "libelle_final": document_labels[src_name],
+                 "libelle_affichage": document_labels[src_name],
+             }
++        parent_meta = {}
++        if document_parent_sources.get(src_name):
++            parent_meta = {
++                "source_parent": document_parent_sources[src_name],
++                "parent_source": document_parent_sources[src_name],
++            }
+         dst = dst_dir / src_name
+         if dst.exists():
+             page_meta = file_page_count_record(dst)
+@@ -3975,6 +3987,7 @@ def copy_ingestion_uploaded_originals(
+                 "destination_stat": file_stat_record(dst),
+                 **role_meta,
+                 **label_meta,
++                **parent_meta,
+                 **page_meta,
+             })
+             continue
+@@ -3992,6 +4005,7 @@ def copy_ingestion_uploaded_originals(
+                 "destination_stat": file_stat_record(dst),
+                 **role_meta,
+                 **label_meta,
++                **parent_meta,
+                 **page_meta,
+             })
+         except Exception as e:
+@@ -4170,7 +4184,10 @@ def first_generated_ocr_source(response: dict) -> str:
+                         return found
+     return ""
+ 
+-PIECE_FILE_RE = re.compile(r"(?i)(?:\bpi[eè]ce\b[^\d]{0,40}|\bn[°o]\s*)0*(\d{1,4})(?:[\s._-]*([a-z])|[.,]([0-9]{1,3}))?\b")
++PIECE_FILE_RE = re.compile(
++    r"(?i)(?:\bpi[eè]ce(?:\b|_)[^\d]{0,40}|\bn[°o]\s*)"
++    r"0*(\d{1,4})(?:(?:\s*|[.-])([a-z])|[.,]([0-9]{1,3}))?(?=\b|_)"
++)
+ EXPLICIT_PIECE_TITLE_RE = re.compile(r"(?i)\bpi[eè]ce\s*(?:n[°o]\s*)?0*(\d{1,4})\s*[:.\-–]?\s*(.*)$")
+ NUMBERED_BCP_TITLE_RE = re.compile(r"^\s*0*(\d{1,4})\s*[.)\-–]\s+(.+)$")
+ NUMBER_ONLY_BCP_RE = re.compile(r"^\s*0*(\d{1,4})\s*[.)\-–]\s*$")
+@@ -4772,6 +4789,27 @@ def piece_title_lookup_from_state(mapping_rows: list[dict], extracted_titles: di
+             lookup[numero] = title
+     return lookup
+ 
++def piece_title_lookup_from_split_rows(split_rows: list[dict], suggestions: dict | None = None) -> dict[int, str]:
++    lookup = {}
++    for key, value in (suggestions or {}).items():
++        numero = coerce_editor_int(key)
++        title = compact_spaces(value or "")
++        if numero is not None and title:
++            lookup[numero] = title
++    for row in split_rows or []:
++        item = dict(row or {})
++        numero = coerce_editor_int(item.get("numero_piece") or item.get("numero"))
++        title = compact_spaces(
++            item.get("editable_title")
++            or item.get("titre_propose")
++            or item.get("libelle_final")
++            or item.get("libelle_affichage")
++            or ""
++        )
++        if numero is not None and title and numero not in lookup:
++            lookup[numero] = title
++    return lookup
++
+ def is_piece_placeholder_label(value: str, numero_piece) -> bool:
+     numero = coerce_editor_int(numero_piece)
+     label = compact_spaces(value or "")
+@@ -4783,6 +4821,14 @@ def is_piece_placeholder_label(value: str, numero_piece) -> bool:
+     normalized = re.sub(r"[^a-zA-Z0-9]+", "", normalized).lower()
+     return normalized == f"piece{numero}".lower()
+ 
++def is_any_piece_placeholder_label(value: str) -> bool:
++    label = compact_spaces(value or "")
++    if not label:
++        return True
++    normalized = unicodedata.normalize("NFKD", label).encode("ascii", "ignore").decode("ascii")
++    normalized = re.sub(r"[^a-zA-Z0-9]+", "", normalized).lower()
++    return bool(re.fullmatch(r"piece\d+", normalized))
++
+ def apply_piece_titles_to_split_rows(rows: list[dict], title_lookup: dict[int, str]) -> list[dict]:
+     out = []
+     diagnostics = []
+@@ -4935,8 +4981,10 @@ def prepare_manual_split_rows(rows: list[dict], total_pages: int | None, output_
+     warnings = []
+     ranges = []
+     output_dir_unc = pcfixe_server_path_to_unc(cfg, aff_id, output_dir_pc)
++    input_rows = [dict(row or {}) for row in (rows or [])]
++    start_pages = [coerce_editor_int(row.get("page_debut")) for row in input_rows]
+ 
+-    for idx, raw in enumerate(rows or [], start=1):
++    for idx, raw in enumerate(input_rows, start=1):
+         row = dict(raw or {})
+         numero = coerce_editor_int(row.get("numero_piece"))
+         sous_piece = compact_spaces(row.get("sous_piece") or "")
+@@ -4954,6 +5002,12 @@ def prepare_manual_split_rows(rows: list[dict], total_pages: int | None, output_
+             filename = f"{filename}.pdf"
+         page_debut = coerce_editor_int(row.get("page_debut"))
+         page_fin = coerce_editor_int(row.get("page_fin"))
++        if page_fin is None and page_debut is not None:
++            next_starts = [p for p in start_pages[idx:] if p is not None and p > page_debut]
++            if next_starts:
++                page_fin = min(next_starts) - 1
++            elif total_pages:
++                page_fin = int(total_pages)
+         raw_action = compact_spaces(row.get("action") or "")
+         has_split_bounds = numero is not None and page_debut is not None and page_fin is not None
+         action = raw_action if raw_action in {"découper", "ignorer", "à vérifier"} else ("découper" if has_split_bounds else "à vérifier")
+@@ -4985,6 +5039,8 @@ def prepare_manual_split_rows(rows: list[dict], total_pages: int | None, output_
+             errors.append(f"{prefix}: page_debut doit être >= 1")
+         if page_fin < page_debut:
+             errors.append(f"{prefix}: page_fin doit être >= page_debut")
++        if total_pages and page_debut > total_pages:
++            errors.append(f"{prefix}: page_debut ({page_debut}) dépasse le total du PDF ({total_pages})")
+         if total_pages and page_fin > total_pages:
+             errors.append(f"{prefix}: page_fin ({page_fin}) dépasse le total du PDF ({total_pages})")
+         if check_existing and clean["output_path_unc"]:
+@@ -7729,12 +7785,19 @@ elif page == "Pré-traitement dépôt PDF":
+         st.caption(f"Journal cohorte provisoire : {cohort_log_path}")
+ 
+     # chemins par défaut basés sur la config projet existante
+-    proj_pcfixe = (project_config.get("roots") or {}).get("pcfixe")
+-    splits_dir_default = pj(proj_pcfixe, "Splits")  # nouveau sous-dossier simple
++    split_aff_id = get_project_id(project_config, "")
++    proj_pcfixe = pcfixe_local_root_for_server(project_config, split_aff_id)
++    splits_dir_default = str(Path(proj_pcfixe) / "AD_Expert_Traitements" / "_Splits")
++    splits_dir_default_unc = str(
++        Path(pcfixe_unc_root_for_laptop(project_config, split_aff_id))
++        / "AD_Expert_Traitements"
++        / "_Splits"
++    )
+     input_default = ""  # fichier précis saisi par l'utilisateur
+ 
+     input_path  = st.text_input("PDF source (chemin VU par le serveur)", value=input_default, key=f"split_pdf_source_server_{project_id}")
+     output_dir  = st.text_input("Dossier de sortie (PC fixe)", value=splits_dir_default, key=f"split_output_dir_pc_{project_id}")
++    st.caption(f"Dossier de sortie UNC : {splits_dir_default_unc}")
+     code_partie = party_code(
+         current_pdf_cohort.get("code_partie")
+         or selected_cohort_party.get("code_partie")
+@@ -9594,13 +9657,46 @@ elif page == "Pré-traitement dépôt PDF":
+ 
+     # Dossier dépôt initial (côté Laptop)
+     depot_dir = pj(aff_root_local, "AA_Expert_Admin", "Depot_initial")
+-    pdfs = sorted([p for p in Path(depot_dir).glob("*.pdf")], key=lambda x: x.name.lower())
++    selected_multi_pdf_name = st.session_state.get("ingestion_multi_pdf") or ""
++    cohort_pdf_names = [
++        Path(name).name
++        for name in (current_pdf_cohort.get("files") or [])
++        if Path(name).suffix.lower() == ".pdf"
++    ]
++    guided_pdf_names = (
++        [Path(selected_multi_pdf_name).name]
++        if selected_multi_pdf_name and selected_multi_pdf_name != "(aucun)"
++        else cohort_pdf_names
++    )
++    pdfs = [
++        Path(depot_dir) / name
++        for name in dict.fromkeys(guided_pdf_names)
++        if (Path(depot_dir) / name).is_file()
++    ]
+ 
+     if not pdfs:
+-        st.info("Aucun PDF dans le dépôt initial.")
++        st.info("Aucun PDF disponible dans la cohorte courante pour la découpe guidée.")
+     else:
+         sel = st.selectbox("Choisir un PDF à découper", [p.name for p in pdfs], key=f"guided_split_pdf_select_{project_id}")
+         this_pdf = next(p for p in pdfs if p.name == sel)
++        guided_page_meta = file_page_count_record(this_pdf)
++        guided_total_pages = guided_page_meta.get("page_count") if guided_page_meta.get("page_count_source") == "pdf_metadata" else None
++        pdf_page_count_for_inputs = None
++        if fitz is not None:
++            try:
++                with fitz.open(str(this_pdf)) as page_count_doc:
++                    pdf_page_count_for_inputs = int(page_count_doc.page_count)
++            except Exception:
++                pass
++        if pdf_page_count_for_inputs is None and guided_total_pages:
++            pdf_page_count_for_inputs = int(guided_total_pages)
++        guided_pdf_widget_id = hashlib.sha1(
++            f"{this_pdf}|{pdf_page_count_for_inputs}".encode("utf-8", errors="ignore")
++        ).hexdigest()[:12]
++        if pdf_page_count_for_inputs:
++            st.caption(f"PDF sélectionné : {pdf_page_count_for_inputs} pages")
++        else:
++            st.warning("Nombre de pages du PDF sélectionné indisponible.")
+ 
+         # --- Aperçu de pages (optionnel) ---
+         if fitz is not None:
+@@ -9621,34 +9717,97 @@ elif page == "Pré-traitement dépôt PDF":
+ 
+         # --- Métadonnées communes ---
+         col_meta = st.columns(3)
++        guided_code_partie = party_code(current_pdf_cohort.get("code_partie") or "")
++        guided_date_transmission = str(current_pdf_cohort.get("date_transmission") or "")
+         with col_meta[0]:
+-            code_partie = st.text_input("Code partie", value="03", key=f"guided_split_code_partie_initial_{project_id}")
++            st.text_input(
++                "Code partie",
++                value=guided_code_partie,
++                disabled=True,
++                key=f"guided_split_code_partie_readonly_{project_id}",
++            )
+         with col_meta[1]:
+-            date_tx = st.date_input("Date transmission", value=date.today(), key=f"guided_split_date_initial_{project_id}")
++            st.text_input(
++                "Date transmission",
++                value=guided_date_transmission,
++                disabled=True,
++                key=f"guided_split_date_readonly_{project_id}",
++            )
+         with col_meta[2]:
+             first_piece_no = st.number_input("Numéro de la 1ʳᵉ pièce (offset)", min_value=1, value=1,
+                                             help="Ex : fichier 8 → commence à 8 si ce fichier contient les pièces 8–13",
+                                             key=f"guided_split_first_piece_no_{project_id}")
+             
+-        suggest = st.session_state.get("piece_title_suggestions", {})  # {no:int -> titre:str}
++        suggest = piece_title_lookup_from_split_rows(
++            st.session_state.get("split_rows", []),
++            st.session_state.get("piece_title_suggestions", {}),
++        )
+ 
+         # --- Déclaration des pièces (pages de début + libellés provisoires) ---
+         st.markdown("### Définir les pièces contenues dans ce PDF")
+         n = st.number_input("Nombre de pièces dans ce fichier", min_value=1, value=1, step=1, key=f"guided_split_piece_count_{project_id}")
+         starts, titles = [], []
+         for i in range(int(n)):
++            piece_no = int(first_piece_no + i)
++            extracted_title = compact_spaces(suggest.get(piece_no) or "")
++            suggested_title = extracted_title or f"Pièce {piece_no}"
++            title_key = f"guided_split_title_{project_id}_{i}"
++            title_auto_key = f"{title_key}_auto_value"
++            current_title_value = compact_spaces(st.session_state.get(title_key) or "")
++            previous_auto_title = compact_spaces(st.session_state.get(title_auto_key) or "")
++            should_prefill_title = (
++                not current_title_value
++                or is_any_piece_placeholder_label(current_title_value)
++                or is_piece_placeholder_label(current_title_value, piece_no)
++                or (previous_auto_title and current_title_value == previous_auto_title)
++            )
++            if should_prefill_title:
++                st.session_state[title_key] = suggested_title
++                st.session_state[title_auto_key] = suggested_title
++            default_start = i * 2 + 1
++            if pdf_page_count_for_inputs:
++                default_start = min(default_start, pdf_page_count_for_inputs)
+             c1, c2 = st.columns([1, 3])
+             with c1:
+-                starts.append(st.number_input(f"Début pièce {first_piece_no + i} (page)", min_value=1, value=(i*2+1), key=f"guided_split_start_page_{project_id}_{i}"))
++                starts.append(st.number_input(
++                    f"Début pièce {piece_no} (page)",
++                    min_value=1,
++                    max_value=pdf_page_count_for_inputs,
++                    value=default_start,
++                    step=1,
++                    key=f"guided_split_start_page_{project_id}_{guided_pdf_widget_id}_{i}",
++                ))
+             with c2:
+-                titles.append(st.text_input(f"Libellé proposé (pièce {first_piece_no + i})",
+-                                            value=f"Pièce {first_piece_no + i}",
+-                                            key=f"guided_split_title_{project_id}_{i}"))
++                titles.append(st.text_input(
++                    f"Libellé proposé (pièce {piece_no})",
++                    value=suggested_title,
++                    key=title_key,
++                ))
+ 
+-        # Validation simple (pages strictement croissantes)
++        # Validation métier après saisie : aucune borne inter-pièces n'est imposée aux widgets.
+         def _valid(lst): return all(lst[i] < lst[i+1] for i in range(len(lst)-1))
+-        if not _valid(starts) and int(n) > 1:
+-            st.warning("Les numéros de page de début doivent être strictement croissants.")
++
++        guided_split_input_errors = []
++        if pdf_page_count_for_inputs is None:
++            guided_split_input_errors.append("Le nombre total de pages du PDF est indisponible.")
++        else:
++            for i, start in enumerate(starts):
++                piece_no = int(first_piece_no + i)
++                if int(start) < 1 or int(start) > pdf_page_count_for_inputs:
++                    guided_split_input_errors.append(
++                        f"Le début de la pièce {piece_no} doit être compris entre 1 et {pdf_page_count_for_inputs}."
++                    )
++                remaining_pieces = int(n) - i
++                remaining_pages = pdf_page_count_for_inputs - int(start) + 1
++                if remaining_pages < remaining_pieces:
++                    guided_split_input_errors.append(
++                        f"Il ne reste pas assez de pages à partir de la pièce {piece_no} "
++                        f"({remaining_pages} page(s) pour {remaining_pieces} pièce(s))."
++                    )
++        if int(n) > 1 and not _valid(starts):
++            guided_split_input_errors.append("Les numéros de page de début doivent être strictement croissants.")
++        for validation_error in guided_split_input_errors:
++            st.warning(validation_error)
+ 
+         # Construction des 'pieces' au bon numéro (avec offset)
+         # starts = [pages de début] ; no_piece = first_piece_no+i
+@@ -9656,7 +9815,9 @@ elif page == "Pré-traitement dépôt PDF":
+         rename_prefix = st.text_input("Préfixe n° avocat", value="PIECE", key=f"guided_split_prefix_avocat_{project_id}")
+ 
+         # nb_pages une fois
+-        if fitz is None:
++        if pdf_page_count_for_inputs:
++            nb_pages = pdf_page_count_for_inputs
++        elif fitz is None:
+             nb_pages = st.number_input("Nombre total de pages (PyMuPDF absent)", min_value=1, value=1, key=f"guided_split_nb_pages_manual_{project_id}")
+         else:
+             nb_pages = doc.page_count
+@@ -9683,29 +9844,39 @@ elif page == "Pré-traitement dépôt PDF":
+ 
+ 
+         # --- Chemins vus par le PC fixe ---
+-        proj_pcfixe = (project_config.get("roots") or {}).get("pcfixe")
+-        out_dir_pc  = pj(proj_pcfixe, "Splits")
++        guided_aff_id = get_project_id(project_config, "")
++        proj_pcfixe = pcfixe_local_root_for_server(project_config, guided_aff_id)
++        canonical_splits_parts = ("AD_Expert_Traitements", "_Splits")
++        canonical_splits_rel = str(Path(*canonical_splits_parts))
++        out_dir_pc = str(Path(proj_pcfixe).joinpath(*canonical_splits_parts))
+ 
+         # Hypothèse simple : tu déposeras le même PDF sur le PC fixe (ou via UNC) sous ce chemin :
+         # (si tu préfères UNC direct, remplace par \\PCFIXE\Affaires\...\Depot_initial\{sel})
+ 
+         input_path_pc = pj(proj_pcfixe, "AA_Expert_Admin", "Depot_initial", this_pdf.name)
++        input_path_unc = str(
++            Path(pcfixe_unc_root_for_laptop(project_config, guided_aff_id))
++            / "AA_Expert_Admin"
++            / "Depot_initial"
++            / this_pdf.name
++        )
++        output_dir_unc = pcfixe_server_path_to_unc(
++            project_config,
++            guided_aff_id,
++            out_dir_pc,
++        )
++        output_dir_nas = pj(
++            effective_nas_affaire_root(project_config, guided_aff_id),
++            *canonical_splits_parts,
++        )
+ 
+         st.text_input("Chemin (PC fixe) du PDF à découper", value=input_path_pc, disabled=True, key=f"guided_split_pdf_pc_path_{project_id}")
+-        st.text_input("Dossier de sortie (PC fixe)", value=out_dir_pc, disabled=True, key=f"guided_split_out_dir_pc_{project_id}")
++        st.text_input("Chemin UNC du PDF source", value=input_path_unc, disabled=True, key=f"guided_split_pdf_unc_path_{project_id}")
++        st.text_input("Dossier de sortie local PC fixe", value=out_dir_pc, disabled=True, key=f"guided_split_out_dir_pc_{project_id}")
++        st.text_input("Dossier de sortie UNC", value=output_dir_unc, disabled=True, key=f"guided_split_out_dir_unc_{project_id}")
++        st.text_input("Dossier de sortie NAS", value=output_dir_nas, disabled=True, key=f"guided_split_out_dir_nas_{project_id}")
+         
+ 
+-        default_cp = st.session_state.get("default_code_partie", "03") or "03"
+-        default_dt = st.session_state.get("default_date_tx", "")  # peut être "YYYY-MM-DD"
+-        with col_meta[0]:
+-            code_partie = st.text_input("Code partie", value=default_cp, key=f"guided_split_code_partie_{project_id}")
+-        with col_meta[1]:
+-            try:
+-                dt_init = date.fromisoformat(default_dt) if default_dt else date.today()
+-            except Exception:
+-                dt_init = date.today()
+-            date_tx = st.date_input("Date transmission", value=dt_init, key=f"guided_split_date_{project_id}")
+-        
+         # Options d’exécution
+         col_opt = st.columns(3)
+         with col_opt[0]:
+@@ -9719,26 +9890,158 @@ elif page == "Pré-traitement dépôt PDF":
+         if "guided_jobs" not in st.session_state:
+             st.session_state.guided_jobs = []
+ 
++        current_guided_job = {
++            "input_path": input_path_pc,
++            "output_dir": out_dir_pc,
++            "code_partie": guided_code_partie,
++            "numero_avocat_prefix": (rename_prefix or "PIECE").strip(),
++            "strategy": strategy,
++            "state": {"last_global": 0} if strategy == "global" else {"prefix": "1", "last_suffix": "00"},
++            "pieces": pieces,
++            "output_dir_nas": output_dir_nas,
++            "mirror_to_nas": True,
++            "meta": {
++                "project_id": guided_aff_id,
++                "date_transmission": guided_date_transmission,
++                "source_pdf_laptop": str(this_pdf),
++                "first_piece_no": int(first_piece_no),
++            },
++        }
++        guided_split_result_key = f"guided_split_immediate_result_{project_id}"
++        guided_split_plan_rows = [
++            {
++                "numero_piece": piece.get("numero"),
++                "pages": f"{piece.get('start_page')}-{piece.get('end_page')}",
++                "nom_cible": piece.get("filename"),
++            }
++            for piece in pieces
++        ]
++
++        def run_guided_split_now(dry_run: bool) -> None:
++            if guided_split_input_errors:
++                st.error("Corrige les pages de début avant de préparer ou d’exécuter le split.")
++                return
++            try:
++                source_unc = Path(input_path_unc)
++                if not source_unc.is_file():
++                    source_unc.parent.mkdir(parents=True, exist_ok=True)
++                    shutil.copy2(str(this_pdf), str(source_unc))
++                if not source_unc.is_file():
++                    st.error(f"PDF source absent côté PC fixe après copie : {input_path_unc}")
++                    return
++            except Exception as exc:
++                st.error(f"Impossible de rendre le PDF source disponible côté PC fixe : {exc}")
++                return
++            job = dict(current_guided_job)
++            job["dry_run"] = bool(dry_run)
++            job["overwrite"] = False
++            payload = {"jobs": [job], "stop_on_error": False}
++            if not ensure_server_ready(MAC_PCFIXE, SERVER_IP, int(SERVER_PORT)):
++                st.error("Serveur indisponible.")
++                return
++            try:
++                with st.spinner("Préparation du split..." if dry_run else "Création des fichiers enfants..."):
++                    response = requests.post(
++                        f"{SERVER_URL}/api/split_pdf_batch",
++                        headers={"x-api-key": API_KEY},
++                        json=payload,
++                        timeout=max(timeout, 300 if dry_run else 600),
++                    )
++                data = response.json() if response.headers.get("Content-Type", "").startswith("application/json") else {
++                    "ok": False,
++                    "raw": response.text,
++                }
++                technical_response = {
++                    "http_status": response.status_code,
++                    "reason": response.reason,
++                    "headers": dict(response.headers),
++                    "body": response.text,
++                    "json": data,
++                }
++            except Exception as exc:
++                st.error(f"Erreur pendant le split : {exc}")
++                return
++
++            expected_files = [str(Path(output_dir_unc) / piece["filename"]) for piece in pieces] if output_dir_unc else []
++            created_files = [
++                path for path in expected_files
++                if not dry_run and Path(path).is_file()
++            ]
++            job_results = data.get("results") if isinstance(data, dict) else []
++            jobs_ok = all(bool(item.get("ok")) for item in job_results if isinstance(item, dict))
++            result = {
++                "dry_run": bool(dry_run),
++                "ok": bool(response.ok and data.get("ok", False) and jobs_ok),
++                "parent_pdf": this_pdf.name,
++                "input_path_pcfixe": input_path_pc,
++                "input_path_unc": input_path_unc,
++                "output_dir_pcfixe": out_dir_pc,
++                "output_dir_unc": output_dir_unc,
++                "output_dir_nas": output_dir_nas,
++                "pieces": guided_split_plan_rows,
++                "expected_files": expected_files,
++                "created_files": created_files,
++                "response": technical_response,
++            }
++            st.session_state[guided_split_result_key] = result
++            if not result["ok"]:
++                st.error("Le serveur n’a pas validé le split.")
++            elif dry_run:
++                st.success("Dry-run du split préparé.")
++            elif len(created_files) == len(pieces):
++                st.success(f"{len(created_files)} fichier(s) enfant(s) créé(s).")
++            else:
++                st.warning(
++                    "Le serveur a terminé le split, mais tous les fichiers attendus "
++                    "ne sont pas encore visibles depuis le laptop."
++                )
++
++        immediate_cols = st.columns(2)
++        with immediate_cols[0]:
++            if st.button(
++                "Préparer le split du PDF sélectionné (dry-run)",
++                key=f"guided_split_prepare_selected_{project_id}",
++            ):
++                run_guided_split_now(dry_run=True)
++        with immediate_cols[1]:
++            if st.button(
++                "Exécuter le split réel et créer les fichiers enfants",
++                key=f"guided_split_execute_selected_{project_id}",
++                type="primary",
++            ):
++                run_guided_split_now(dry_run=False)
++
++        immediate_result = st.session_state.get(guided_split_result_key) or {}
++        if (
++            immediate_result
++            and immediate_result.get("parent_pdf") == this_pdf.name
++            and _norm(immediate_result.get("output_dir_pcfixe")) == _norm(out_dir_pc)
++        ):
++            st.write("Parent PDF :", immediate_result.get("parent_pdf"))
++            st.write("Dossier de sortie local PC fixe :", immediate_result.get("output_dir_pcfixe"))
++            st.write("Dossier de sortie UNC :", immediate_result.get("output_dir_unc"))
++            st.write("Dossier de sortie NAS :", immediate_result.get("output_dir_nas"))
++            st.dataframe(
++                prepare_df_for_streamlit_display(immediate_result.get("pieces") or []),
++                width="stretch",
++            )
++            if not immediate_result.get("dry_run"):
++                created_files = immediate_result.get("created_files") or []
++                st.write(f"Fichiers enfants créés : {len(created_files)}")
++                if created_files:
++                    st.code("\n".join(created_files))
++            with st.expander(
++                "Réponse technique du serveur",
++                expanded=not bool(immediate_result.get("ok")),
++            ):
++                st.json(immediate_result.get("response") or {})
++
+         if st.button("➕ Ajouter ce fichier au batch", key=f"guided_split_add_to_batch_{project_id}"):
+-            if int(n) > 1 and not _valid(starts):
+-                st.error("Corrige d’abord l’ordre des pages de début.")
++            if guided_split_input_errors:
++                st.error("Corrige les pages de début avant d’ajouter ce fichier au batch.")
+             else:
+-                job = {
+-                    "input_path": input_path_pc,
+-                    "output_dir": out_dir_pc,
+-                    "code_partie": code_partie.strip(),
+-                    "numero_avocat_prefix": (rename_prefix or "PIECE").strip(),
+-                    "strategy": strategy,
+-                    "state": {"last_global": 0} if strategy == "global" else {"prefix": "1", "last_suffix": "00"},
+-                    "project_id": get_project_id(project_config, ""),
+-                    "pieces": pieces,
+-                    "dry_run": bool(do_dry),
+-                    "meta": {
+-                        "date_transmission": str(date_tx),
+-                        "source_pdf_laptop": str(this_pdf),
+-                        "first_piece_no": int(first_piece_no)
+-                    }
+-                }
++                job = dict(current_guided_job)
++                job["dry_run"] = bool(do_dry)
+                 st.session_state.guided_jobs.append(job)
+                 st.success("Ajouté au batch.")
+ 
+@@ -10214,11 +10517,147 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                 out.append({**item, "numero_valide": numero, "titre_valide": title})
+             return out
+ 
++        def multi_pdf_child_rows_for_dry_run(title_lookup: dict[int, str]) -> list[dict]:
++            if not multi_pdf_name or multi_pdf_name == "(aucun)":
++                return []
++            source_rows = (
++                st.session_state.get("ingestion_manual_split_rows_current")
++                or st.session_state.get("ingestion_manual_split_rows")
++                or current_split_table_rows()
++            )
++            out = []
++            for row in source_rows or []:
++                item = dict(row or {})
++                numero_piece = coerce_editor_int(item.get("numero_piece") or item.get("numero"))
++                if numero_piece is None:
++                    continue
++                page_debut = coerce_editor_int(item.get("page_debut") or item.get("start_page"))
++                page_fin = coerce_editor_int(item.get("page_fin") or item.get("end_page"))
++                libelle = compact_spaces(
++                    item.get("libelle_final")
++                    or item.get("editable_title")
++                    or item.get("titre_propose")
++                    or title_lookup.get(numero_piece)
++                    or ""
++                )
++                target_name = f"PIECE n°{numero_piece} {sanitize_filename(libelle)}.pdf" if libelle else ""
++                action = "classer" if libelle and page_debut is not None and page_fin is not None else "à vérifier"
++                out.append({
++                    "fichier_source": Path(str(item.get("fichier_sortie") or target_name or f"piece_{numero_piece}.pdf")).name,
++                    "numero_piece": numero_piece,
++                    "libelle_ocr": libelle,
++                    "nom_cible_propose": target_name,
++                    "action": action,
++                    "origine": "enfant_split_pdf_multi_pieces",
++                    "parent_source": multi_pdf_name,
++                    "pages_source": f"{page_debut}-{page_fin}" if page_debut is not None and page_fin is not None else "",
++                })
++            return out
++
++        def scan_canonical_split_children(title_lookup: dict[int, str]) -> dict:
++            split_dir_unc = str(
++                Path(pcfixe_unc_root_for_laptop(project_config, get_project_id(project_config, "")))
++                / "AD_Expert_Traitements"
++                / "_Splits"
++            )
++            source_rows = (
++                st.session_state.get("ingestion_manual_split_rows_current")
++                or st.session_state.get("ingestion_manual_split_rows")
++                or current_split_table_rows()
++            )
++            expected_numbers = {
++                numero
++                for numero in (
++                    coerce_editor_int((row or {}).get("numero_piece") or (row or {}).get("numero"))
++                    for row in source_rows or []
++                )
++                if numero is not None
++            }
++            expected_numbers.update(
++                normalized_numero
++                for normalized_numero in (coerce_editor_int(numero) for numero in title_lookup)
++                if normalized_numero is not None
++            )
++
++            found_files = []
++            selected_by_number = {}
++            try:
++                found_files = [path for path in Path(split_dir_unc).glob("*.pdf") if path.is_file()]
++                for path in found_files:
++                    numero_piece, _sub_piece = detect_piece_ref_from_filename(path.name)
++                    if numero_piece is None or (expected_numbers and numero_piece not in expected_numbers):
++                        continue
++                    current = selected_by_number.get(numero_piece)
++                    if current is None or path.stat().st_mtime > current.stat().st_mtime:
++                        selected_by_number[numero_piece] = path
++            except Exception:
++                found_files = []
++                selected_by_number = {}
++
++            rows = []
++            for numero_piece, path in sorted(selected_by_number.items()):
++                libelle = compact_spaces(
++                    title_lookup.get(numero_piece)
++                    or fallback_piece_title_from_filename(path.name, numero_piece)
++                    or path.stem
++                )
++                rows.append({
++                    "fichier_source": path.name,
++                    "numero_piece": numero_piece,
++                    "libelle_ocr": libelle,
++                    "nom_cible_propose": (
++                        f"PIECE n°{numero_piece} {sanitize_filename(libelle)}.pdf"
++                        if libelle else path.name
++                    ),
++                    "action": "classer" if libelle else "à vérifier",
++                    "origine": "enfant_split_pdf_multi_pieces",
++                    "parent_source": multi_pdf_name if multi_pdf_name != "(aucun)" else "",
++                    "pages_source": "",
++                    "chemin_source": str(path),
++                })
++            return {
++                "dossier_splits_scanné": split_dir_unc,
++                "nombre_fichiers_trouvés": len(found_files),
++                "fichiers_enfants_retenus": [row["fichier_source"] for row in rows],
++                "parent_pdf_associé": multi_pdf_name if multi_pdf_name != "(aucun)" else "",
++                "rows": rows,
++            }
++
+         if st.button("Préparer renommage des pièces séparées", key=f"prepare_renaming_separated_pieces_{project_id}"):
+             suggestions = st.session_state.get("piece_title_suggestions") or {}
+             st.session_state.split_rows = current_split_table_rows()
+             validated_titles = split_table_validated_titles()
+             validated_unnumbered_titles = split_table_validated_unnumbered_titles()
++            split_children_scan = scan_canonical_split_children(validated_titles)
++            st.write("Diagnostic enfants du PDF multi-pièces")
++            st.json({
++                key: value
++                for key, value in split_children_scan.items()
++                if key != "rows"
++            })
++            guided_split_result = st.session_state.get(f"guided_split_immediate_result_{project_id}") or {}
++            canonical_guided_split_dir = str(
++                Path(pcfixe_local_root_for_server(project_config, get_project_id(project_config, ""))).joinpath(
++                    "AD_Expert_Traitements",
++                    "_Splits",
++                )
++            )
++            matching_created_children = (
++                guided_split_result.get("parent_pdf") == multi_pdf_name
++                and _norm(guided_split_result.get("output_dir_pcfixe")) == _norm(canonical_guided_split_dir)
++                and bool(guided_split_result.get("created_files"))
++            )
++            matching_created_children = matching_created_children or bool(split_children_scan.get("rows"))
++            if (
++                multi_pdf_name
++                and multi_pdf_name != "(aucun)"
++                and not piece_names
++                and not matching_created_children
++            ):
++                st.warning(
++                    "Le PDF multi-pièces est sélectionné mais ses fichiers enfants n’ont pas encore été créés. "
++                    "Exécuter d’abord le split réel."
++                )
+             next_unnumbered_idx = 0
+             dry_rows = []
+             for name in piece_names or []:
+@@ -10281,20 +10720,29 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                     "action": action,
+                     "origine": dry_row_origin if used_unnumbered_fallback or dry_row_origin else "",
+                 })
++            existing_dry_sources = {
++                Path(str(row.get("fichier_source") or "")).name.lower()
++                for row in dry_rows
++            }
++            dry_rows.extend(
++                row for row in (split_children_scan.get("rows") or [])
++                if Path(str(row.get("fichier_source") or "")).name.lower() not in existing_dry_sources
++            )
+ 
+             if dry_rows:
+                 st.session_state[separated_pieces_dry_run_key] = dry_rows
+                 st.info("Dry-run uniquement : aucune copie, aucun renommage, aucune écriture SQLite.")
+                 st.dataframe(prepare_df_for_streamlit_display(dry_rows), width="stretch")
+             else:
+-                st.warning("Aucun fichier de pièce sélectionné pour le dry-run de renommage.")
++                st.warning("Aucun fichier de pièce séparé ni enfant de PDF multi-pièces prêt pour le dry-run de renommage.")
+ 
+         selected_names = []
+-        for name in [dire_name, bcp_name, multi_pdf_name, *piece_names, *other_names]:
++        for name in [dire_name, bcp_name, *piece_names, *other_names]:
+             if name and name != "(aucun)" and name not in selected_names:
+                 selected_names.append(name)
+-        selected_uploads = [uploaded_by_name[name] for name in selected_names if name in uploaded_by_name]
+         selected_document_roles = build_ingestion_document_roles(dire_name, bcp_name, piece_names, multi_pdf_name, other_names=other_names)
++        if multi_pdf_name and multi_pdf_name != "(aucun)":
++            selected_document_roles.pop(Path(multi_pdf_name).name, None)
+ 
+         qualification_rows = []
+         title_lookup_for_summary = split_table_validated_titles()
+@@ -10303,11 +10751,32 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+             for k, v in (st.session_state.get("piece_title_suggestions") or {}).items()
+             if coerce_editor_int(k) is not None and coerce_editor_int(k) not in title_lookup_for_summary
+         })
++        current_split_children_scan = scan_canonical_split_children(title_lookup_for_summary)
++        current_split_child_rows = current_split_children_scan.get("rows") or []
+         separated_piece_rows_by_name = {
+             Path(str(row.get("fichier_source") or "")).name: row
+             for row in (st.session_state.get(separated_pieces_dry_run_key) or [])
+             if compact_spaces(row.get("action") or "") == "classer"
+         }
++        separated_piece_rows_by_name.update({
++            Path(str(row.get("fichier_source") or "")).name: row
++            for row in current_split_child_rows
++            if compact_spaces(row.get("action") or "") == "classer"
++        })
++
++        selected_uploads = [uploaded_by_name[name] for name in selected_names if name in uploaded_by_name]
++        document_parent_sources = {}
++        for child_row in current_split_child_rows:
++            child_path = Path(str(child_row.get("chemin_source") or ""))
++            if not child_path.is_file():
++                continue
++            child_upload = io.BytesIO(child_path.read_bytes())
++            child_upload.name = child_path.name
++            selected_uploads.append(child_upload)
++            selected_document_roles[child_path.name] = "piece"
++            if multi_pdf_name and multi_pdf_name != "(aucun)":
++                document_parent_sources[child_path.name] = multi_pdf_name
++
+         for filename in separated_piece_rows_by_name:
+             selected_document_roles[filename] = "piece"
+         for name in selected_names:
+@@ -10335,6 +10804,41 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                 "libelle_retenu": libelle,
+                 "action": "classer" if role else "à vérifier",
+             })
++        for child_row in current_split_child_rows:
++            child_path = Path(str(child_row.get("chemin_source") or ""))
++            numero_piece = coerce_editor_int(child_row.get("numero_piece"))
++            target_stem = compact_spaces(
++                Path(str(child_row.get("nom_cible_propose") or "")).stem
++            )
++            child_title = compact_spaces(
++                child_row.get("libelle_ocr")
++                or title_lookup_for_summary.get(numero_piece)
++                or child_path.stem
++            )
++            libelle = target_stem or (
++                f"PIECE n°{numero_piece} {child_title}"
++                if numero_piece is not None and child_title
++                else child_title
++            )
++            page_meta = file_page_count_record(child_path)
++            qualification_rows.append({
++                "fichier_source": child_path.name,
++                "role": "piece",
++                "type": "piece",
++                "numero_piece": numero_piece or "",
++                "libelle_retenu": libelle,
++                "page_count": page_meta.get("page_count"),
++                "source_parent": multi_pdf_name if multi_pdf_name != "(aucun)" else "",
++                "action": "classer",
++            })
++        multi_pdf_children_missing = bool(
++            multi_pdf_name
++            and multi_pdf_name != "(aucun)"
++            and not current_split_child_rows
++        )
++        if multi_pdf_name and multi_pdf_name != "(aucun)":
++            st.info(f"PDF parent multi-pièces : {multi_pdf_name} — non classé comme pièce finale")
++            st.write(f"Enfants classés : {len(current_split_child_rows)}")
+         if qualification_rows:
+             st.markdown("#### Synthèse avant validation documentaire")
+             edited_qualification = st.data_editor(
+@@ -10346,11 +10850,26 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                     "role": st.column_config.TextColumn("role", disabled=True),
+                     "type": st.column_config.TextColumn("type", disabled=True),
+                     "numero_piece": st.column_config.TextColumn("numero_piece", disabled=True),
++                    "page_count": st.column_config.NumberColumn("page_count", disabled=True),
++                    "source_parent": st.column_config.TextColumn("source_parent", disabled=True),
+                     "libelle_retenu": st.column_config.TextColumn("libelle_retenu"),
+                     "action": st.column_config.TextColumn("action", disabled=True),
+                 },
+             )
+             qualification_rows = data_editor_rows(edited_qualification)
++        split_child_names = {
++            Path(str(row.get("fichier_source") or "")).name
++            for row in current_split_child_rows
++        }
++        invalid_split_child_labels = [
++            Path(str(row.get("fichier_source") or "")).name
++            for row in qualification_rows
++            if (
++                Path(str(row.get("fichier_source") or "")).name in split_child_names
++                and coerce_editor_int(row.get("numero_piece")) is not None
++                and not re.match(r"(?i)^PIECE\b", compact_spaces(row.get("libelle_retenu") or ""))
++            )
++        ]
+         selected_document_labels = {
+             Path(str(row.get("fichier_source") or "")).name: compact_spaces(row.get("libelle_retenu") or "")
+             for row in qualification_rows
+@@ -10368,6 +10887,16 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                 st.error("Renseigner le type de transmission.")
+             elif not auteur_transmission.strip():
+                 st.error("Renseigner l'auteur ou le conseil.")
++            elif multi_pdf_children_missing:
++                st.error(
++                    "Le PDF multi-pièces est sélectionné mais aucun fichier enfant n’est disponible. "
++                    "Exécuter d’abord le split réel."
++                )
++            elif invalid_split_child_labels:
++                st.error(
++                    "Validation bloquée : chaque libellé d’enfant numéroté doit commencer par “PIECE”. "
++                    f"Corriger : {', '.join(invalid_split_child_labels)}"
++                )
+             elif not selected_uploads:
+                 st.error("Choisir au moins un fichier parmi les fichiers déposés.")
+             else:
+@@ -10391,6 +10920,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+                         project_config,
+                         selected_document_roles,
+                         selected_document_labels,
++                        document_parent_sources,
+                     )
+                     st.session_state["last_ingestion_event"] = event
+                     st.session_state["last_transmission_id"] = event.get("transmission_id")
+@@ -10967,6 +11497,15 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+         multi_pdf_pages_meta = file_page_count_record(Path(multi_pdf_local)) if multi_pdf_local else {"page_count": None}
+         multi_pdf_total_pages = multi_pdf_pages_meta.get("page_count") if multi_pdf_pages_meta.get("page_count_source") == "pdf_metadata" else None
+         multi_pdf_pc = pj(proj_pcfixe_ing, folder_rel_ing, multi_pdf_name) if multi_pdf_selected else ""
++        ingestion_title_lookup = piece_title_lookup_from_split_rows(
++            st.session_state.get("split_rows", []),
++            st.session_state.get("piece_title_suggestions", {}),
++        )
++        for k, v in piece_title_lookup_from_state(
++            st.session_state.get("ingestion_mapping_rows", []),
++            st.session_state.get("ingestion_bcp_extracted_titles", {}),
++        ).items():
++            ingestion_title_lookup.setdefault(k, v)
+         split_output_dir_pc_default = pj(proj_pcfixe_ing, folder_rel_ing) if folder_rel_ing else ""
+         split_output_dir_pc_raw = st.text_input(
+             "Dossier de sortie des pièces découpées (chemin vu PC fixe)",
+@@ -11104,11 +11643,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+             )
+             if st.button("Importer la pagination saisie", key="ingestion_import_manual_pagination"):
+                 parsed = parse_manual_pagination_text(st.session_state.get("ingestion_manual_pagination_text", ""))
+-                title_lookup = piece_title_lookup_from_state(
+-                    st.session_state.get("ingestion_mapping_rows", []),
+-                    st.session_state.get("ingestion_bcp_extracted_titles", {}),
+-                )
+-                parsed["rows"] = apply_piece_titles_to_split_rows(parsed["rows"], title_lookup)
++                parsed["rows"] = apply_piece_titles_to_split_rows(parsed["rows"], ingestion_title_lookup)
+                 st.session_state["ingestion_manual_pagination_parse"] = parsed
+                 if parsed["errors"]:
+                     st.error("Import partiel ou impossible : corriger les lignes signalées.")
+@@ -11123,6 +11658,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None
+         else:
+             st.info("Sélectionner un PDF multi-pièces pour afficher la table de découpe manuelle.")
+         current_split_rows = st.session_state.get("ingestion_manual_split_rows_current") or st.session_state.get("ingestion_manual_split_rows", [])
++        current_split_rows = apply_piece_titles_to_split_rows(current_split_rows, ingestion_title_lookup)
+         st.session_state["ingestion_manual_split_rows"] = current_split_rows
+         st.session_state["ingestion_manual_split_rows_current"] = current_split_rows
+         split_preview = prepare_manual_split_rows(
