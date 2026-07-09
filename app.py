@@ -194,6 +194,7 @@ else:
 SEED_SCRIPT = r"C:\LLM_Assistant\tools\sync\seed_captation.py"
 ROOT_DST_DEFAULT = r"\\192.168.1.20\Affaires"
 AFFAIRES_ROOT = Path(r"C:\Affaires")
+AUDIO_VOXTRAL_TOOL_DIR = Path(__file__).resolve().parent / "tools" / "audio_voxtral"
 
 
 
@@ -5347,6 +5348,86 @@ def list_captations(affaire_id: str):
 
     return items
 
+
+def prepare_voxtral_audio(wav_paths: list[str | Path], dry_run: bool = False) -> dict:
+    """Prépare un ou plusieurs WAV avec les scripts portables du dépôt."""
+    sources = [Path(str(path).strip()).resolve() for path in wav_paths if str(path).strip()]
+    if not sources:
+        raise ValueError("Sélectionner au moins un fichier WAV natif.")
+    for source in sources:
+        if not source.is_file() or source.suffix.lower() != ".wav":
+            raise FileNotFoundError(f"WAV natif introuvable : {source}")
+
+    prep_script = AUDIO_VOXTRAL_TOOL_DIR / "prep_voxtral.bat"
+    assembly_script = AUDIO_VOXTRAL_TOOL_DIR / "assemblage.ps1"
+    if not prep_script.is_file() or not assembly_script.is_file():
+        raise FileNotFoundError(f"Outils audio Voxtral incomplets : {AUDIO_VOXTRAL_TOOL_DIR}")
+
+    prepared = [
+        source.with_name(f"{source.stem}_mono16_16000Hz.wav")
+        for source in sources
+    ]
+    commands = [
+        ["cmd.exe", "/c", str(prep_script), str(source)]
+        for source in sources
+    ]
+    work_dir = sources[0].parent
+    list_path = work_dir / "liste.txt" if len(sources) > 1 else None
+
+    if len(sources) == 1:
+        final_path = prepared[0]
+    else:
+        base_name = re.sub(r"\s+partie\s+\d+.*$", "", prepared[0].stem, flags=re.IGNORECASE)
+        base_name = re.sub(r"\s+", "_", base_name)
+        final_path = work_dir / f"{base_name}_complet.wav"
+
+    if dry_run:
+        return {
+            "final_path": str(final_path),
+            "prepared_paths": [str(path) for path in prepared],
+            "list_path": str(list_path) if list_path else "",
+            "commands": commands,
+            "dry_run": True,
+        }
+
+    logs = []
+    for command, prepared_path in zip(commands, prepared):
+        proc = subprocess.run(command, capture_output=True, text=True, shell=False)
+        logs.append((proc.stdout or "") + (proc.stderr or ""))
+        if proc.returncode != 0:
+            raise RuntimeError(logs[-1].strip() or f"Échec de préparation : {prepared_path}")
+        if not prepared_path.is_file():
+            raise RuntimeError(f"Le WAV préparé n’a pas été créé : {prepared_path}")
+
+    if list_path:
+        list_content = "".join(f"file '{path}'\n" for path in prepared)
+        list_path.write_text(list_content, encoding="utf-8")
+        assembly_command = [
+            "powershell.exe",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(assembly_script),
+            "-WorkDir",
+            str(work_dir),
+        ]
+        proc = subprocess.run(assembly_command, capture_output=True, text=True, shell=False)
+        logs.append((proc.stdout or "") + (proc.stderr or ""))
+        if proc.returncode != 0:
+            raise RuntimeError(logs[-1].strip() or "Échec de l’assemblage WAV.")
+
+    if not final_path.is_file():
+        raise RuntimeError(f"Le WAV final n’a pas été créé : {final_path}")
+
+    return {
+        "final_path": str(final_path),
+        "prepared_paths": [str(path) for path in prepared],
+        "list_path": str(list_path) if list_path else "",
+        "logs": logs,
+        "dry_run": False,
+    }
+
 ASR_MEDIA_EXTENSIONS = (".wav", ".mp3", ".flac", ".m4a", ".ogg", ".mp4", ".mkv", ".mov")
 
 def _read_text_list_file(path: str | Path | None) -> list[str]:
@@ -7193,6 +7274,39 @@ elif page == "Voxtral (ASR / CR)":
         else:
             st.caption("Aucun vocabulaire auto lisible localement pour cette captation.")
 
+    st.markdown("### 🎚️ Prétraitement audio Voxtral")
+    native_audio_default = asr_ctx.get("local_audio_path", "") if asr_ctx else ""
+    native_audio_paths_text = st.text_area(
+        "WAV natifs à préparer (un chemin par ligne)",
+        value=native_audio_default,
+        key="voxtral_native_audio_paths",
+        help="Pour un assemblage, indiquer les parties dans l’ordre souhaité.",
+    )
+    native_audio_paths = [
+        line.strip().strip('"')
+        for line in native_audio_paths_text.splitlines()
+        if line.strip()
+    ]
+    if st.button("Préparer audio Voxtral", key="voxtral_prepare_audio"):
+        try:
+            prep_result = prepare_voxtral_audio(native_audio_paths)
+            final_audio_path = prep_result["final_path"]
+            st.session_state["voxtral_prepared_audio_path"] = final_audio_path
+            st.session_state["voxtral_asr_media"] = final_audio_path
+            st.success("WAV prêt pour ASR.")
+        except Exception as e:
+            st.error(f"Préparation audio Voxtral impossible : {e}")
+
+    prepared_voxtral_audio = str(
+        st.session_state.get("voxtral_prepared_audio_path", "") or ""
+    ).strip()
+    st.text_input(
+        "WAV final prêt pour ASR",
+        value=prepared_voxtral_audio,
+        disabled=True,
+        key="voxtral_prepared_audio_display",
+    )
+
     # ===== Diarisation (unique) =====
     st.markdown("### 📓 Noms propres, glossaires & alias locuteurs")
 
@@ -7433,7 +7547,11 @@ elif page == "Voxtral (ASR / CR)":
                 r = requests.post(f"{SERVER_URL}/voxtral_chat", headers={"x-api-key": API_KEY}, json=payload, timeout=timeout)
                 st.write(r.json())
       
-        media = st.text_input("Média (PC fixe)", value=project_config.get("ocr_input_pcfixe",""), key="voxtral_asr_media")
+        media = st.text_input(
+            "Média (PC fixe)",
+            value=prepared_voxtral_audio or project_config.get("ocr_input_pcfixe", ""),
+            key="voxtral_asr_media",
+        )
         lang_asr = st.text_input("Langue (fr/en/auto)", value="fr", key="voxtral_asr_language")
         timestamps = st.checkbox("Inclure timestamps", True)
         col = st.columns(3)
@@ -7447,7 +7565,7 @@ elif page == "Voxtral (ASR / CR)":
             # `project_id` seul ne suffit pas Ã  descendre jusqu'Ã  `{id_captation}`.
             resolved_output_dir = asr_ctx.get("trans_dir_pcfixe") or ""
             payload = {
-                "audio_path": asr_ctx.get("server_audio_path") or media,
+                "audio_path": prepared_voxtral_audio or asr_ctx.get("server_audio_path") or media,
                 "model_key": asr_model_key,
                 "timestamps": bool(timestamps),
                 "lang": lang_asr or None,
@@ -7514,7 +7632,11 @@ elif page == "Voxtral (ASR / CR)":
 
     # --- TAB 2 : compte-rendu (C/D) ---
     with tabs[1]:
-        media = st.text_input("Média (PC fixe) — CR", value=project_config.get("ocr_input_pcfixe",""), key="voxtral_cr_media")
+        media = st.text_input(
+            "Média (PC fixe) — CR",
+            value=prepared_voxtral_audio or project_config.get("ocr_input_pcfixe", ""),
+            key="voxtral_cr_media",
+        )
         csv_dir2 = st.text_input("Dossier CSV sortie (PC fixe) — CR", value=project_config.get("csv_output_pcfixe",""), key="voxtral_cr_csv_output_dir")
         also_csv = st.checkbox("Produire aussi un CSV de transcription pure", value=True)
 
@@ -7558,7 +7680,7 @@ elif page == "Voxtral (ASR / CR)":
             # MÃªme ciblage canonique pour les sorties de CR dÃ©rivÃ©es de l'ASR.
             resolved_output_dir = asr_ctx.get("trans_dir_pcfixe") or ""
             payload = {
-                "audio_path": asr_ctx.get("server_audio_path") or media,
+                "audio_path": prepared_voxtral_audio or asr_ctx.get("server_audio_path") or media,
                 "model_key": asr_model_key,
                 "export_chat_csv": True,
                 "export_chat_docx": True,
