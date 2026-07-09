@@ -5557,6 +5557,8 @@ def build_debrief_audio_block(
     affaire_id: str,
     id_captation: str,
     source_laptop: str | Path,
+    proper_names_file: str | Path | None = None,
+    proper_names_source: str = "none",
     existing_debrief: dict | None = None,
 ) -> dict:
     """Construit le bloc infos_projet.json pour un debrief audio optionnel."""
@@ -5586,6 +5588,8 @@ def build_debrief_audio_block(
     )
 
     source_changed = str(existing.get("source_laptop") or "") != str(src)
+    proper_names_value = str(proper_names_file or "").strip()
+    proper_source_value = str(proper_names_source or "none").strip() or "none"
     return {
         "enabled": True,
         "type": "audio",
@@ -5594,6 +5598,8 @@ def build_debrief_audio_block(
         "nas_wav": str(nas_dir / src.name),
         "csv": "" if source_changed else str(existing.get("csv") or ""),
         "transcribed": False if source_changed else bool(existing.get("transcribed") or False),
+        "proper_names_file": proper_names_value,
+        "proper_names_source": proper_source_value,
     }
 
 def update_infos_projet_debrief(
@@ -7552,22 +7558,6 @@ elif page == "Voxtral (ASR / CR)":
             help="Déduit automatiquement depuis l’id_captation.",
         )
 
-    debrief_proper_names_path = asr_ctx.get("proper_names_local_path", "") if asr_ctx else ""
-    if debrief_advanced:
-        debrief_proper_names_path = st.text_input(
-            "proper_names.txt",
-            value=debrief_proper_names_path,
-            key="voxtral_debrief_proper_names_advanced",
-            help="Correction manuelle si aucun fichier canonique *_proper_names.txt n’a été détecté.",
-        )
-    else:
-        st.text_input(
-            "proper_names détecté",
-            value=debrief_proper_names_path,
-            disabled=True,
-            key="voxtral_debrief_proper_names_display",
-        )
-
     debrief_dir_path = st.text_input(
         "Dossier debrief contenant les WAV",
         value=default_debrief_dir,
@@ -7587,6 +7577,52 @@ elif page == "Voxtral (ASR / CR)":
         debrief_wav_path = ""
         st.caption("Aucun WAV détecté dans ce dossier debrief.")
 
+    debrief_proper_candidates: list[tuple[str, str, str]] = []
+    canonical_proper = asr_ctx.get("proper_names_local_path", "") if asr_ctx else ""
+    if canonical_proper:
+        debrief_proper_candidates.append(("canonical", "Canonique captation", canonical_proper))
+    debrief_folder_candidates = _glob_existing_files(
+        Path(debrief_wav_path).parent if debrief_wav_path else debrief_dir_path,
+        ["*_proper_names.txt", "*proper_names*.txt"],
+    )
+    for candidate in debrief_folder_candidates:
+        if str(candidate) != canonical_proper:
+            debrief_proper_candidates.append(("debrief_folder", "Dossier debrief", str(candidate)))
+
+    debrief_proper_options = ["Aucun proper_names"]
+    debrief_proper_lookup = {"Aucun proper_names": ("none", "")}
+    for source_label, display_source, candidate_path in debrief_proper_candidates:
+        option = f"{display_source} — {Path(candidate_path).name}"
+        if option in debrief_proper_lookup:
+            option = f"{option} ({candidate_path})"
+        debrief_proper_options.append(option)
+        debrief_proper_lookup[option] = (source_label, candidate_path)
+
+    default_proper_index = 1 if len(debrief_proper_options) > 1 else 0
+    selected_debrief_proper_option = st.selectbox(
+        "proper_names à utiliser pour le debrief",
+        debrief_proper_options,
+        index=default_proper_index,
+        key="voxtral_debrief_proper_names_select",
+    )
+    debrief_proper_names_source, debrief_proper_names_path = debrief_proper_lookup[selected_debrief_proper_option]
+    if debrief_advanced:
+        manual_debrief_proper = st.text_input(
+            "proper_names manuel pour le debrief",
+            value="" if debrief_proper_names_source == "none" else debrief_proper_names_path,
+            key="voxtral_debrief_proper_names_manual",
+            help="Laisser vide pour ne transmettre aucun proper_names au job debrief.",
+        ).strip().strip('"')
+        debrief_proper_names_path = manual_debrief_proper
+        debrief_proper_names_source = "manual" if manual_debrief_proper else "none"
+
+    st.text_input(
+        "proper_names debrief retenu",
+        value=debrief_proper_names_path,
+        disabled=True,
+        key="voxtral_debrief_proper_names_display",
+    )
+
     st.text_input(
         "WAV de debrief sélectionné",
         value=debrief_wav_path,
@@ -7604,6 +7640,8 @@ elif page == "Voxtral (ASR / CR)":
                 affaire_id=affaire_id,
                 id_captation=selected_captation if selected_captation != "(aucune)" else "",
                 source_laptop=debrief_wav_path,
+                proper_names_file=debrief_proper_names_path,
+                proper_names_source=debrief_proper_names_source,
                 existing_debrief=existing_debrief,
             )
             st.caption("Dry-run : bloc debrief proposé pour infos_projet.json")
@@ -7747,7 +7785,7 @@ elif page == "Voxtral (ASR / CR)":
             job_result = submit_asr_v2_job(
                 infos_path=debrief_infos_path,
                 audio_prepared=prepared_debrief_audio,
-                proper_names_path=debrief_proper_names_path or None,
+                proper_names_path=(updated_infos.get("debrief", {}) or {}).get("proper_names_file") or None,
                 model=asr_model_key,
                 diarize=bool(use_diar),
                 debrief_csv=(updated_infos.get("debrief", {}) or {}).get("csv") or None,
