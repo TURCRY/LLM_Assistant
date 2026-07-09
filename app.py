@@ -5428,6 +5428,67 @@ def prepare_voxtral_audio(wav_paths: list[str | Path], dry_run: bool = False) ->
         "dry_run": False,
     }
 
+def build_debrief_audio_block(
+    *,
+    project_config: dict,
+    affaire_id: str,
+    id_captation: str,
+    source_laptop: str | Path,
+    existing_debrief: dict | None = None,
+) -> dict:
+    """Construit le bloc infos_projet.json pour un debrief audio optionnel."""
+    raw_source = str(source_laptop).strip().strip('"')
+    if not raw_source:
+        raise ValueError("Sélectionner un WAV de debrief ou laisser le champ vide.")
+    if not affaire_id or not id_captation:
+        raise ValueError("Sélectionner une affaire et une captation avant d’ajouter un debrief.")
+    src = Path(raw_source).expanduser()
+    if src.suffix.lower() != ".wav":
+        raise ValueError("Le debrief audio doit être un fichier WAV.")
+
+    existing = existing_debrief if isinstance(existing_debrief, dict) else {}
+    pcfixe_dir = (
+        Path(pcfixe_local_root_for_server(project_config, affaire_id))
+        / "AF_Expert_ASR"
+        / "transcriptions"
+        / id_captation
+        / "debrief"
+    )
+    nas_dir = (
+        Path(effective_nas_affaire_root(project_config, affaire_id))
+        / "AF_Expert_ASR"
+        / "transcriptions"
+        / id_captation
+        / "debrief"
+    )
+
+    source_changed = str(existing.get("source_laptop") or "") != str(src)
+    return {
+        "enabled": True,
+        "type": "audio",
+        "source_laptop": str(src),
+        "pcfixe_wav": str(pcfixe_dir / src.name),
+        "nas_wav": str(nas_dir / src.name),
+        "csv": "" if source_changed else str(existing.get("csv") or ""),
+        "transcribed": False if source_changed else bool(existing.get("transcribed") or False),
+    }
+
+def update_infos_projet_debrief(
+    infos_path: str | Path,
+    debrief_block: dict,
+) -> dict:
+    """Ajoute/met à jour uniquement la clé debrief sans supprimer les autres clés."""
+    path = Path(str(infos_path).strip().strip('"'))
+    if not path.is_file():
+        raise FileNotFoundError(f"infos_projet.json introuvable : {path}")
+    infos = load_json(str(path), {})
+    if not isinstance(infos, dict):
+        raise ValueError(f"infos_projet.json invalide : {path}")
+    infos["debrief"] = debrief_block
+    save_json(str(path), infos)
+    return infos
+
+
 ASR_MEDIA_EXTENSIONS = (".wav", ".mp3", ".flac", ".m4a", ".ogg", ".mp4", ".mkv", ".mov")
 
 def _read_text_list_file(path: str | Path | None) -> list[str]:
@@ -7306,6 +7367,72 @@ elif page == "Voxtral (ASR / CR)":
         disabled=True,
         key="voxtral_prepared_audio_display",
     )
+
+    st.markdown("### 📝 Debrief audio optionnel")
+    nas_infos_candidate = ""
+    if affaire_id and selected_captation != "(aucune)":
+        nas_infos_candidate = str(
+            Path(effective_nas_affaire_root(project_config, affaire_id))
+            / "AF_Expert_ASR"
+            / "transcriptions"
+            / selected_captation
+            / "infos_projet.json"
+        )
+    default_debrief_infos_path = asr_ctx.get("infos_path_laptop", "") if asr_ctx else ""
+    if default_debrief_infos_path and not Path(default_debrief_infos_path).exists() and nas_infos_candidate:
+        default_debrief_infos_path = nas_infos_candidate
+    elif not default_debrief_infos_path:
+        default_debrief_infos_path = nas_infos_candidate
+
+    debrief_infos_path = st.text_input(
+        "infos_projet.json à compléter",
+        value=default_debrief_infos_path,
+        key="voxtral_debrief_infos_path",
+        help="Le debrief est inscrit dans infos_projet.json, sans remplacer l’audio principal.",
+    )
+    debrief_infos = load_json(debrief_infos_path, {}) if debrief_infos_path else {}
+    existing_debrief = debrief_infos.get("debrief", {}) if isinstance(debrief_infos, dict) else {}
+    default_debrief_wav = ""
+    if isinstance(existing_debrief, dict):
+        default_debrief_wav = str(existing_debrief.get("source_laptop") or "")
+    debrief_wav_path = st.text_input(
+        "WAV de debrief optionnel (laptop)",
+        value=default_debrief_wav,
+        key="voxtral_debrief_wav_path",
+        help="Optionnel : laisser vide si aucun debrief audio n’est disponible.",
+    )
+    proposed_debrief_block = None
+    if debrief_wav_path.strip():
+        try:
+            proposed_debrief_block = build_debrief_audio_block(
+                project_config=project_config,
+                affaire_id=affaire_id,
+                id_captation=selected_captation if selected_captation != "(aucune)" else "",
+                source_laptop=debrief_wav_path,
+                existing_debrief=existing_debrief,
+            )
+            st.caption("Dry-run : bloc debrief proposé pour infos_projet.json")
+            st.json(proposed_debrief_block)
+        except Exception as e:
+            st.warning(f"Bloc debrief non calculable : {e}")
+    else:
+        st.caption("Aucun debrief audio sélectionné : l’ASR principal reste disponible.")
+
+    if st.button("Inscrire le debrief dans infos_projet.json", key="voxtral_save_debrief"):
+        if not proposed_debrief_block:
+            st.error("Sélectionner un WAV de debrief valide avant inscription.")
+        elif not Path(debrief_wav_path.strip().strip('"')).is_file():
+            st.error(f"WAV de debrief introuvable : {debrief_wav_path}")
+        else:
+            try:
+                updated_infos = update_infos_projet_debrief(
+                    debrief_infos_path,
+                    proposed_debrief_block,
+                )
+                st.success("Bloc debrief inscrit dans infos_projet.json.")
+                st.json(updated_infos.get("debrief", {}))
+            except Exception as e:
+                st.error(f"Mise à jour infos_projet.json impossible : {e}")
 
     # ===== Diarisation (unique) =====
     st.markdown("### 📓 Noms propres, glossaires & alias locuteurs")
