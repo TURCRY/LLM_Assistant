@@ -195,6 +195,10 @@ SEED_SCRIPT = r"C:\LLM_Assistant\tools\sync\seed_captation.py"
 ROOT_DST_DEFAULT = r"\\192.168.1.20\Affaires"
 AFFAIRES_ROOT = Path(r"C:\Affaires")
 AUDIO_VOXTRAL_TOOL_DIR = Path(__file__).resolve().parent / "tools" / "audio_voxtral"
+PCFIXE_AFFAIRES_UNC_ROOT = Path(r"\\192.168.0.155\Affaires")
+ASR_JOBS_UNC_ROOT = PCFIXE_AFFAIRES_UNC_ROOT / "_jobs"
+PCFIXE_AFFAIRES_ROOT = Path(r"C:\Affaires")
+PCFIXE_BOOST_FILE = Path(r"D:\GPT4All_Local\config\boost_vocab.txt")
 
 
 
@@ -5428,6 +5432,125 @@ def prepare_voxtral_audio(wav_paths: list[str | Path], dry_run: bool = False) ->
         "dry_run": False,
     }
 
+
+def submit_asr_v2_job(
+    *,
+    infos_path: str | Path,
+    audio_prepared: str | Path,
+    proper_names_path: str | Path | None,
+    model: str,
+    diarize: bool,
+    debrief_csv: str | Path | None = None,
+    nas_root: str | Path | None = None,
+    audio_target_dir_pcfixe: str | Path | None = None,
+    audio_target_dir_unc: str | Path | None = None,
+    dry_run: bool = False,
+) -> dict:
+    """Prépare et dépose atomiquement un job ASR schema_version=2."""
+    infos_source = Path(infos_path).resolve()
+    audio_source = Path(audio_prepared).resolve()
+    if not infos_source.is_file():
+        raise FileNotFoundError(f"infos_projet.json introuvable : {infos_source}")
+    if not audio_source.is_file():
+        raise FileNotFoundError(f"WAV préparé introuvable : {audio_source}")
+
+    infos = load_json(str(infos_source), {})
+    id_affaire = str(infos.get("id_affaire") or infos.get("project_id") or "").strip()
+    id_captation = str(infos.get("id_captation") or infos.get("captation_id") or "").strip()
+    if not id_affaire or not id_captation:
+        raise ValueError("id_affaire/id_captation manquants dans infos_projet.json.")
+    if any(char in id_affaire + id_captation for char in '\\/:*?"<>|'):
+        raise ValueError("id_affaire/id_captation invalides.")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    job_id = f"asr_{id_affaire}_{id_captation}_{stamp}_{uuid.uuid4().hex[:8]}"
+    pc_audio_dir = (
+        PCFIXE_AFFAIRES_ROOT / id_affaire / "AE_Expert_captations" / id_captation / "audio"
+    )
+    if audio_target_dir_pcfixe:
+        pc_audio_dir = Path(audio_target_dir_pcfixe)
+    pc_trans_dir = (
+        PCFIXE_AFFAIRES_ROOT / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation
+    )
+    unc_audio_dir = (
+        PCFIXE_AFFAIRES_UNC_ROOT
+        / id_affaire / "AE_Expert_captations" / id_captation / "audio"
+    )
+    if audio_target_dir_unc:
+        unc_audio_dir = Path(audio_target_dir_unc)
+    unc_trans_dir = (
+        PCFIXE_AFFAIRES_UNC_ROOT
+        / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation
+    )
+
+    pc_audio_prepared = pc_audio_dir / audio_source.name
+    pc_infos = pc_trans_dir / "infos_projet.json"
+    proper_source = Path(proper_names_path).resolve() if proper_names_path else None
+    pc_proper_names = pc_trans_dir / proper_source.name if proper_source and proper_source.is_file() else None
+
+    debrief_source = Path(debrief_csv).resolve() if debrief_csv else None
+    pc_debrief = pc_trans_dir / debrief_source.name if debrief_source and debrief_source.is_file() else None
+
+    infos_for_pcfixe = json.loads(json.dumps(infos))
+    infos_for_pcfixe["id_affaire"] = id_affaire
+    infos_for_pcfixe["id_captation"] = id_captation
+    infos_for_pcfixe.setdefault("pcfixe", {})
+    if isinstance(infos_for_pcfixe["pcfixe"], dict):
+        infos_for_pcfixe["pcfixe"]["root_affaires"] = str(PCFIXE_AFFAIRES_ROOT)
+        configured_transcript = str(
+            infos_for_pcfixe["pcfixe"].get("fichier_transcription") or ""
+        ).strip()
+        if configured_transcript:
+            infos_for_pcfixe["pcfixe"]["fichier_transcription"] = str(
+                pc_trans_dir / Path(configured_transcript).name
+            )
+    if nas_root:
+        infos_for_pcfixe.setdefault("roots", {})
+        if isinstance(infos_for_pcfixe["roots"], dict):
+            infos_for_pcfixe["roots"]["nas"] = str(nas_root)
+
+    job = {
+        "schema_version": 2,
+        "job_id": job_id,
+        "type": "asr_voxtral",
+        "infos_projet": str(pc_infos),
+        "audio_input": str(pc_audio_prepared),
+        "audio_prepared": str(pc_audio_prepared),
+        "proper_names_file": str(pc_proper_names) if pc_proper_names else "",
+        "boost_file": str(PCFIXE_BOOST_FILE),
+        "debrief_csv": str(pc_debrief) if pc_debrief else "",
+        "model": str(model or "Voxtral_Mini_3B_Transformers"),
+        "diarize": bool(diarize),
+    }
+
+    queued_path = ASR_JOBS_UNC_ROOT / "queued" / f"{job_id}.json"
+    result = {
+        "job_id": job_id,
+        "job_path": str(queued_path),
+        "status": "dry-run" if dry_run else "queued",
+        "job": job,
+    }
+    if dry_run:
+        return result
+
+    unc_audio_dir.mkdir(parents=True, exist_ok=True)
+    unc_trans_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(audio_source, unc_audio_dir / audio_source.name)
+    (unc_trans_dir / "infos_projet.json").write_text(
+        json.dumps(infos_for_pcfixe, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    if pc_proper_names:
+        shutil.copy2(proper_source, unc_trans_dir / proper_source.name)
+    if pc_debrief:
+        shutil.copy2(debrief_source, unc_trans_dir / debrief_source.name)
+
+    queued_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, queued_path)
+    return result
+
 def build_debrief_audio_block(
     *,
     project_config: dict,
@@ -5487,7 +5610,6 @@ def update_infos_projet_debrief(
     infos["debrief"] = debrief_block
     save_json(str(path), infos)
     return infos
-
 
 ASR_MEDIA_EXTENSIONS = (".wav", ".mp3", ".flac", ".m4a", ".ogg", ".mp4", ".mkv", ".mov")
 
@@ -5574,6 +5696,20 @@ def _pick_existing_path(*candidates: str | Path | None) -> str:
             continue
     return ""
 
+def _glob_existing_files(directory: str | Path | None, patterns: list[str]) -> list[Path]:
+    if not directory:
+        return []
+    try:
+        root = Path(directory)
+        if not root.exists() or not root.is_dir():
+            return []
+        found: list[Path] = []
+        for pattern in patterns:
+            found.extend(p for p in root.glob(pattern) if p.is_file())
+        return sorted(set(found), key=lambda p: p.name.casefold())
+    except Exception:
+        return []
+
 def _dedupe_keep_order(items: list[str]) -> list[str]:
     out = []
     seen = set()
@@ -5591,17 +5727,21 @@ def _dedupe_keep_order(items: list[str]) -> list[str]:
 def resolve_asr_captation_context(project_config: dict, affaire_id: str, id_captation: str) -> dict:
     proj_pcfixe = ((project_config.get("roots") or {}).get("pcfixe") or "").rstrip("\\/")
     proj_laptop = str((Path(AFFAIRES_ROOT) / affaire_id).resolve())
+    proj_nas = effective_nas_affaire_root(project_config, affaire_id)
 
     audio_dir_lp = Path(proj_laptop) / "AE_Expert_captations" / id_captation / "audio"
     trans_dir_lp = Path(proj_laptop) / "AF_Expert_ASR" / "transcriptions" / id_captation
+    trans_dir_nas = Path(proj_nas) / "AF_Expert_ASR" / "transcriptions" / id_captation if proj_nas else None
     audio_dir_pc = Path(proj_pcfixe) / "AE_Expert_captations" / id_captation / "audio" if proj_pcfixe else None
     trans_dir_pc = Path(proj_pcfixe) / "AF_Expert_ASR" / "transcriptions" / id_captation if proj_pcfixe else None
 
     infos_lp_path = trans_dir_lp / "infos_projet.json"
-    infos = load_json(str(infos_lp_path), {}) if infos_lp_path.exists() else {}
+    infos_nas_path = trans_dir_nas / "infos_projet.json" if trans_dir_nas else None
+    infos_effective_path = Path(_pick_existing_path(infos_lp_path, infos_nas_path) or str(infos_lp_path))
+    infos = load_json(str(infos_effective_path), {}) if infos_effective_path.exists() else {}
     infos, infos_changed = _migrate_infos_local_paths(infos)
-    if infos_changed and infos_lp_path.exists():
-        save_json(str(infos_lp_path), infos)
+    if infos_changed and infos_effective_path.exists():
+        save_json(str(infos_effective_path), infos)
     infos_pc = infos.get("pcfixe", {}) if isinstance(infos.get("pcfixe"), dict) else {}
 
     local_audio_candidates = []
@@ -5636,13 +5776,18 @@ def resolve_asr_captation_context(project_config: dict, affaire_id: str, id_capt
         server_audio_path = str(audio_dir_pc / local_audio_name)
 
     canonical_proper_names_lp = trans_dir_lp / f"{affaire_id}_proper_names.txt"
+    canonical_proper_names_nas = (trans_dir_nas / f"{affaire_id}_proper_names.txt") if trans_dir_nas else None
     canonical_proper_names_pc = (trans_dir_pc / f"{affaire_id}_proper_names.txt") if trans_dir_pc else None
-
-    proper_names_local_path = _pick_existing_path(
+    proper_names_candidates = [
         canonical_proper_names_lp,
+        canonical_proper_names_nas,
         infos.get("proper_names_file"),
         infos_pc.get("proper_names_file"),
-    )
+    ]
+    proper_names_candidates.extend(_glob_existing_files(trans_dir_lp, ["*_proper_names.txt", "*proper_names*.txt"]))
+    proper_names_candidates.extend(_glob_existing_files(trans_dir_nas, ["*_proper_names.txt", "*proper_names*.txt"]))
+
+    proper_names_local_path = _pick_existing_path(*proper_names_candidates)
     proper_names_server_path = str(canonical_proper_names_pc) if canonical_proper_names_pc else ""
     if proper_names_server_path and not Path(proper_names_server_path).exists():
         proper_names_server_path = infos_pc.get("proper_names_file") or proper_names_server_path
@@ -5662,11 +5807,14 @@ def resolve_asr_captation_context(project_config: dict, affaire_id: str, id_capt
 
     return {
         "infos_path_laptop": str(infos_lp_path),
-        "infos_exists": infos_lp_path.exists(),
+        "infos_path_nas": str(infos_nas_path) if infos_nas_path else "",
+        "infos_path_effective": str(infos_effective_path),
+        "infos_exists": infos_effective_path.exists(),
         "infos": infos,
         "audio_dir_laptop": str(audio_dir_lp),
         "audio_dir_pcfixe": str(audio_dir_pc) if audio_dir_pc else "",
         "trans_dir_laptop": str(trans_dir_lp),
+        "trans_dir_nas": str(trans_dir_nas) if trans_dir_nas else "",
         "trans_dir_pcfixe": str(trans_dir_pc) if trans_dir_pc else "",
         "server_audio_path": server_audio_path,
         "local_audio_path": local_audio_path,
@@ -7318,14 +7466,14 @@ elif page == "Voxtral (ASR / CR)":
         st.caption(f"Audio canonique PC fixe: {asr_ctx.get('audio_dir_pcfixe')}")
         st.caption(f"Sortie canonique transcription: {asr_ctx.get('trans_dir_pcfixe')}")
         if asr_ctx.get("infos_exists"):
-            st.caption(f"infos_projet.json dÃ©tectÃ©: {asr_ctx.get('infos_path_laptop')}")
+            st.caption(f"infos_projet.json détecté: {asr_ctx.get('infos_path_effective')}")
         else:
             st.warning("`infos_projet.json` non dÃ©tectÃ© pour cette captation; repli sur l'arborescence canonique.")
 
         col_auto = st.columns(2)
         with col_auto[0]:
             st.text_input("Audio source rÃ©solu (PC fixe)", value=asr_ctx.get("server_audio_path", ""), disabled=True, key="voxtral_asr_audio_source_resolved")
-            st.text_input("Proper names attendu (PC fixe)", value=asr_ctx.get("proper_names_server_path", ""), disabled=True, key="voxtral_asr_proper_names_expected")
+            st.text_input("Proper names détecté", value=asr_ctx.get("proper_names_local_path", "") or asr_ctx.get("proper_names_server_path", ""), disabled=True, key="voxtral_asr_proper_names_expected")
         with col_auto[1]:
             st.text_input("Sortie transcription cible (PC fixe)", value=asr_ctx.get("trans_dir_pcfixe", ""), disabled=True, key="voxtral_asr_transcription_target")
             st.text_input("Boost vocab par dÃ©faut", value=asr_ctx.get("boost_server_path", ""), disabled=True, key="voxtral_asr_boost_vocab_default")
@@ -7369,38 +7517,85 @@ elif page == "Voxtral (ASR / CR)":
     )
 
     st.markdown("### 📝 Debrief audio optionnel")
-    nas_infos_candidate = ""
-    if affaire_id and selected_captation != "(aucune)":
-        nas_infos_candidate = str(
-            Path(effective_nas_affaire_root(project_config, affaire_id))
-            / "AF_Expert_ASR"
-            / "transcriptions"
-            / selected_captation
-            / "infos_projet.json"
-        )
-    default_debrief_infos_path = asr_ctx.get("infos_path_laptop", "") if asr_ctx else ""
-    if default_debrief_infos_path and not Path(default_debrief_infos_path).exists() and nas_infos_candidate:
-        default_debrief_infos_path = nas_infos_candidate
-    elif not default_debrief_infos_path:
-        default_debrief_infos_path = nas_infos_candidate
+    debrief_advanced = st.checkbox(
+        "Mode avancé debrief (corriger les chemins déduits)",
+        value=False,
+        key="voxtral_debrief_advanced",
+    )
+    default_debrief_infos_path = asr_ctx.get("infos_path_effective", "") if asr_ctx else ""
+    debrief_trans_dir = Path(default_debrief_infos_path).parent if default_debrief_infos_path else None
+    default_debrief_dir = ""
+    if debrief_trans_dir:
+        canonical_debrief_dir = debrief_trans_dir / "debrief"
+        default_debrief_dir = str(canonical_debrief_dir if canonical_debrief_dir.exists() else debrief_trans_dir)
 
-    debrief_infos_path = st.text_input(
-        "infos_projet.json à compléter",
-        value=default_debrief_infos_path,
-        key="voxtral_debrief_infos_path",
-        help="Le debrief est inscrit dans infos_projet.json, sans remplacer l’audio principal.",
+    st.text_input(
+        "Dossier canonique transcription",
+        value=str(debrief_trans_dir or ""),
+        disabled=True,
+        key="voxtral_debrief_trans_dir_display",
+    )
+    if debrief_advanced:
+        debrief_infos_path = st.text_input(
+            "infos_projet.json à compléter",
+            value=default_debrief_infos_path,
+            key="voxtral_debrief_infos_path_advanced",
+            help="Correction manuelle réservée aux cas où la captation ne pointe pas vers le bon infos_projet.json.",
+        )
+    else:
+        debrief_infos_path = default_debrief_infos_path
+        st.text_input(
+            "infos_projet.json détecté",
+            value=debrief_infos_path,
+            disabled=True,
+            key="voxtral_debrief_infos_path_display",
+            help="Déduit automatiquement depuis l’id_captation.",
+        )
+
+    debrief_proper_names_path = asr_ctx.get("proper_names_local_path", "") if asr_ctx else ""
+    if debrief_advanced:
+        debrief_proper_names_path = st.text_input(
+            "proper_names.txt",
+            value=debrief_proper_names_path,
+            key="voxtral_debrief_proper_names_advanced",
+            help="Correction manuelle si aucun fichier canonique *_proper_names.txt n’a été détecté.",
+        )
+    else:
+        st.text_input(
+            "proper_names détecté",
+            value=debrief_proper_names_path,
+            disabled=True,
+            key="voxtral_debrief_proper_names_display",
+        )
+
+    debrief_dir_path = st.text_input(
+        "Dossier debrief contenant les WAV",
+        value=default_debrief_dir,
+        key="voxtral_debrief_dir_path",
+        help="Choisir le dossier debrief de la captation ; les *.wav présents seront listés ci-dessous.",
+    )
+    debrief_wav_candidates = _glob_existing_files(debrief_dir_path, ["*.wav", "*.WAV"]) if debrief_dir_path else []
+    if debrief_wav_candidates:
+        debrief_wav_labels = [p.name for p in debrief_wav_candidates]
+        selected_debrief_wav_label = st.selectbox(
+            "WAV de debrief à transcrire",
+            debrief_wav_labels,
+            key="voxtral_debrief_wav_select",
+        )
+        debrief_wav_path = str(debrief_wav_candidates[debrief_wav_labels.index(selected_debrief_wav_label)])
+    else:
+        debrief_wav_path = ""
+        st.caption("Aucun WAV détecté dans ce dossier debrief.")
+
+    st.text_input(
+        "WAV de debrief sélectionné",
+        value=debrief_wav_path,
+        disabled=True,
+        key="voxtral_debrief_wav_display",
+        help="Le debrief est distinct de l’audio principal.",
     )
     debrief_infos = load_json(debrief_infos_path, {}) if debrief_infos_path else {}
     existing_debrief = debrief_infos.get("debrief", {}) if isinstance(debrief_infos, dict) else {}
-    default_debrief_wav = ""
-    if isinstance(existing_debrief, dict):
-        default_debrief_wav = str(existing_debrief.get("source_laptop") or "")
-    debrief_wav_path = st.text_input(
-        "WAV de debrief optionnel (laptop)",
-        value=default_debrief_wav,
-        key="voxtral_debrief_wav_path",
-        help="Optionnel : laisser vide si aucun debrief audio n’est disponible.",
-    )
     proposed_debrief_block = None
     if debrief_wav_path.strip():
         try:
@@ -7417,6 +7612,18 @@ elif page == "Voxtral (ASR / CR)":
             st.warning(f"Bloc debrief non calculable : {e}")
     else:
         st.caption("Aucun debrief audio sélectionné : l’ASR principal reste disponible.")
+
+    def prepare_selected_debrief_audio() -> str:
+        source = Path(debrief_wav_path.strip().strip('"'))
+        if not source.is_file():
+            raise FileNotFoundError(f"WAV de debrief introuvable : {source}")
+        if source.name.lower().endswith("_mono16_16000hz.wav"):
+            return str(source)
+        prepared = source.with_name(f"{source.stem}_mono16_16000Hz.wav")
+        if prepared.is_file():
+            return str(prepared)
+        prep_result = prepare_voxtral_audio([source])
+        return str(prep_result["final_path"])
 
     if st.button("Inscrire le debrief dans infos_projet.json", key="voxtral_save_debrief"):
         if not proposed_debrief_block:
@@ -7505,6 +7712,104 @@ elif page == "Voxtral (ASR / CR)":
             "allow_overlap": bool(overlap_ok),
         }
 
+    asr_job_dry_run = st.checkbox(
+        "Dry-run soumission ASR (afficher le JSON sans le déposer)",
+        value=True,
+        key="voxtral_asr_job_dry_run",
+    )
+
+    def submit_debrief_asr_job() -> None:
+        if not debrief_infos_path or not Path(debrief_infos_path.strip().strip('"')).is_file():
+            st.error("infos_projet.json de la captation introuvable.")
+            return
+        if not proposed_debrief_block:
+            st.error("Sélectionner un WAV de debrief valide.")
+            return
+        try:
+            updated_infos = update_infos_projet_debrief(
+                debrief_infos_path,
+                proposed_debrief_block,
+            )
+            prepared_debrief_audio = prepare_selected_debrief_audio()
+            pc_debrief_audio_dir = Path(proposed_debrief_block["pcfixe_wav"]).parent
+            unc_debrief_audio_dir = (
+                pcfixe_server_path_to_unc(project_config, affaire_id, str(pc_debrief_audio_dir))
+                or str(
+                    PCFIXE_AFFAIRES_UNC_ROOT
+                    / affaire_id
+                    / "AF_Expert_ASR"
+                    / "transcriptions"
+                    / selected_captation
+                    / "debrief"
+                )
+            )
+            st.session_state["voxtral_prepared_debrief_audio_path"] = prepared_debrief_audio
+            job_result = submit_asr_v2_job(
+                infos_path=debrief_infos_path,
+                audio_prepared=prepared_debrief_audio,
+                proper_names_path=debrief_proper_names_path or None,
+                model=asr_model_key,
+                diarize=bool(use_diar),
+                debrief_csv=(updated_infos.get("debrief", {}) or {}).get("csv") or None,
+                nas_root=(project_config.get("roots") or {}).get("nas") or None,
+                audio_target_dir_pcfixe=pc_debrief_audio_dir,
+                audio_target_dir_unc=unc_debrief_audio_dir,
+                dry_run=asr_job_dry_run,
+            )
+            st.session_state["voxtral_last_debrief_asr_job"] = job_result
+            st.write("WAV debrief préparé :", prepared_debrief_audio)
+            st.write("job_id debrief :", job_result["job_id"])
+            st.write("chemin JSON :", job_result["job_path"])
+            st.write("statut initial :", job_result["status"])
+            st.json(job_result["job"])
+            if not asr_job_dry_run:
+                st.success("Job ASR debrief déposé. Streamlit n’attend pas la fin du traitement.")
+        except Exception as e:
+            st.error(f"Soumission du job ASR debrief impossible : {e}")
+
+    if st.button("Préparer et soumettre le debrief au spooler ASR", key="voxtral_submit_debrief_asr_job"):
+        submit_debrief_asr_job()
+
+    def submit_current_asr_job() -> None:
+        infos_for_asr_job = ""
+        if debrief_infos_path and Path(debrief_infos_path.strip().strip('"')).is_file():
+            infos_for_asr_job = debrief_infos_path.strip().strip('"')
+        elif asr_ctx:
+            infos_for_asr_job = asr_ctx.get("infos_path_laptop", "")
+
+        if not asr_ctx or not infos_for_asr_job or not Path(infos_for_asr_job).is_file():
+            st.error("Sélectionner une captation disposant de son infos_projet.json.")
+            return
+        if not prepared_voxtral_audio:
+            st.error("Préparer d’abord le WAV final avec « Préparer audio Voxtral ».")
+            return
+        try:
+            debrief_csv_for_asr = None
+            current_infos = load_json(infos_for_asr_job, {})
+            if isinstance(current_infos, dict):
+                current_debrief = current_infos.get("debrief", {})
+                if isinstance(current_debrief, dict):
+                    debrief_csv_for_asr = current_debrief.get("csv") or None
+            job_result = submit_asr_v2_job(
+                infos_path=infos_for_asr_job,
+                audio_prepared=prepared_voxtral_audio,
+                proper_names_path=asr_ctx.get("proper_names_local_path") or None,
+                model=asr_model_key,
+                diarize=bool(use_diar),
+                debrief_csv=debrief_csv_for_asr,
+                nas_root=(project_config.get("roots") or {}).get("nas") or None,
+                dry_run=asr_job_dry_run,
+            )
+            st.session_state["voxtral_last_asr_job"] = job_result
+            st.write("job_id :", job_result["job_id"])
+            st.write("chemin JSON :", job_result["job_path"])
+            st.write("statut initial :", job_result["status"])
+            st.json(job_result["job"])
+            if not asr_job_dry_run:
+                st.success("Job ASR déposé. Streamlit n’attend pas la fin du traitement.")
+        except Exception as e:
+            st.error(f"Soumission du job ASR impossible : {e}")
+
     tabs = st.tabs(["Transcription (CSV garanti)", "Compte-rendu (LLM)"])
 
     
@@ -7571,72 +7876,8 @@ elif page == "Voxtral (ASR / CR)":
 
             st.info(f"Chemin lu par le serveur (audio_path) → {server_audio_path}")
 
-            # 4) Transcription (CSV garanti)
-            if st.button("🎧 Transcrire le média déposé"):
-                if not ensure_ready():
-                    st.error("❌ Serveur injoignable après WOL"); st.stop()
-                # Le serveur rÃ©sout `asr_transcriptions` au niveau affaire via `project_id`,
-                # mais pas le sous-niveau `{id_captation}`: on force donc le dossier canonique ici.
-                resolved_output_dir = asr_ctx.get("trans_dir_pcfixe") or ""
-                payload = {
-                    "audio_path": server_audio_path,
-                    "model_key": asr_model_key,
-                    "timestamps": True,
-                    "lang": "fr",
-                    "chunk": 30,
-                    "stride": 5,
-                    "temperature": 0.0,
-                    "export_chat_csv": False,
-                    "export_chat_docx": False,
-                    "auto_chunk": bool(auto_chunk),
-                    "batch_size": int(batch_size),
-                    "project_id": get_project_id(project_config, ""),             
-                }
-
-                if resolved_output_dir:
-                    payload["output_csv_dir"] = resolved_output_dir
-                elif use_output_override:
-                    payload["output_csv_dir"] = build_server_local_path(proj_pcfixe, sub_out, "")
-
-                
-                # Noms / glossaire / alias locuteurs
-                names_list = [l.strip() for l in (names_text or "").splitlines() if l.strip()]
-                names_list = _dedupe_keep_order(names_list + list(asr_ctx.get("auto_vocab_lines") or []))
-                if names_list: payload["vocab_hint"] = names_list
-                if glossary_path.strip(): payload["glossary_path"] = glossary_path.strip()
-                if speaker_rules_path.strip(): payload["speaker_rules_path"] = speaker_rules_path.strip()
-
-                # Exports (Excel/CSV + silences)
-                apply_common_exports(
-                    payload,
-                    excel_enc=excel_enc,
-                    excel_dec=excel_dec,
-                    silence_split=silence_split,
-                    silence_top_db=silence_top_db,
-                    silence_min_ms=silence_min_ms,
-                )
-
-                # Diarisation éventuelle
-                add_diarization(payload)
-
-                r = requests.post(f"{SERVER_URL}/asr_voxtral", headers={"x-api-key": API_KEY}, json=payload, timeout=timeout)
-                res = r.json()
-                st.write(res)
-                if isinstance(res, dict) and res.get("timing"):
-                    t = res["timing"]
-                    st.info(f"⏱ total={t.get('total_s')}s · RTF={t.get('rtf')} · throughput={t.get('throughput_kBps')} kB/s · segments/s={t.get('segments_per_s')}")
-
-                # Récup résultats via UNC (si dispo)
-                st.markdown("---")
-                st.markdown("### ⬇️ Récupération des résultats (PC fixe → laptop)")
-                laptop_out_dir = asr_ctx.get("trans_dir_laptop") or pj("\\".join([proj_laptop, sub_out]))
-                unc_out_dir = st.text_input("UNC sorties (serveur)", value=share_unc if share_unc.strip() else "", key="voxtral_asr_results_unc")
-                if st.button("📥 Copier résultats (CSV/DOCX/SRT/VTT) → laptop"):
-                    try:
-                        n = pull_results_from_unc(unc_out_dir, laptop_out_dir)
-                        st.success(f"✅ {n} fichier(s) récupéré(s) dans {laptop_out_dir}")
-                    except Exception as e:
-                        st.error(f"Erreur copie retours: {e}")
+            if st.button("📨 Soumettre le média préparé au spooler ASR"):
+                submit_current_asr_job()
 
             st.markdown("### 🧪 CR depuis un CSV existant (Voxtral Chat)")
             csv_for_chat = st.text_input("CSV brut (chemin serveur)", value="", key="voxtral_chat_source_csv")
@@ -7686,76 +7927,8 @@ elif page == "Voxtral (ASR / CR)":
         with col[1]: stride = st.number_input("Stride (s)", 0, 60, 5)
         with col[2]: csv_dir = st.text_input("Dossier CSV sortie (PC fixe)", value=project_config.get("csv_output_pcfixe",""), key="voxtral_asr_csv_output_dir")
 
-        if st.button("🎧 Transcrire (CSV)"):
-            if not ensure_ready():
-                st.error("❌ Serveur injoignable après WOL"); st.stop()
-            # `project_id` seul ne suffit pas Ã  descendre jusqu'Ã  `{id_captation}`.
-            resolved_output_dir = asr_ctx.get("trans_dir_pcfixe") or ""
-            payload = {
-                "audio_path": prepared_voxtral_audio or asr_ctx.get("server_audio_path") or media,
-                "model_key": asr_model_key,
-                "timestamps": bool(timestamps),
-                "lang": lang_asr or None,
-                "chunk": int(chunk), "stride": int(stride),
-                "temperature": 0.0,
-                "export_chat_csv": False,
-                "export_chat_docx": False,
-                "project_id": get_project_id(project_config, ""),
-            }
-            if resolved_output_dir:
-                payload["output_csv_dir"] = resolved_output_dir
-            elif use_output_override:
-                payload["output_csv_dir"] = build_server_local_path(proj_pcfixe, sub_out, "")
-            elif (csv_dir or "").strip():
-                payload["output_csv_dir"] = csv_dir.strip()
-
-            # — noms propres en liste
-            names_list = [l.strip() for l in (names_text or "").splitlines() if l.strip()]
-            names_list = _dedupe_keep_order(names_list + list(asr_ctx.get("auto_vocab_lines") or []))
-            if names_list:
-                payload["vocab_hint"] = names_list
-
-            # — chemins serveur optionnels
-            if glossary_path.strip():
-                payload["glossary_path"] = glossary_path.strip()
-            if speaker_rules_path.strip():
-                payload["speaker_rules_path"] = speaker_rules_path.strip()
-
-            # — auto-chunk / batch
-            payload["auto_chunk"] = bool(auto_chunk)
-            payload["batch_size"] = int(batch_size)
-
-            # — socle exports (avec encodage/décimale/silences UI)
-            apply_common_exports(payload,
-                excel_enc=excel_enc,
-                excel_dec=excel_dec,
-                silence_split=silence_split,
-                silence_top_db=silence_top_db,
-                silence_min_ms=silence_min_ms,
-            ) 
-            payload.update({
-                "temperature": 0.0,
-                "export_chat_csv": False,
-                "export_chat_docx": False,
-            })
-            add_diarization(payload)
-            r = requests.post(f"{SERVER_URL}/asr_voxtral", headers={"x-api-key": API_KEY}, json=payload, timeout=timeout)
-            res = r.json() if isinstance(r, requests.Response) else r
-            st.write(res)
-            if res.get("timing"):
-                t = res["timing"]
-                st.info(
-                    f"⏱ total={t.get('total_s')}s · "
-                    f"RTF={t.get('rtf')} · "
-                    f"throughput={t.get('throughput_kBps')} kB/s · "
-                    f"segments/s={t.get('segments_per_s')}"
-                )
-
-            # miroir des sorties côté PC -> laptop
-            asr_out_pc = resolved_output_dir or pj(pcfixe_root, project_config.get("asr_out_subdir","ASR_Out"))
-            produced = [str(p) for p in Path(asr_out_pc).glob("*.*")]
-            mirror_results_asr(pcfixe_root, laptop_root, project_config, produced, push_csv_to_vec=True)
-            st.success("✅ Résultats ASR répliqués (Laptop\\RAG_Vectoriel [+ PCfixe\\RAG_Vectoriel]).")
+        if st.button("📨 Soumettre le job ASR Voxtral"):
+            submit_current_asr_job()
 
     # --- TAB 2 : compte-rendu (C/D) ---
     with tabs[1]:
@@ -7799,65 +7972,9 @@ elif page == "Voxtral (ASR / CR)":
             tid = st.selectbox("Template défaut", ids, index=0) if ids else None
             report_prompt = st.text_area("Prompt (éditable)", value=(report_templates.get(tid, {}).get("instructions","") if tid else ""), height=200)
 
-        if st.button("🧾 CR (LLM)"):
-            if not ensure_ready():
-                st.error("❌ Serveur injoignable après WOL"); st.stop()
-
-            # 0) payload minimal
-            # MÃªme ciblage canonique pour les sorties de CR dÃ©rivÃ©es de l'ASR.
-            resolved_output_dir = asr_ctx.get("trans_dir_pcfixe") or ""
-            payload = {
-                "audio_path": prepared_voxtral_audio or asr_ctx.get("server_audio_path") or media,
-                "model_key": asr_model_key,
-                "export_chat_csv": True,
-                "export_chat_docx": True,
-                "top_p": float(ui_top_p),
-                "top_k": int(ui_top_k),
-                "repeat_penalty": float(ui_rp),
-                "max_tokens": int(ui_maxt),
-                "temperature": max(0.1, float(ui_temp)),
-                "project_id": get_project_id(project_config, ""),               
-            }
-
-            if resolved_output_dir:
-                payload["output_csv_dir"] = resolved_output_dir
-            elif use_output_override:
-                payload["output_csv_dir"] = build_server_local_path(proj_pcfixe, sub_out, "")  
-            elif also_csv and (csv_dir2 or "").strip():
-                payload["output_csv_dir"] = csv_dir2.strip()          
-
-            apply_common_exports(
-                payload,
-                excel_enc=excel_enc,
-                excel_dec=excel_dec,
-                silence_split=silence_split,
-                silence_top_db=silence_top_db,
-                silence_min_ms=silence_min_ms,
-            )
-
-            # hints/glossaire/alias + templates CR
-            names_list = [l.strip() for l in (names_text or "").splitlines() if l.strip()]
-            names_list = _dedupe_keep_order(names_list + list(asr_ctx.get("auto_vocab_lines") or []))
-            if names_list: payload["vocab_hint"] = names_list
-            if glossary_path.strip(): payload["glossary_path"] = glossary_path.strip()
-            if speaker_rules_path.strip(): payload["speaker_rules_path"] = speaker_rules_path.strip()
-            report_prompts_path = build_server_local_path(proj_pcfixe, cfg_subdir, "voxtral_report_prompts.json")
-            if report_prompts_path.strip(): payload["report_prompts_path"] = report_prompts_path.strip()
-
-            rp = (report_prompt or "").strip()
-            if rp: payload["report_prompt"] = rp
-
-            add_diarization(payload)
-
-            r = requests.post(f"{SERVER_URL}/asr_voxtral", headers={"x-api-key": API_KEY}, json=payload, timeout=timeout)
-            res = r.json()
-            st.write(res)
-
-            # 8) miroir sorties
-            asr_out_pc = resolved_output_dir or pj(pcfixe_root, project_config.get("asr_out_subdir","ASR_Out"))
-            produced = [str(p) for p in Path(asr_out_pc).glob("*.*")]
-            mirror_results_asr(pcfixe_root, laptop_root, project_config, produced, push_csv_to_vec=True)
-            st.success("✅ Résultats ASR répliqués (Laptop\\RAG_Vectoriel [+ PCfixe\\RAG_Vectoriel]).")
+        if st.button("📨 Soumettre l’ASR au spooler avant génération du CR"):
+            submit_current_asr_job()
+            st.info("Le compte-rendu pourra être généré après publication des sorties ASR.")
 
         st.markdown("### ☁️ Upload ressources (vers PC fixe)")
         up = st.file_uploader("Uploader un fichier ressource (txt/json)", type=["txt","json"], key="res_up")
