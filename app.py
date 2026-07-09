@@ -7182,11 +7182,11 @@ elif page == "Voxtral (ASR / CR)":
 
         col_auto = st.columns(2)
         with col_auto[0]:
-            st.text_input("Audio source rÃ©solu (PC fixe)", value=asr_ctx.get("server_audio_path", ""), disabled=True)
-            st.text_input("Proper names attendu (PC fixe)", value=asr_ctx.get("proper_names_server_path", ""), disabled=True)
+            st.text_input("Audio source rÃ©solu (PC fixe)", value=asr_ctx.get("server_audio_path", ""), disabled=True, key="voxtral_asr_audio_source_resolved")
+            st.text_input("Proper names attendu (PC fixe)", value=asr_ctx.get("proper_names_server_path", ""), disabled=True, key="voxtral_asr_proper_names_expected")
         with col_auto[1]:
-            st.text_input("Sortie transcription cible (PC fixe)", value=asr_ctx.get("trans_dir_pcfixe", ""), disabled=True)
-            st.text_input("Boost vocab par dÃ©faut", value=asr_ctx.get("boost_server_path", ""), disabled=True)
+            st.text_input("Sortie transcription cible (PC fixe)", value=asr_ctx.get("trans_dir_pcfixe", ""), disabled=True, key="voxtral_asr_transcription_target")
+            st.text_input("Boost vocab par dÃ©faut", value=asr_ctx.get("boost_server_path", ""), disabled=True, key="voxtral_asr_boost_vocab_default")
 
         if asr_ctx.get("auto_vocab_lines"):
             st.caption(f"Vocabulaire auto injectÃ©: {len(asr_ctx['auto_vocab_lines'])} terme(s) depuis `proper_names`/`boost_vocab`.")
@@ -7197,7 +7197,7 @@ elif page == "Voxtral (ASR / CR)":
     st.markdown("### 📓 Noms propres, glossaires & alias locuteurs")
 
     # Où stocker ces fichiers côté serveur (dans le projet)
-    cfg_subdir  = st.text_input("Sous-dossier config (PC fixe)", value="Config_ASR")
+    cfg_subdir  = st.text_input("Sous-dossier config (PC fixe)", value="Config_ASR", key="voxtral_asr_config_subdir")
 
     # 1) Noms propres (tu peux coller une liste, 1 par ligne)
     names_text = st.text_area("Noms/termes (1 par ligne)", height=120, 
@@ -7205,11 +7205,13 @@ elif page == "Voxtral (ASR / CR)":
 
     # 2) Glossaire (chemin serveur d'un JSON)
     glossary_path = st.text_input("Chemin serveur du glossaire JSON (optionnel)",
-                                value=build_server_local_path(proj_pcfixe, cfg_subdir, "proper_names_glossary.json"))
+                                value=build_server_local_path(proj_pcfixe, cfg_subdir, "proper_names_glossary.json"),
+                                key="voxtral_asr_glossary_path")
 
     # 3) Alias locuteurs (chemin serveur)
     speaker_rules_path = st.text_input("Chemin serveur alias locuteurs (optionnel)",
-                                    value=build_server_local_path(proj_pcfixe, cfg_subdir, "speaker_aliases.json"))
+                                    value=build_server_local_path(proj_pcfixe, cfg_subdir, "speaker_aliases.json"),
+                                    key="voxtral_asr_speaker_rules_path")
 
     # 4) Excel / CSV
     excel_enc = st.selectbox("Encodage CSV", ["utf-8-sig", "cp1252"], index=0,
@@ -7266,7 +7268,7 @@ elif page == "Voxtral (ASR / CR)":
 
     
     use_output_override = st.checkbox("Déroger au dossier de sortie projet", value=False)
-    default_asr_out_subdir = st.text_input("Sous-dossier ASR (sorties)", value="ASR_Out")
+    default_asr_out_subdir = st.text_input("Sous-dossier ASR (sorties)", value="ASR_Out", key="voxtral_asr_default_output_subdir")
 
  
     # --- TAB 1 : transcription pure (A/B) ---
@@ -7288,12 +7290,13 @@ elif page == "Voxtral (ASR / CR)":
 
         colt = st.columns(3)
         with colt[0]:
-            sub_in  = st.text_input("Sous-dossier ASR (entrées)", value="ASR_In")
+            sub_in  = st.text_input("Sous-dossier ASR (entrées)", value="ASR_In", key="voxtral_asr_input_subdir")
         with colt[1]:
-            sub_out = st.text_input("Sous-dossier ASR (sorties)", value="ASR_Out")
+            sub_out = st.text_input("Sous-dossier ASR (sorties)", value="ASR_Out", key="voxtral_asr_transfer_output_subdir")
         with colt[2]:
             share_unc = st.text_input("UNC dépôt (serveur)", value="\\\\PC-Fixe\\Drop_transcrip\\",
-                              help="Si vous avez un partage dédié; sinon vide et on utilisera un UNC dérivé.")
+                              help="Si vous avez un partage dédié; sinon vide et on utilisera un UNC dérivé.",
+                              key="voxtral_asr_deposit_unc")
 
         uploaded = st.file_uploader("Fichier audio/vidéo", type=["wav","mp3","flac","m4a","ogg","mp4","mkv","mov"])
         
@@ -7386,7 +7389,7 @@ elif page == "Voxtral (ASR / CR)":
                 st.markdown("---")
                 st.markdown("### ⬇️ Récupération des résultats (PC fixe → laptop)")
                 laptop_out_dir = asr_ctx.get("trans_dir_laptop") or pj("\\".join([proj_laptop, sub_out]))
-                unc_out_dir = st.text_input("UNC sorties (serveur)", value=share_unc if share_unc.strip() else "")
+                unc_out_dir = st.text_input("UNC sorties (serveur)", value=share_unc if share_unc.strip() else "", key="voxtral_asr_results_unc")
                 if st.button("📥 Copier résultats (CSV/DOCX/SRT/VTT) → laptop"):
                     try:
                         n = pull_results_from_unc(unc_out_dir, laptop_out_dir)
@@ -7395,12 +7398,13 @@ elif page == "Voxtral (ASR / CR)":
                         st.error(f"Erreur copie retours: {e}")
 
             st.markdown("### 🧪 CR depuis un CSV existant (Voxtral Chat)")
-            csv_for_chat = st.text_input("CSV brut (chemin serveur)", value="")
-            csv_out_cr   = st.text_input("Dossier sortie CR (PC fixe)", value=project_config.get("csv_output_pcfixe",""))
-            template_key = st.text_input("Template key (ex: expert_compte_rendu_v1)", value="expert_compte_rendu_v1")
+            csv_for_chat = st.text_input("CSV brut (chemin serveur)", value="", key="voxtral_chat_source_csv")
+            csv_out_cr   = st.text_input("Dossier sortie CR (PC fixe)", value=project_config.get("csv_output_pcfixe",""), key="voxtral_chat_output_dir")
+            template_key = st.text_input("Template key (ex: expert_compte_rendu_v1)", value="expert_compte_rendu_v1", key="voxtral_chat_template_key")
             report_prompts_path = st.text_input(
                 "Chemin serveur des templates CR (voxtral_report_prompts.json)",
-                value=build_server_local_path(proj_pcfixe, cfg_subdir, "voxtral_report_prompts.json")
+                value=build_server_local_path(proj_pcfixe, cfg_subdir, "voxtral_report_prompts.json"),
+                key="voxtral_chat_report_prompts_path",
             )
 
             if st.button("🧾 Générer CR via /voxtral_chat"):
@@ -7429,13 +7433,13 @@ elif page == "Voxtral (ASR / CR)":
                 r = requests.post(f"{SERVER_URL}/voxtral_chat", headers={"x-api-key": API_KEY}, json=payload, timeout=timeout)
                 st.write(r.json())
       
-        media = st.text_input("Média (PC fixe)", value=project_config.get("ocr_input_pcfixe",""))
-        lang_asr = st.text_input("Langue (fr/en/auto)", value="fr")
+        media = st.text_input("Média (PC fixe)", value=project_config.get("ocr_input_pcfixe",""), key="voxtral_asr_media")
+        lang_asr = st.text_input("Langue (fr/en/auto)", value="fr", key="voxtral_asr_language")
         timestamps = st.checkbox("Inclure timestamps", True)
         col = st.columns(3)
         with col[0]: chunk = st.number_input("Chunk (s)", 5, 180, 30)
         with col[1]: stride = st.number_input("Stride (s)", 0, 60, 5)
-        with col[2]: csv_dir = st.text_input("Dossier CSV sortie (PC fixe)", value=project_config.get("csv_output_pcfixe",""))
+        with col[2]: csv_dir = st.text_input("Dossier CSV sortie (PC fixe)", value=project_config.get("csv_output_pcfixe",""), key="voxtral_asr_csv_output_dir")
 
         if st.button("🎧 Transcrire (CSV)"):
             if not ensure_ready():
@@ -7510,8 +7514,8 @@ elif page == "Voxtral (ASR / CR)":
 
     # --- TAB 2 : compte-rendu (C/D) ---
     with tabs[1]:
-        media = st.text_input("Média (PC fixe) — CR", value=project_config.get("ocr_input_pcfixe",""))
-        csv_dir2 = st.text_input("Dossier CSV sortie (PC fixe) — CR", value=project_config.get("csv_output_pcfixe",""))
+        media = st.text_input("Média (PC fixe) — CR", value=project_config.get("ocr_input_pcfixe",""), key="voxtral_cr_media")
+        csv_dir2 = st.text_input("Dossier CSV sortie (PC fixe) — CR", value=project_config.get("csv_output_pcfixe",""), key="voxtral_cr_csv_output_dir")
         also_csv = st.checkbox("Produire aussi un CSV de transcription pure", value=True)
 
         scn = llm_scenarios.get("rapport", {})
