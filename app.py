@@ -2026,6 +2026,10 @@ DOCUMENT_ROLE_ALIASES = {
     "courrier": "lettre_dire",
     "bcp": "bcp",
     "bordereau": "bcp",
+    "production_complementaire": "production_complementaire",
+    "production_complémentaire": "production_complementaire",
+    "productioncomplémentaire": "production_complementaire",
+    "productioncomplementaire": "production_complementaire",
     "piece": "piece",
     "pièce": "piece",
     "pieces": "piece",
@@ -2702,12 +2706,46 @@ def format_date_long_fr(value: str) -> str:
     ]
     return f"{parsed.day} {mois[parsed.month - 1]} {parsed.year}"
 
-def state1_inclusion_decision(doc: dict) -> tuple[bool, str]:
-    role = normalize_document_role(doc.get("document_role"))
+def state1_document_role(doc: dict) -> str:
+    return normalize_document_role(doc.get("document_role") or doc.get("type_document"))
+
+def state1_group_key(doc: dict) -> tuple[str, str]:
+    party_key = compact_spaces(
+        doc.get("code_partie")
+        or doc.get("deposant")
+        or doc.get("partie")
+        or doc.get("source_type")
+        or ""
+    ).lower()
+    return party_key, compact_spaces(document_state_date(doc))
+
+def state1_unqualified_letter_or_dire(doc: dict) -> bool:
+    if state1_document_role(doc):
+        return False
+    haystack = " ".join([
+        str(doc.get("type_transmission") or ""),
+        str(doc.get("reference") or ""),
+        str(doc.get("fichier_source") or ""),
+        str(doc.get("libelle_affichage") or ""),
+        str(doc.get("libelle_final") or ""),
+    ]).lower()
+    return any(term in haystack for term in ("dire", "lettre"))
+
+def state1_inclusion_decision(
+    doc: dict,
+    has_letter_or_dire_same_group: bool = False,
+) -> tuple[bool, str]:
+    role = state1_document_role(doc)
     if role == "lettre_dire":
         return True, "document_role_lettre_dire"
-    if role in {"bcp", "piece", "pdf_multi_pieces"}:
+    if role == "bcp":
+        if has_letter_or_dire_same_group:
+            return False, "document_role_bcp_exclu_dire_ou_lettre_meme_partie_date"
+        return True, "document_role_bcp_seul_meme_partie_date"
+    if role in {"autre", "production_complementaire", "piece", "pdf_multi_pieces"}:
         return False, f"document_role_{role}_exclu"
+    if role:
+        return False, f"document_role_{role}_non_eligible"
     haystack = " ".join([
         str(doc.get("type_transmission") or ""),
         str(doc.get("reference") or ""),
@@ -2717,23 +2755,19 @@ def state1_inclusion_decision(doc: dict) -> tuple[bool, str]:
     ]).lower()
     exclude_terms = [
         "bcp", "bordereau", "communication de pièces", "communication de pieces",
+        "production complémentaire", "production complementaire",
         "liste de pièces", "liste de pieces", "pièce", "piece", "rapport",
         "plan", "photo", "photographie", "facture", "devis", "contrat",
         "annexe", "socabat", "saretec", "expertise",
     ]
     if doc.get("numero_piece") or any(term in haystack for term in exclude_terms):
         return False, "heuristique_exclusion_piece_bcp_annexe"
-    include_terms = [
-        "dire", "lettre", "courrier", "courriel", "mail", "message",
-        "observation", "note", "ordonnance", "avis", "convocation",
-        "notification",
-    ]
-    if any(term in haystack for term in include_terms):
-        return True, "heuristique_communication"
+    if state1_unqualified_letter_or_dire(doc):
+        return True, "heuristique_dire_ou_lettre_sans_role"
     return False, "aucun_critere_communication"
 
-def is_state1_communication(doc: dict) -> bool:
-    return state1_inclusion_decision(doc)[0]
+def is_state1_communication(doc: dict, has_letter_or_dire_same_group: bool = False) -> bool:
+    return state1_inclusion_decision(doc, has_letter_or_dire_same_group)[0]
 
 def flatten_transmission_documents(records: list[dict], aff_id: str = "", existing_ids_by_fingerprint: dict | None = None) -> list[dict]:
     docs = []
@@ -3300,9 +3334,18 @@ def build_document_states(records: list[dict], aff_id: str = "", aff_root_local:
             d.get("fichier_source") or "",
         ),
     )
+    state1_letter_or_dire_groups = {
+        state1_group_key(doc)
+        for doc in etat2
+        if state1_document_role(doc) == "lettre_dire"
+        or state1_unqualified_letter_or_dire(doc)
+    }
     etat1 = [
         doc for doc in etat2
-        if is_state1_communication(doc)
+        if is_state1_communication(
+            doc,
+            state1_group_key(doc) in state1_letter_or_dire_groups,
+        )
     ]
     etat1 = sorted(etat1, key=lambda d: (d.get("deposant") or "", parse_date_for_sort(document_state_date(d), reverse_empty=True), d.get("libelle_document") or ""))
     etat3 = [
@@ -3374,13 +3417,20 @@ def build_document_states(records: list[dict], aff_id: str = "", aff_root_local:
     ]
     diagnostic_etat1_qualification = []
     for doc in docs:
-        included, reason = state1_inclusion_decision(doc)
+        group_key = state1_group_key(doc)
+        has_letter_or_dire_same_group = group_key in state1_letter_or_dire_groups
+        included, reason = state1_inclusion_decision(
+            doc,
+            has_letter_or_dire_same_group,
+        )
         diagnostic_etat1_qualification.append({
             "fichier_source": str(doc.get("fichier_source") or ""),
             "document_role": str(doc.get("document_role") or ""),
             "type_document": str(doc.get("type_document") or ""),
             "qualification_source": str(doc.get("qualification_source") or ""),
             "type_transmission": str(doc.get("type_transmission") or ""),
+            "groupe_partie_date": " | ".join(group_key),
+            "dire_ou_lettre_meme_groupe": str(bool(has_letter_or_dire_same_group)),
             "inclusion_etat1": str(bool(included)),
             "motif_inclusion_exclusion_etat1": reason,
         })
