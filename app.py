@@ -199,6 +199,11 @@ PCFIXE_AFFAIRES_UNC_ROOT = Path(r"\\192.168.0.155\Affaires")
 ASR_JOBS_UNC_ROOT = PCFIXE_AFFAIRES_UNC_ROOT / "_jobs"
 PCFIXE_AFFAIRES_ROOT = Path(r"C:\Affaires")
 PCFIXE_BOOST_FILE = Path(r"D:\GPT4All_Local\config\boost_vocab.txt")
+NAS_AFFAIRES_ROOT = Path(r"\\192.168.1.20\Affaires")
+ANNOTATION_PHOTOS_CONFIG_DIR_CANDIDATES = [
+    Path(r"C:\AnnotationPhotosGPT\config"),
+    Path(r"C:\CodexWorkspace\AnnotationPhotosGPT\config"),
+]
 
 
 
@@ -5551,6 +5556,237 @@ def submit_asr_v2_job(
     os.replace(tmp_path, queued_path)
     return result
 
+ANN_PHOTOS_LLM_BACKENDS = {"openai", "local"}
+
+def _normalize_annotation_llm_backend(llm_backend: str) -> str:
+    backend = (llm_backend or "openai").strip().lower()
+    if backend not in ANN_PHOTOS_LLM_BACKENDS:
+        raise ValueError("llm_backend invalide : attendu 'openai' ou 'local'.")
+    return backend
+
+def _annotation_atomic_write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_path, path)
+
+PHOTO_BATCH_ACTIONS = {
+    "initial": {
+        "label": "Lancer le traitement initial",
+        "profile": "vlm_strict",
+        "options": ["--reset-vlm", "1", "--vlm-strict", "1"],
+    },
+    "weak_dry_run": {
+        "label": "Analyser les weak - simulation",
+        "profile": "rerun_weak_dry_run",
+        "options": ["--rerun-weak", "1", "--dry-run", "1"],
+    },
+    "weak_rerun": {
+        "label": "Relancer les weak",
+        "profile": "rerun_weak",
+        "options": ["--rerun-weak", "1"],
+    },
+}
+
+PHOTO_REPORT_JOB_SUPPORTED = False
+
+def _safe_job_token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("_") or "na"
+
+def _annotation_canonical_paths(id_affaire: str, id_captation: str) -> dict[str, Path]:
+    rel = Path(id_affaire) / "AF_Expert_ASR" / "transcriptions" / id_captation
+    out_rel = Path(id_affaire) / "BE_Traitement_captations" / id_captation / "compte_rendu_LLM"
+    return {
+        "nas_trans_dir": NAS_AFFAIRES_ROOT / rel,
+        "nas_infos": NAS_AFFAIRES_ROOT / rel / "infos_projet.json",
+        "pcfixe_trans_dir": PCFIXE_AFFAIRES_ROOT / rel,
+        "pcfixe_infos": PCFIXE_AFFAIRES_ROOT / rel / "infos_projet.json",
+        "pcfixe_unc_trans_dir": PCFIXE_AFFAIRES_UNC_ROOT / rel,
+        "pcfixe_unc_infos": PCFIXE_AFFAIRES_UNC_ROOT / rel / "infos_projet.json",
+        "pcfixe_report_dir": PCFIXE_AFFAIRES_ROOT / out_rel,
+        "pcfixe_report_unc_dir": PCFIXE_AFFAIRES_UNC_ROOT / out_rel,
+        "nas_report_dir": NAS_AFFAIRES_ROOT / out_rel,
+    }
+
+def _annotation_existing_infos_path(paths: dict[str, Path]) -> Path:
+    for key in ("nas_infos", "pcfixe_unc_infos"):
+        candidate = paths[key]
+        if candidate.is_file():
+            return candidate
+    return paths["nas_infos"]
+
+def _annotation_source_file(filename: str) -> Path | None:
+    for directory in ANNOTATION_PHOTOS_CONFIG_DIR_CANDIDATES:
+        candidate = directory / filename
+        if candidate.is_file():
+            return candidate
+    return None
+
+def _infos_declared_path(infos: dict, key: str, fallback: Path | None = None) -> Path:
+    pcfixe = infos.get("pcfixe", {}) if isinstance(infos.get("pcfixe"), dict) else {}
+    raw = infos.get(key) or pcfixe.get(key) or ""
+    return Path(str(raw).strip().strip('"')) if raw else (fallback or Path(""))
+
+def _annotation_resource_paths(infos_path: Path, infos: dict) -> dict[str, Path]:
+    base = infos_path.parent
+    photos_path = _infos_declared_path(infos, "fichier_photos")
+    photos_batch_path = _infos_declared_path(
+        infos,
+        "fichier_photos_batch",
+        photos_path.with_name("photos_batch.csv") if photos_path else Path(""),
+    )
+    return {
+        "infos_projet.json": infos_path,
+        "config_llm.json": base / "config_llm.json",
+        "prompt_gpt.json": base / "prompt_gpt.json",
+        "prompt_gpt_batch_only.json": base / "prompt_gpt_batch_only.json",
+        "contexte_general.json": base / "contexte_general.json",
+        "contexte_general_photos.json": base / "contexte_general_photos.json",
+        "photos.csv": photos_path,
+        "photos_batch.csv": photos_batch_path,
+    }
+
+def _copy_exact_file(source: str | Path, target: Path, *, overwrite: bool = False) -> None:
+    src = Path(str(source).strip().strip('"'))
+    if not src.is_file():
+        raise FileNotFoundError(f"Fichier source introuvable : {src}")
+    if target.exists() and not overwrite:
+        raise FileExistsError(f"Fichier cible déjà présent, copie refusée sans écrasement explicite : {target}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    shutil.copy2(src, tmp)
+    os.replace(tmp, target)
+
+def _annotation_job_statuses(id_affaire: str, id_captation: str) -> dict[str, str]:
+    status = {key: "absent" for key in PHOTO_BATCH_ACTIONS}
+    priority = {"queued": 1, "running": 2, "completed": 3, "failed": 4}
+    folders = {
+        "queued": "queued",
+        "running": "running",
+        "done": "completed",
+        "failed": "failed",
+    }
+    for folder, state in folders.items():
+        root = ASR_JOBS_UNC_ROOT / folder
+        if not root.exists():
+            continue
+        for job_file in root.glob("*.json"):
+            job = load_json(str(job_file), {})
+            if not isinstance(job, dict) or job.get("type") != "annotation_photos_batch":
+                continue
+            if str(job.get("affaire") or "") != id_affaire or str(job.get("captation") or "") != id_captation:
+                continue
+            options = [str(x) for x in (job.get("options") or [])]
+            for action_key, spec in PHOTO_BATCH_ACTIONS.items():
+                if options == spec["options"] and priority[state] >= priority.get(status[action_key], 0):
+                    status[action_key] = state
+    return status
+
+def submit_annotation_photos_batch_job(
+    *,
+    id_affaire: str,
+    id_captation: str,
+    infos_pcfixe: str | Path,
+    action_key: str,
+    dry_run: bool = True,
+) -> dict:
+    id_affaire = (id_affaire or "").strip()
+    id_captation = (id_captation or "").strip()
+    if not id_affaire or not id_captation:
+        raise ValueError("id_affaire/id_captation obligatoires.")
+    if any(char in id_affaire + id_captation for char in '\\/:*?"<>|'):
+        raise ValueError("id_affaire/id_captation invalides.")
+    if action_key not in PHOTO_BATCH_ACTIONS:
+        raise ValueError(f"Action batch inconnue : {action_key}")
+
+    spec = PHOTO_BATCH_ACTIONS[action_key]
+    infos = Path(str(infos_pcfixe).strip().strip('"'))
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    job_id = (
+        f"annotation_{_safe_job_token(id_affaire)}_{_safe_job_token(id_captation)}_"
+        f"{_safe_job_token(spec['profile'])}_{stamp}_{uuid.uuid4().hex[:8]}"
+    )
+    job = {
+        "job_id": job_id,
+        "type": "annotation_photos_batch",
+        "affaire": id_affaire,
+        "captation": id_captation,
+        "infos_projet": str(infos),
+        "profile": spec["profile"],
+        "options": list(spec["options"]),
+    }
+    queued_path = ASR_JOBS_UNC_ROOT / "queued" / f"{job_id}.json"
+    result = {
+        "job_id": job_id,
+        "job_path": str(queued_path),
+        "status": "dry-run" if dry_run else "queued",
+        "job": job,
+    }
+    if dry_run:
+        return result
+    queued_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, queued_path)
+    return result
+
+def _patch_infos_llm_backend(infos_path: Path, backend: str) -> tuple[str, str]:
+    backend = _normalize_annotation_llm_backend(backend)
+    data = load_json(str(infos_path), {})
+    if not isinstance(data, dict):
+        raise ValueError(f"infos_projet.json invalide : {infos_path}")
+    old = str(data.get("llm_backend") or "")
+    updated = json.loads(json.dumps(data))
+    updated["llm_backend"] = backend
+    _annotation_atomic_write_json(infos_path, updated)
+    return old, backend
+
+def _photo_report_job_preview(
+    *,
+    id_affaire: str,
+    id_captation: str,
+    infos_pcfixe: Path,
+    mode: str,
+    only_retenue: bool,
+) -> dict:
+    report_mode = "UI" if mode == "provisoire" else "GTP"
+    retenue = "oui" if only_retenue else "non"
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    job_id = (
+        f"annotation_word_{_safe_job_token(id_affaire)}_"
+        f"{_safe_job_token(id_captation)}_{stamp}_{uuid.uuid4().hex[:8]}"
+    )
+    job = {
+        "schema_version": 1,
+        "job_id": job_id,
+        "type": "annotation_photos_word_report",
+        "affaire": id_affaire,
+        "captation": id_captation,
+        "infos_projet": str(infos_pcfixe),
+        "mode": mode,
+        "retenue": retenue,
+    }
+    return {
+        "status": "dry-run",
+        "supported_by_spooler": PHOTO_REPORT_JOB_SUPPORTED,
+        "message": "Support spooler serveur requis avant exécution réelle",
+        "reason": "Aucun type de job rapport Word n'est présent dans le spooler audité.",
+        "job": job,
+        "job_path": str(ASR_JOBS_UNC_ROOT / "queued" / f"{job_id}.json"),
+        "batch_reference": (
+            "run_generate_word_report_n8n.bat --infos <infos> "
+            "--mode <provisoire|valide> --retenue <oui|non>"
+        ),
+        "env": {
+            "REPORT_MODE": report_mode,
+            "REPORT_ONLY_RETENUE": "1" if only_retenue else "0",
+        },
+        "command_preview": (
+            f'run_generate_word_report_n8n.bat --infos "{infos_pcfixe}" '
+            f"--mode {mode} --retenue {retenue}"
+        ),
+    }
+
 def build_debrief_audio_block(
     *,
     project_config: dict,
@@ -7070,6 +7306,7 @@ familles = [
     "OCR & Conversions",
     "Pré-traitement dépôt PDF",
     "Voxtral (ASR / CR)",
+    "Annotation photos / Rapport Word",
     "Prompts & Bibliothèque",
     "Historique Q&A",
     "Administration",
@@ -8081,6 +8318,249 @@ elif page == "Prompts & Bibliothèque":
                 st.write(r.json())
                 # resync local
                 st.session_state.prompts_structures = [p for p in prompts if p.get("nom") != cur.get("nom","")]
+
+elif page == "Annotation photos / Rapport Word":
+    st.subheader("Annotation photos / Rapport Word")
+
+    default_affaire = get_project_id(project_config, "")
+    ann_id_affaire = st.text_input("id_affaire", value=default_affaire, key="ann_photos_id_affaire").strip()
+    ann_known_captations: list[str] = []
+    if ann_id_affaire:
+        ann_known_captations.extend([c["id_captation"] for c in list_captations(ann_id_affaire)])
+        ann_nas_trans_root = NAS_AFFAIRES_ROOT / ann_id_affaire / "AF_Expert_ASR" / "transcriptions"
+        if ann_nas_trans_root.exists():
+            ann_known_captations.extend([p.name for p in sorted(ann_nas_trans_root.iterdir()) if p.is_dir()])
+    ann_known_captations = list(dict.fromkeys([x for x in ann_known_captations if x]))
+    ann_selected_captation = st.selectbox(
+        "id_captation",
+        ann_known_captations or ["(saisir manuellement)"],
+        key="ann_photos_id_captation_select",
+    )
+    ann_manual_captation = ""
+    if ann_selected_captation == "(saisir manuellement)":
+        ann_manual_captation = st.text_input("id_captation manuel", value="", key="ann_photos_id_captation_manual").strip()
+    ann_id_captation = ann_manual_captation or ann_selected_captation
+
+    if not ann_id_affaire or not ann_id_captation or ann_id_captation == "(saisir manuellement)":
+        st.info("Sélectionner une affaire et une captation pour afficher le contrôle.")
+    else:
+        st.markdown("### 1. Vérification des ressources")
+        ann_paths = _annotation_canonical_paths(ann_id_affaire, ann_id_captation)
+        ann_advanced = st.checkbox(
+            "Mode avancé (corriger infos_projet.json)",
+            value=False,
+            key="ann_photos_advanced",
+        )
+        ann_infos_default = str(_annotation_existing_infos_path(ann_paths))
+        if ann_advanced:
+            ann_infos_path_text = st.text_input(
+                "infos_projet.json",
+                value=ann_infos_default,
+                key="ann_photos_infos_manual",
+            ).strip().strip('"')
+        else:
+            ann_infos_path_text = ann_infos_default
+            st.text_input(
+                "infos_projet.json déduit",
+                value=ann_infos_path_text,
+                disabled=True,
+                key="ann_photos_infos_auto",
+            )
+
+        ann_infos_path = Path(ann_infos_path_text) if ann_infos_path_text else ann_paths["nas_infos"]
+        ann_infos = load_json(str(ann_infos_path), {}) if ann_infos_path.is_file() else {}
+        if ann_infos_path.is_file() and not isinstance(ann_infos, dict):
+            st.error("infos_projet.json existe mais n'est pas un objet JSON.")
+            ann_infos = {}
+
+        st.text_input(
+            "Dossier canonique",
+            value=str(ann_infos_path.parent),
+            disabled=True,
+            key="ann_photos_canonical_dir",
+        )
+        st.text_input(
+            "infos_projet.json PC fixe pour spooler",
+            value=str(ann_paths["pcfixe_infos"]),
+            disabled=True,
+            key="ann_photos_pcfixe_infos",
+        )
+
+        ann_resources = _annotation_resource_paths(ann_infos_path, ann_infos if isinstance(ann_infos, dict) else {})
+        ann_job_statuses = _annotation_job_statuses(ann_id_affaire, ann_id_captation)
+        ann_report_files = []
+        for report_root in (ann_paths["pcfixe_report_unc_dir"], ann_paths["nas_report_dir"]):
+            if report_root.exists():
+                ann_report_files.extend(report_root.glob(f"annotation_photos_{ann_id_affaire}_{ann_id_captation}_V_*.docx"))
+        ann_report_status = "présent" if ann_report_files else "absent"
+
+        status_rows = [
+            {
+                "élément": name,
+                "état": "présent" if path.is_file() else "absent",
+                "chemin": str(path),
+            }
+            for name, path in ann_resources.items()
+        ]
+        status_rows.extend([
+            {"élément": "traitement initial", "état": ann_job_statuses["initial"], "chemin": ""},
+            {"élément": "analyse weak", "état": ann_job_statuses["weak_dry_run"], "chemin": ""},
+            {"élément": "reprise weak", "état": ann_job_statuses["weak_rerun"], "chemin": ""},
+            {
+                "élément": "rapport Word",
+                "état": ann_report_status,
+                "chemin": str(ann_report_files[0]) if ann_report_files else str(ann_paths["pcfixe_report_unc_dir"]),
+            },
+        ])
+        st.markdown("#### Tableau d'état")
+        st.dataframe(status_rows, use_container_width=True, hide_index=True)
+
+        st.markdown("#### Ressources obligatoires")
+        copy_candidates = {
+            "config_llm.json": _annotation_source_file("config.json"),
+            "prompt_gpt.json": _annotation_source_file("prompt_gpt.json"),
+            "prompt_gpt_batch_only.json": _annotation_source_file("prompt_gpt_batch_only.json"),
+        }
+        for resource_name in ("config_llm.json", "prompt_gpt.json", "prompt_gpt_batch_only.json"):
+            target = ann_resources[resource_name]
+            source = copy_candidates.get(resource_name)
+            col_res = st.columns([2, 4, 2])
+            with col_res[0]:
+                st.write(resource_name)
+            with col_res[1]:
+                st.caption(str(target))
+                st.caption(f"source proposée : {source or '(introuvable)'}")
+            with col_res[2]:
+                if target.is_file():
+                    st.warning("présent - copie bloquée pour éviter l'écrasement")
+                elif source and st.button(f"Copier {resource_name}", key=f"ann_photos_copy_{resource_name}"):
+                    try:
+                        _copy_exact_file(source, target)
+                        st.success("Copie effectuée.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Copie impossible : {e}")
+                else:
+                    st.warning("absent")
+
+        for resource_name in ("contexte_general.json", "contexte_general_photos.json"):
+            target = ann_resources[resource_name]
+            source_value = st.text_input(
+                f"Source laptop pour {resource_name}",
+                value="",
+                key=f"ann_photos_source_{resource_name}",
+                help="Ce fichier peut provenir d'un dossier différent des autres ressources.",
+            )
+            if target.is_file():
+                st.warning(f"{resource_name} présent - copie bloquée pour éviter l'écrasement : {target}")
+            elif st.button(f"Copier {resource_name}", key=f"ann_photos_copy_manual_{resource_name}"):
+                try:
+                    _copy_exact_file(source_value, target)
+                    st.success("Copie effectuée.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Copie impossible : {e}")
+
+        missing_required = [
+            name for name in (
+                "infos_projet.json",
+                "config_llm.json",
+                "prompt_gpt.json",
+                "prompt_gpt_batch_only.json",
+                "contexte_general.json",
+                "contexte_general_photos.json",
+                "photos.csv",
+                "photos_batch.csv",
+            )
+            if not ann_resources[name].is_file()
+        ]
+        if missing_required:
+            st.warning("Ressources absentes : " + ", ".join(missing_required))
+
+        st.markdown("### 2. Batch des photos")
+        st.markdown("#### Backend LLM")
+        current_backend = str((ann_infos or {}).get("llm_backend") or "").strip()
+        backend_default_idx = 0 if current_backend != "local" else 1
+        new_backend = st.selectbox(
+            "llm_backend",
+            ["openai", "local"],
+            index=backend_default_idx,
+            key="ann_photos_llm_backend",
+        )
+        st.write("ancienne valeur :", current_backend or "(absente)")
+        st.write("nouvelle valeur :", new_backend)
+        if st.button("Écrire llm_backend dans infos_projet.json", key="ann_photos_write_llm_backend"):
+            try:
+                old_backend, written_backend = _patch_infos_llm_backend(ann_infos_path, new_backend)
+                st.success(f"llm_backend mis à jour : {old_backend or '(absente)'} -> {written_backend}")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Mise à jour impossible : {e}")
+
+        st.markdown("#### Actions de traitement")
+        ann_job_dry_run = st.checkbox(
+            "Dry-run job photos (afficher le JSON sans le déposer)",
+            value=True,
+            key="ann_photos_job_dry_run",
+        )
+        for action_key, spec in PHOTO_BATCH_ACTIONS.items():
+            st.markdown(f"#### {spec['label']}")
+            preview = submit_annotation_photos_batch_job(
+                id_affaire=ann_id_affaire,
+                id_captation=ann_id_captation,
+                infos_pcfixe=ann_paths["pcfixe_infos"],
+                action_key=action_key,
+                dry_run=True,
+            )
+            st.json(preview["job"])
+            if st.button(spec["label"], key=f"ann_photos_submit_{action_key}"):
+                try:
+                    result = submit_annotation_photos_batch_job(
+                        id_affaire=ann_id_affaire,
+                        id_captation=ann_id_captation,
+                        infos_pcfixe=ann_paths["pcfixe_infos"],
+                        action_key=action_key,
+                        dry_run=ann_job_dry_run,
+                    )
+                    st.write("job_id :", result["job_id"])
+                    st.write("chemin JSON :", result["job_path"])
+                    st.write("statut initial :", result["status"])
+                    st.json(result["job"])
+                    if not ann_job_dry_run:
+                        st.success("Job annotation_photos_batch déposé. Streamlit n'attend pas la fin du traitement.")
+                except Exception as e:
+                    st.error(f"Soumission impossible : {e}")
+
+        st.markdown("### 3. Impression du rapport")
+        report_mode = st.radio(
+            "Mode",
+            ["provisoire", "valide"],
+            horizontal=True,
+            key="ann_photos_report_mode",
+        )
+        report_filter = st.radio(
+            "Filtre",
+            ["uniquement photos retenues", "toutes les photos"],
+            horizontal=True,
+            key="ann_photos_report_filter",
+        )
+        report_preview = _photo_report_job_preview(
+            id_affaire=ann_id_affaire,
+            id_captation=ann_id_captation,
+            infos_pcfixe=ann_paths["pcfixe_infos"],
+            mode=report_mode,
+            only_retenue=report_filter == "uniquement photos retenues",
+        )
+        st.warning("Support spooler serveur requis avant exécution réelle.")
+        if st.button("Préparer le job rapport Word (dry-run)", key="ann_photos_report_dry_run"):
+            st.write("job_id :", report_preview["job"]["job_id"])
+            st.write("chemin JSON prévu :", report_preview["job_path"])
+            st.write("statut initial :", report_preview["status"])
+            st.json(report_preview)
+        st.caption(
+            "Aucun JSON n'est déposé et aucun traitement long n'est lancé depuis Streamlit "
+            "tant que le type de job serveur n'existe pas."
+        )
 
 elif page == "Historique Q&A":
     st.subheader("🗂️ Historique Q&A — projet courant")
