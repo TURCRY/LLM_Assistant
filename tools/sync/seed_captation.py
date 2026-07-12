@@ -19,6 +19,7 @@ from typing import Any
 
 
 DEFAULT_ROOT_DST_NAS = r"\\192.168.1.20\Affaires"
+DEFAULT_ROOT_PCFIXE = rf"\\{os.getenv('PCFIXE_SMB_HOST_VPN', '10.0.1.10')}\Affaires"
 DEFAULT_MODE = "FULL"
 BACKEND_LABEL = "run_all_from_jpg_v5"
 
@@ -120,12 +121,15 @@ def validate_inputs(args: argparse.Namespace, bat_path: Path) -> dict[str, Any]:
         warnings.append(f"--photos-csv-path introuvable: {photos_csv}")
 
     root_dst = args.root_dst.strip()
+    root_pcfixe = args.root_pcfixe.strip()
     mode = args.mode.strip().upper()
     if root_dst and root_dst != DEFAULT_ROOT_DST_NAS:
         warnings.append(
             "--root-dst est conserve pour compatibilite UI, mais le backend v5 "
             "utilise ses racines operationnelles internes."
         )
+    if not root_pcfixe:
+        warnings.append("--root-pcfixe absent; le backend utilisera ses valeurs internes si elles existent.")
     if mode not in {"FULL", "NAS", "PCFIXE"}:
         warnings.append("--mode non standard; valeurs attendues: FULL, NAS, PCFIXE")
     elif mode in {"NAS", "PCFIXE"}:
@@ -143,11 +147,11 @@ def validate_inputs(args: argparse.Namespace, bat_path: Path) -> dict[str, Any]:
         "backend_label": BACKEND_LABEL,
         "backend_bat": str(bat_path),
         "root_dst_ui": root_dst,
+        "root_pcfixe_ui": root_pcfixe,
         "mode_ui": mode,
         "operational_roots": {
-            "nas": r"\\192.168.1.20\Affaires",
-            "pcfixe_wifi": r"\\192.168.0.155\Affaires",
-            "pcfixe_rj45": r"\\192.168.0.120\Affaires",
+            "nas": root_dst or DEFAULT_ROOT_DST_NAS,
+            "pcfixe": root_pcfixe or DEFAULT_ROOT_PCFIXE,
         },
     }
 
@@ -169,6 +173,11 @@ def main() -> int:
         "--root-dst",
         default=DEFAULT_ROOT_DST_NAS,
         help=r"Valeur UI historique. Backend v5: racines operationnelles internes.",
+    )
+    parser.add_argument(
+        "--root-pcfixe",
+        default=os.getenv("PCFIXE_AFFAIRES_UNC_ROOT", DEFAULT_ROOT_PCFIXE),
+        help=r"Racine SMB du miroir PC fixe resolue par l'UI. Ex: \\10.0.1.10\Affaires",
     )
     parser.add_argument(
         "--mode",
@@ -212,6 +221,11 @@ def main() -> int:
     write_jsonl_line(log_path, start_evt)
 
     try:
+        child_env = os.environ.copy()
+        child_env["ROOT_DST"] = preflight["operational_roots"]["nas"]
+        child_env["ROOT_DST_NAS"] = preflight["operational_roots"]["nas"]
+        child_env["ROOT_PCFIXE"] = preflight["operational_roots"]["pcfixe"]
+        child_env["PCFIXE_AFFAIRES_UNC_ROOT"] = preflight["operational_roots"]["pcfixe"]
         proc = subprocess.run(
             command,
             cwd=preflight["cwd"],
@@ -219,6 +233,7 @@ def main() -> int:
             text=True,
             timeout=timeout_s,
             shell=False,
+            env=child_env,
         )
         rc = proc.returncode
         out = proc.stdout or ""
