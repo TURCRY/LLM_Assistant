@@ -227,23 +227,8 @@ def probe_pcfixe_affaires_shares(require_jobs_queue: bool = True) -> list[dict]:
             "ok": False,
             "status": "Indisponible",
             "detail": "",
+            "network_context": "VPN actif" if vpn_active else "VPN inactif",
         }
-        if host in {"192.168.0.120", "192.168.0.155"} and vpn_active:
-            row.update({
-                "tested": False,
-                "status": "Non testé",
-                "detail": "VPN OpenVPN actif",
-            })
-            rows.append(row)
-            continue
-        if host == "10.0.1.10" and not vpn_active:
-            row.update({
-                "tested": False,
-                "status": "Non testé",
-                "detail": "VPN OpenVPN inactif",
-            })
-            rows.append(row)
-            continue
         try:
             root_ok, root_detail = _test_path_with_timeout(root)
             queue_ok, queue_detail = _test_path_with_timeout(queue) if root_ok else (False, "")
@@ -263,13 +248,36 @@ def probe_pcfixe_affaires_shares(require_jobs_queue: bool = True) -> list[dict]:
     return rows
 
 
+def _format_pcfixe_share_probe_results(probes: list[dict], *, require_jobs_queue: bool = True) -> str:
+    lines = []
+    for row in probes:
+        root = row.get("root") or ""
+        status = row.get("status") or "Indisponible"
+        root_ok = "oui" if row.get("root_accessible") else "non"
+        queue_ok = "oui" if row.get("queue_ready") else "non"
+        detail = row.get("detail") or ""
+        if require_jobs_queue:
+            lines.append(f"- {root} : {status} ; racine={root_ok} ; _jobs\\queued={queue_ok} ; {detail}")
+        else:
+            lines.append(f"- {root} : {status} ; racine={root_ok} ; {detail}")
+    return "\n".join(lines)
+
+
+def _raise_no_pcfixe_affaires_share(probes: list[dict], *, require_jobs_queue: bool = True) -> None:
+    wanted = "racine SMB PC fixe avec _jobs\\queued" if require_jobs_queue else "racine SMB PC fixe"
+    details = _format_pcfixe_share_probe_results(probes, require_jobs_queue=require_jobs_queue)
+    raise FileNotFoundError(
+        f"Aucune {wanted} accessible. Aucun fallback non vérifié ne sera utilisé.\n"
+        f"Racines testées :\n{details}"
+    )
+
+
 def resolve_pcfixe_affaires_share(require_jobs_queue: bool = True) -> tuple[Path, list[dict]]:
     probes = probe_pcfixe_affaires_shares(require_jobs_queue=require_jobs_queue)
     for row in probes:
         if row.get("ok"):
             return Path(str(row["root"])), probes
-    configured = get_pcfixe_share_path_resolved("Affaires", resolve_accessible=False)
-    return configured, probes
+    _raise_no_pcfixe_affaires_share(probes, require_jobs_queue=require_jobs_queue)
 
 
 def get_pcfixe_share_path(share: str, *parts: str) -> Path:
@@ -322,27 +330,25 @@ def get_nas_affaires_root() -> Path:
 def validate_pcfixe_smb_path(path: str | Path) -> None:
     raw = str(path or "")
     raw_lower = raw.lower()
-    if _pcfixe_vpn_active() and (
-        raw_lower.startswith(r"\\192.168.0.120")
-        or raw_lower.startswith(r"\\192.168.0.155")
-    ):
-        raise RuntimeError(f"Chemin SMB LAN interdit lorsque le VPN est actif : {raw}")
+    if raw_lower.startswith(r"\\10.0.1.1"):
+        raise RuntimeError(f"10.0.1.1 est le NAS/VPN, pas un partage SMB PC fixe : {raw}")
 
 
 def preflight_pcfixe_target_dir(target_dir: str | Path) -> dict:
     target = Path(target_dir)
     validate_pcfixe_smb_path(target)
-    root = get_pcfixe_affaires_root()
+    root, probes = resolve_pcfixe_affaires_share(require_jobs_queue=False)
     info = {
-        "smb_host": get_pcfixe_smb_host(),
+        "smb_host": str(root).strip("\\").split("\\", 1)[0],
         "share_root": str(root),
         "target_dir": str(target),
         "share_accessible": False,
         "target_ready": False,
+        "probes": probes,
     }
-    info["share_accessible"] = root.exists()
+    info["share_accessible"] = any(row.get("ok") and str(row.get("root")) == str(root) for row in probes)
     if not info["share_accessible"]:
-        raise FileNotFoundError(f"Partage PC fixe inaccessible : {root}")
+        _raise_no_pcfixe_affaires_share(probes, require_jobs_queue=False)
     target.mkdir(parents=True, exist_ok=True)
     info["target_ready"] = target.exists() and target.is_dir()
     if not info["target_ready"]:
@@ -418,7 +424,7 @@ NAS_AFFAIRES_ROOT = get_nas_affaires_root()
 ROOT_DST_DEFAULT = str(NAS_AFFAIRES_ROOT)
 AFFAIRES_ROOT = Path(r"C:\Affaires")
 AUDIO_VOXTRAL_TOOL_DIR = Path(__file__).resolve().parent / "tools" / "audio_voxtral"
-PCFIXE_AFFAIRES_UNC_ROOT = get_pcfixe_affaires_root()
+PCFIXE_AFFAIRES_UNC_ROOT = get_pcfixe_share_path_resolved("Affaires", resolve_accessible=False)
 ASR_JOBS_UNC_ROOT = PCFIXE_AFFAIRES_UNC_ROOT / "_jobs"
 PCFIXE_AFFAIRES_ROOT = Path(r"C:\Affaires")
 PCFIXE_BOOST_FILE = Path(r"D:\GPT4All_Local\config\boost_vocab.txt")
@@ -5705,6 +5711,7 @@ def submit_asr_v2_job(
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     job_id = f"asr_{id_affaire}_{id_captation}_{stamp}_{uuid.uuid4().hex[:8]}"
+    pcfixe_unc_root = get_pcfixe_affaires_root()
     pc_audio_dir = (
         PCFIXE_AFFAIRES_ROOT / id_affaire / "AE_Expert_captations" / id_captation / "audio"
     )
@@ -5714,13 +5721,13 @@ def submit_asr_v2_job(
         PCFIXE_AFFAIRES_ROOT / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation
     )
     unc_audio_dir = (
-        PCFIXE_AFFAIRES_UNC_ROOT
+        pcfixe_unc_root
         / id_affaire / "AE_Expert_captations" / id_captation / "audio"
     )
     if audio_target_dir_unc:
         unc_audio_dir = Path(audio_target_dir_unc)
     unc_trans_dir = (
-        PCFIXE_AFFAIRES_UNC_ROOT
+        pcfixe_unc_root
         / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation
     )
 
@@ -6110,15 +6117,16 @@ def _safe_job_token(value: str) -> str:
 def _annotation_canonical_paths(id_affaire: str, id_captation: str) -> dict[str, Path]:
     rel = Path(id_affaire) / "AF_Expert_ASR" / "transcriptions" / id_captation
     out_rel = Path(id_affaire) / "BE_Traitement_captations" / id_captation / "compte_rendu_LLM"
+    pcfixe_unc_root = get_pcfixe_affaires_root()
     return {
         "nas_trans_dir": NAS_AFFAIRES_ROOT / rel,
         "nas_infos": NAS_AFFAIRES_ROOT / rel / "infos_projet.json",
         "pcfixe_trans_dir": PCFIXE_AFFAIRES_ROOT / rel,
         "pcfixe_infos": PCFIXE_AFFAIRES_ROOT / rel / "infos_projet.json",
-        "pcfixe_unc_trans_dir": PCFIXE_AFFAIRES_UNC_ROOT / rel,
-        "pcfixe_unc_infos": PCFIXE_AFFAIRES_UNC_ROOT / rel / "infos_projet.json",
+        "pcfixe_unc_trans_dir": pcfixe_unc_root / rel,
+        "pcfixe_unc_infos": pcfixe_unc_root / rel / "infos_projet.json",
         "pcfixe_report_dir": PCFIXE_AFFAIRES_ROOT / out_rel,
-        "pcfixe_report_unc_dir": PCFIXE_AFFAIRES_UNC_ROOT / out_rel,
+        "pcfixe_report_unc_dir": pcfixe_unc_root / out_rel,
         "nas_report_dir": NAS_AFFAIRES_ROOT / out_rel,
     }
 
@@ -9254,7 +9262,7 @@ elif page == "Voxtral (ASR / CR)":
             unc_debrief_audio_dir = (
                 pcfixe_server_path_to_unc(project_config, affaire_id, str(pc_debrief_audio_dir))
                 or str(
-                    PCFIXE_AFFAIRES_UNC_ROOT
+                    get_pcfixe_affaires_root()
                     / affaire_id
                     / "AF_Expert_ASR"
                     / "transcriptions"
