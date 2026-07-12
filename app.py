@@ -163,19 +163,26 @@ def _pcfixe_vpn_active() -> bool:
 
 
 PCFIXE_AFFAIRES_SHARE_CANDIDATES = (
-    r"\\192.168.0.120\Affaires",
     r"\\192.168.0.155\Affaires",
     r"\\10.0.1.10\Affaires",
 )
 PCFIXE_SMB_TEST_TIMEOUT_SECONDS = float(os.getenv("PCFIXE_SMB_TEST_TIMEOUT_SECONDS", "2.5"))
 
 
+def _sanitize_pcfixe_smb_host(host: str, fallback: str) -> str:
+    value = str(host or "").strip() or fallback
+    if value == "192.168.0.120":
+        print("[SMB] 192.168.0.120 ignoré pour les partages SMB ; utilisation de " + fallback)
+        return fallback
+    return value
+
+
 def get_pcfixe_smb_host() -> str:
     # Variables optionnelles .env :
-    # PCFIXE_SMB_HOST_LAN=192.168.0.120, PCFIXE_SMB_HOST_VPN=10.0.1.10
+    # PCFIXE_SMB_HOST_LAN=192.168.0.155, PCFIXE_SMB_HOST_VPN=10.0.1.10
     if _pcfixe_vpn_active():
-        return os.getenv("PCFIXE_SMB_HOST_VPN", "10.0.1.10").strip() or "10.0.1.10"
-    return os.getenv("PCFIXE_SMB_HOST_LAN", "192.168.0.120").strip() or "192.168.0.120"
+        return _sanitize_pcfixe_smb_host(os.getenv("PCFIXE_SMB_HOST_VPN", "10.0.1.10"), "10.0.1.10")
+    return _sanitize_pcfixe_smb_host(os.getenv("PCFIXE_SMB_HOST_LAN", "192.168.0.155"), "192.168.0.155")
 
 
 def _test_path_with_timeout(path: str | Path, timeout_seconds: float = PCFIXE_SMB_TEST_TIMEOUT_SECONDS) -> tuple[bool, str]:
@@ -284,6 +291,23 @@ def get_pcfixe_share_path(share: str, *parts: str) -> Path:
     return get_pcfixe_share_path_resolved(share, *parts)
 
 
+def _pcfixe_smb_host_candidates() -> list[str]:
+    preferred = [get_pcfixe_smb_host()]
+    preferred.extend(["192.168.0.155", "10.0.1.10"])
+    out: list[str] = []
+    seen: set[str] = set()
+    for host in preferred:
+        host = _sanitize_pcfixe_smb_host(host, "192.168.0.155")
+        if host == "192.168.0.120":
+            continue
+        key = host.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(host)
+    return out
+
+
 def get_pcfixe_share_path_resolved(share: str, *parts: str, resolve_accessible: bool = True) -> Path:
     share_name = str(share or "").strip().strip("\\/")
     if not share_name:
@@ -291,6 +315,12 @@ def get_pcfixe_share_path_resolved(share: str, *parts: str, resolve_accessible: 
     if share_name.casefold() == "affaires" and resolve_accessible:
         root, _ = resolve_pcfixe_affaires_share(require_jobs_queue=False)
         return root.joinpath(*[str(p) for p in parts if str(p)])
+    if resolve_accessible:
+        for host in _pcfixe_smb_host_candidates():
+            root = Path(rf"\\{host}\{share_name}")
+            root_ok, _ = _test_path_with_timeout(root)
+            if root_ok:
+                return root.joinpath(*[str(p) for p in parts if str(p)])
     return Path(rf"\\{get_pcfixe_smb_host()}\{share_name}").joinpath(*[str(p) for p in parts if str(p)])
 
 
@@ -304,6 +334,8 @@ def remap_pcfixe_unc_path(path: str | Path) -> str:
     host = parts[0].lower()
     if host not in {"192.168.0.120", "192.168.0.155", "10.0.1.10"}:
         return raw
+    if host == "192.168.0.120":
+        print(f"[SMB] chemin legacy {raw} remappé vers un partage PC fixe accessible")
     return str(get_pcfixe_share_path(parts[1], *parts[2:]))
 
 
@@ -321,6 +353,11 @@ def get_pcfixe_jobs_root() -> Path:
     return root / "_jobs"
 
 
+def get_pcfixe_jobs_logs_dir() -> Path:
+    root, _ = resolve_pcfixe_affaires_share(require_jobs_queue=True)
+    return root / "_jobs" / "logs"
+
+
 def get_nas_affaires_root() -> Path:
     # Variable optionnelle .env : NAS_AFFAIRES_HOST=192.168.1.20
     host = os.getenv("NAS_AFFAIRES_HOST", "192.168.1.20").strip() or "192.168.1.20"
@@ -329,8 +366,9 @@ def get_nas_affaires_root() -> Path:
 
 def validate_pcfixe_smb_path(path: str | Path) -> None:
     raw = str(path or "")
-    raw_lower = raw.lower()
-    if raw_lower.startswith(r"\\10.0.1.1"):
+    parts = [part for part in raw.strip("\\").split("\\") if part]
+    host = parts[0].lower() if parts else ""
+    if host == "10.0.1.1":
         raise RuntimeError(f"10.0.1.1 est le NAS/VPN, pas un partage SMB PC fixe : {raw}")
 
 
@@ -482,10 +520,77 @@ PROJETS_INDEX_PATH = os.getenv(
     "PROJETS_INDEX_PATH",
     r"C:\LLM_Assistant\config\projets_index.json"
 )
-SERVER_PROJETS_INDEX_PATH = remap_pcfixe_unc_path(os.getenv(
-    "SERVER_PROJETS_INDEX_PATH",
-    str(get_pcfixe_share_path("GPT4all_local", "config", "projets_index.json"))
-))
+SERVER_PROJETS_INDEX_PROBES: list[dict] = []
+SERVER_PROJETS_INDEX_WARNING = ""
+
+def _unc_host(path: str | Path) -> str:
+    raw = str(path or "").strip()
+    if not raw.startswith("\\\\"):
+        return ""
+    parts = [part for part in raw.strip("\\").split("\\") if part]
+    return parts[0].lower() if parts else ""
+
+def _probe_projects_index_candidate(path: str | Path, label: str) -> tuple[str, dict]:
+    raw = str(path or "").strip().strip('"')
+    candidate = Path(raw)
+    probe = {
+        "source": label,
+        "chemin": str(candidate),
+        "etat": "non teste",
+        "detail": "",
+    }
+    if _unc_host(candidate) == "192.168.0.120":
+        probe["etat"] = "refuse"
+        probe["detail"] = r"\\192.168.0.120\GPT4All_Local n'est pas une racine SMB autorisee pour l'index serveur."
+        return "", probe
+    try:
+        if candidate.is_file():
+            probe["etat"] = "disponible"
+            probe["detail"] = "projets_index.json present"
+            return str(candidate), probe
+        probe["etat"] = "indisponible"
+        probe["detail"] = "fichier absent ou partage inaccessible"
+    except Exception as exc:
+        probe["etat"] = "erreur"
+        probe["detail"] = str(exc)
+    return "", probe
+
+def resolve_server_projects_index_path() -> str:
+    global SERVER_PROJETS_INDEX_PROBES, SERVER_PROJETS_INDEX_WARNING
+    preferred_roots = (
+        [r"\\10.0.1.10\GPT4All_Local", r"\\192.168.0.155\GPT4All_Local"]
+        if _pcfixe_vpn_active()
+        else [r"\\192.168.0.155\GPT4All_Local", r"\\10.0.1.10\GPT4All_Local"]
+    )
+    candidates: list[tuple[str, Path]] = []
+    explicit = os.getenv("SERVER_PROJETS_INDEX_PATH", "").strip().strip('"')
+    if explicit:
+        candidates.append(("SERVER_PROJETS_INDEX_PATH", Path(explicit)))
+    for root in preferred_roots:
+        candidates.append((f"{root}", Path(root) / "config" / "projets_index.json"))
+
+    probes: list[dict] = []
+    seen: set[str] = set()
+    for label, candidate in candidates:
+        key = str(candidate).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        resolved, probe = _probe_projects_index_candidate(candidate, label)
+        probes.append(probe)
+        if resolved:
+            SERVER_PROJETS_INDEX_PROBES = probes
+            SERVER_PROJETS_INDEX_WARNING = ""
+            return resolved
+
+    SERVER_PROJETS_INDEX_PROBES = probes
+    SERVER_PROJETS_INDEX_WARNING = (
+        "Index projets serveur inaccessible : utilisation du fallback local "
+        f"{PROJETS_INDEX_PATH}. Les libelles d'affaires peuvent etre incomplets ou obsoletes."
+    )
+    return ""
+
+SERVER_PROJETS_INDEX_PATH = resolve_server_projects_index_path()
 # Racine des données (miroir NAS sur PC fixe ; Laptop via Syncthing sélectif)
 
 def iter_project_config_candidates(project_id: str, projets_index_path: str | None = None):
@@ -558,6 +663,18 @@ def read_projects_index(path: str | Path) -> list[dict]:
         return []
     return data if isinstance(data, list) else []
 
+def _warn_server_projects_index_fallback_once() -> None:
+    if not SERVER_PROJETS_INDEX_WARNING:
+        return
+    key = "_server_projects_index_fallback_warning"
+    try:
+        if st.session_state.get(key) == SERVER_PROJETS_INDEX_WARNING:
+            return
+        st.warning(SERVER_PROJETS_INDEX_WARNING)
+        st.session_state[key] = SERVER_PROJETS_INDEX_WARNING
+    except Exception:
+        st.warning(SERVER_PROJETS_INDEX_WARNING)
+
 def project_index_sources() -> list[tuple[str, list[dict]]]:
     sources = []
     seen = set()
@@ -565,12 +682,16 @@ def project_index_sources() -> list[tuple[str, list[dict]]]:
         ("serveur", SERVER_PROJETS_INDEX_PATH),
         ("local", PROJETS_INDEX_PATH),
     ):
+        if not path:
+            continue
         key = str(path).lower()
         if key in seen:
             continue
         seen.add(key)
         items = read_projects_index(path)
         if items:
+            if label == "local" and not sources and SERVER_PROJETS_INDEX_WARNING:
+                _warn_server_projects_index_fallback_once()
             sources.append((label, items))
     return sources
 
@@ -6116,6 +6237,7 @@ def _safe_job_token(value: str) -> str:
 
 def _annotation_canonical_paths(id_affaire: str, id_captation: str) -> dict[str, Path]:
     rel = Path(id_affaire) / "AF_Expert_ASR" / "transcriptions" / id_captation
+    photos_rel = Path(id_affaire) / "AE_Expert_captations" / id_captation / "photos"
     out_rel = Path(id_affaire) / "BE_Traitement_captations" / id_captation / "compte_rendu_LLM"
     pcfixe_unc_root = get_pcfixe_affaires_root()
     return {
@@ -6125,6 +6247,9 @@ def _annotation_canonical_paths(id_affaire: str, id_captation: str) -> dict[str,
         "pcfixe_infos": PCFIXE_AFFAIRES_ROOT / rel / "infos_projet.json",
         "pcfixe_unc_trans_dir": pcfixe_unc_root / rel,
         "pcfixe_unc_infos": pcfixe_unc_root / rel / "infos_projet.json",
+        "pcfixe_unc_photos_dir": pcfixe_unc_root / photos_rel,
+        "pcfixe_unc_photos": pcfixe_unc_root / photos_rel / "photos.csv",
+        "pcfixe_unc_photos_batch": pcfixe_unc_root / photos_rel / "photos_batch.csv",
         "pcfixe_report_dir": PCFIXE_AFFAIRES_ROOT / out_rel,
         "pcfixe_report_unc_dir": pcfixe_unc_root / out_rel,
         "nas_report_dir": NAS_AFFAIRES_ROOT / out_rel,
@@ -6168,6 +6293,92 @@ def _annotation_resource_paths(infos_path: Path, infos: dict) -> dict[str, Path]
         "photos_batch.csv": photos_batch_path,
     }
 
+def _annotation_pcfixe_required_resources(paths: dict[str, Path]) -> dict[str, Path]:
+    base = paths["pcfixe_unc_trans_dir"]
+    return {
+        "infos_projet.json": paths["pcfixe_unc_infos"],
+        "config_llm.json": base / "config_llm.json",
+        "prompt_gpt.json": base / "prompt_gpt.json",
+        "prompt_gpt_batch_only.json": base / "prompt_gpt_batch_only.json",
+        "contexte_general.json": base / "contexte_general.json",
+        "contexte_general_photos.json": base / "contexte_general_photos.json",
+        "photos.csv": paths["pcfixe_unc_photos"],
+        "photos_batch.csv": paths["pcfixe_unc_photos_batch"],
+    }
+
+def _assert_annotation_pcfixe_resources_ready(id_affaire: str, id_captation: str) -> dict[str, Path]:
+    paths = _annotation_canonical_paths(id_affaire, id_captation)
+    required = _annotation_pcfixe_required_resources(paths)
+    missing = [f"{name} : {path}" for name, path in required.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Job annotation_photos_batch bloqué : ressources PC fixe manquantes ou inaccessibles.\n"
+            + "\n".join(missing)
+        )
+    return required
+
+def _read_text_excerpt(path: Path, limit: int = 4000) -> str:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    return text[-limit:] if len(text) > limit else text
+
+def _first_existing_log(logs_dir: Path, safe_job_id: str, suffixes: tuple[str, ...]) -> Path | None:
+    for suffix in suffixes:
+        matches = sorted(
+            logs_dir.glob(f"*{safe_job_id}*{suffix}"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if matches:
+            return matches[0]
+    return None
+
+def _job_failure_details(job_id: str) -> dict[str, str]:
+    safe_job_id = _safe_job_token(job_id)
+    details = {
+        "exit_code": "",
+        "stderr_excerpt": "",
+        "manifest_path": "",
+        "stdout_path": "",
+        "stderr_path": "",
+        "command_path": "",
+    }
+    if not safe_job_id:
+        return details
+    try:
+        logs_dir = get_pcfixe_jobs_logs_dir()
+    except Exception:
+        return details
+    if not logs_dir.exists():
+        return details
+    manifest = _first_existing_log(logs_dir, safe_job_id, (".manifest.json", "manifest.json"))
+    stdout = _first_existing_log(logs_dir, safe_job_id, (".stdout.log", "stdout.log"))
+    stderr = _first_existing_log(logs_dir, safe_job_id, (".stderr.log", "stderr.log"))
+    command = _first_existing_log(logs_dir, safe_job_id, (".command.txt", "command.txt"))
+    exitcode = _first_existing_log(logs_dir, safe_job_id, (".exitcode.txt", "exitcode.txt"))
+    details.update({
+        "manifest_path": str(manifest or ""),
+        "stdout_path": str(stdout or ""),
+        "stderr_path": str(stderr or ""),
+        "command_path": str(command or ""),
+    })
+    if exitcode:
+        details["exit_code"] = _read_text_excerpt(exitcode, 200).strip()
+    if stderr:
+        details["stderr_excerpt"] = _read_text_excerpt(stderr)
+    if manifest and not details["exit_code"]:
+        manifest_data = load_json(str(manifest), {})
+        if isinstance(manifest_data, dict):
+            details["exit_code"] = str(
+                manifest_data.get("exit_code")
+                or manifest_data.get("returncode")
+                or manifest_data.get("return_code")
+                or ""
+            )
+    return details
+
 def _copy_exact_file(source: str | Path, target: Path, *, overwrite: bool = False) -> None:
     src = Path(str(source).strip().strip('"'))
     if not src.is_file():
@@ -6194,6 +6405,12 @@ def _annotation_job_details(id_affaire: str, id_captation: str) -> dict[str, dic
             "annotated_photos": "",
             "remaining_photos": "",
             "weak_photos": "",
+            "exit_code": "",
+            "stderr_excerpt": "",
+            "manifest_path": "",
+            "stdout_path": "",
+            "stderr_path": "",
+            "command_path": "",
         }
         for key in PHOTO_BATCH_ACTIONS
     }
@@ -6223,6 +6440,7 @@ def _annotation_job_details(id_affaire: str, id_captation: str) -> dict[str, dic
                 result = job.get("result") if isinstance(job.get("result"), dict) else {}
                 summary = job.get("summary") if isinstance(job.get("summary"), dict) else {}
                 counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
+                failure = _job_failure_details(str(job.get("job_id") or job_file.stem)) if state == "failed" else {}
                 details[action_key] = {
                     "status": state,
                     "job_id": str(job.get("job_id") or job_file.stem),
@@ -6264,6 +6482,12 @@ def _annotation_job_details(id_affaire: str, id_captation: str) -> dict[str, dic
                         or counts.get("weak")
                         or ""
                     ),
+                    "exit_code": str(failure.get("exit_code") or ""),
+                    "stderr_excerpt": str(failure.get("stderr_excerpt") or ""),
+                    "manifest_path": str(failure.get("manifest_path") or ""),
+                    "stdout_path": str(failure.get("stdout_path") or ""),
+                    "stderr_path": str(failure.get("stderr_path") or ""),
+                    "command_path": str(failure.get("command_path") or ""),
                 }
     return details
 
@@ -6315,6 +6539,7 @@ def submit_annotation_photos_batch_job(
     }
     if dry_run:
         return result
+    _assert_annotation_pcfixe_resources_ready(id_affaire, id_captation)
     preflight_pcfixe_target_dir(queued_path.parent)
     tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -7202,9 +7427,68 @@ def _pcfixe_probe_rows(probes: list[dict]) -> list[dict]:
             "Endpoint": item.get("url") or "",
             "État": item.get("status") or "Non testé",
             "Détail": item.get("detail") or "",
-            "Temps (ms)": item.get("elapsed_ms") if item.get("elapsed_ms") is not None else "",
+            "Temps (ms)": str(item.get("elapsed_ms")) if item.get("elapsed_ms") is not None else "",
         })
     return rows
+
+
+def _render_pcfixe_network_snapshot(*, key_prefix: str, expanded: bool = False) -> None:
+    with st.expander("Localisation réseau PC fixe", expanded=expanded):
+        vpn_active = _pcfixe_vpn_active()
+        probes = _pcfixe_contextual_probes()
+        reachable = [item for item in probes if item.get("ok")]
+        vpn_reachable = any(
+            item.get("ok") and item.get("url", "").startswith("http://10.0.1.10:")
+            for item in probes
+        )
+        lan_reachable = any(
+            item.get("ok") and (
+                item.get("url", "").startswith("http://192.168.0.120:")
+                or item.get("url", "").startswith("http://192.168.0.155:")
+            )
+            for item in probes
+        )
+        try:
+            smb_root, smb_probes = resolve_pcfixe_affaires_share(require_jobs_queue=True)
+            smb_error = ""
+        except Exception as exc:
+            smb_root = Path("")
+            smb_probes = probe_pcfixe_affaires_shares(require_jobs_queue=True)
+            smb_error = str(exc)
+
+        col_net = st.columns(4)
+        with col_net[0]:
+            st.metric("VPN laptop", "actif" if vpn_active else "inactif")
+        with col_net[1]:
+            st.metric("Endpoint Flask", SERVER_URL)
+        with col_net[2]:
+            st.metric("Racine SMB accessible", str(smb_root) or "aucune")
+        with col_net[3]:
+            st.metric("Endpoint VPN seul", "oui" if vpn_reachable and not lan_reachable else "non")
+
+        st.caption(
+            "L’endpoint Flask et la racine SMB sont résolus séparément. "
+            "Aucune racine SMB n’est construite depuis l’IP Flask."
+        )
+        st.dataframe(_pcfixe_probe_rows(probes), width="stretch", hide_index=True)
+        st.dataframe(
+            [
+                {
+                    "racine SMB": row.get("root", ""),
+                    "racine": "oui" if row.get("root_accessible") else "non",
+                    "_jobs\\queued": "oui" if row.get("queue_ready") else "non",
+                    "résultat": row.get("status", ""),
+                    "détail": row.get("detail", ""),
+                }
+                for row in smb_probes
+            ],
+            width="stretch",
+            hide_index=True,
+        )
+        if smb_error:
+            st.warning(smb_error)
+        if reachable:
+            st.write("Endpoints Flask joignables :", ", ".join(item.get("url", "") for item in reachable))
 
 
 def _pcfixe_status_value(payload: dict, *keys: str):
@@ -8831,11 +9115,12 @@ elif page == "OCR & Conversions":
 
 elif page == "Voxtral (ASR / CR)":
     st.subheader("🎙️ Voxtral")
+    _render_pcfixe_network_snapshot(key_prefix="voxtral_network", expanded=False)
 
     # Chemins projet depuis la config
     proj_pcfixe = (project_config.get("roots") or {}).get("pcfixe") or ""
     affaire_id = selection if selection != "➕ Créer une nouvelle affaire…" else get_project_id(project_config, "")
-    st.text_input("Affaire active", value=affaire_id, disabled=True, key="voxtral_active_affaire_display")
+    st.text_input("Affaire active", value=affaire_id, disabled=True, key=f"voxtral_active_affaire_display_{affaire_id}")
     proj_laptop = pj(AFFAIRES_ROOT, affaire_id)
 
     pcfixe_root = proj_pcfixe
@@ -9469,7 +9754,7 @@ elif page == "Voxtral (ASR / CR)":
         if cr_mode == "Affaire / captation":
             st.markdown("### 🧾 Compte-rendu métier via spooler")
             cr_affaire_id = affaire_id
-            st.text_input("id_affaire", value=cr_affaire_id, disabled=True, key="cr_job_id_affaire_display")
+            st.text_input("id_affaire", value=cr_affaire_id, disabled=True, key=f"cr_job_id_affaire_display_{cr_affaire_id}")
             cr_captations = list_captations(cr_affaire_id) if cr_affaire_id else []
             cr_captation_values = [c["id_captation"] for c in cr_captations]
             cr_captation_options = cr_captation_values or ["(aucune)"]
@@ -9502,7 +9787,12 @@ elif page == "Voxtral (ASR / CR)":
                 cr_infos_path = st.text_input("infos_projet.json", value=cr_infos_default, key="cr_job_infos_manual").strip().strip('"')
             else:
                 cr_infos_path = cr_infos_default
-                st.text_input("infos_projet.json déduit", value=cr_infos_path, disabled=True, key="cr_job_infos_auto")
+                st.text_input(
+                    "infos_projet.json déduit",
+                    value=cr_infos_path,
+                    disabled=True,
+                    key=f"cr_job_infos_auto_{cr_affaire_id}_{cr_id_captation}",
+                )
 
             cr_infos = load_json(cr_infos_path, {}) if cr_infos_path and Path(cr_infos_path).is_file() else {}
             cr_pcfixe = cr_infos.get("pcfixe", {}) if isinstance(cr_infos.get("pcfixe"), dict) else {}
@@ -9559,7 +9849,7 @@ elif page == "Voxtral (ASR / CR)":
                 "Dossier canonique proposé",
                 value=str(debrief_csv_default_dir or ""),
                 disabled=True,
-                key="cr_debrief_csv_canonical_dir",
+                key=f"cr_debrief_csv_canonical_dir_{cr_affaire_id}_{cr_id_captation}",
             )
             debrief_csv_custom_dir = st.text_input(
                 "Dossier contenant les CSV de debrief",
@@ -10164,6 +10454,7 @@ elif page == "Annotation photos / Rapport Word":
         )
 
         ann_resources = _annotation_resource_paths(ann_infos_path, ann_infos if isinstance(ann_infos, dict) else {})
+        ann_pcfixe_resources = _annotation_pcfixe_required_resources(ann_paths)
         ann_job_details = _annotation_job_details(ann_id_affaire, ann_id_captation)
         ann_job_statuses = {key: value.get("status", "absent") for key, value in ann_job_details.items()}
         ann_report_files = []
@@ -10204,6 +10495,19 @@ elif page == "Annotation photos / Rapport Word":
         ])
         st.markdown("#### Tableau d'état")
         st.dataframe(status_rows, width="stretch", hide_index=True)
+        st.markdown("#### Ressources PC fixe utilisées par le batch")
+        st.dataframe(
+            [
+                {
+                    "ressource": name,
+                    "état": "présent" if path.is_file() else "absent",
+                    "chemin laptop vers PC fixe": str(path),
+                }
+                for name, path in ann_pcfixe_resources.items()
+            ],
+            width="stretch",
+            hide_index=True,
+        )
         job_follow_rows = [
             {
                 "action": PHOTO_BATCH_ACTIONS[action_key]["status_label"],
@@ -10219,6 +10523,22 @@ elif page == "Annotation photos / Rapport Word":
         ]
         st.markdown("#### Suivi des jobs batch")
         st.dataframe(job_follow_rows, width="stretch", hide_index=True)
+        failed_details = [
+            detail for detail in ann_job_details.values()
+            if detail.get("status") == "failed" and detail.get("job_id")
+        ]
+        for detail in failed_details:
+            with st.expander(f"Détails échec job {detail.get('job_id')}", expanded=True):
+                st.write("exit code :", detail.get("exit_code") or "(non disponible)")
+                st.write("manifest.json :", detail.get("manifest_path") or "(non trouvé)")
+                st.write("stdout.log :", detail.get("stdout_path") or "(non trouvé)")
+                st.write("stderr.log :", detail.get("stderr_path") or "(non trouvé)")
+                st.write("command.txt :", detail.get("command_path") or "(non trouvé)")
+                stderr_excerpt = detail.get("stderr_excerpt") or ""
+                if stderr_excerpt:
+                    st.code(stderr_excerpt, language="text")
+                else:
+                    st.caption("Aucun contenu stderr.log disponible.")
         st.caption(
             "Les compteurs ne sont affichés que si le spooler ou le batch les écrit dans le JSON de job. "
             "Le batch PC fixe écrit aussi stdout et batch_all_photos_pcfixe.log, mais pas de JSON de synthèse dédié."
