@@ -31,7 +31,16 @@ import traceback
 import uuid
 import getpass
 from urllib.parse import urlparse
-from server_locator import resolve_flask_base_url, request_with_endpoint_fallback
+from server_locator import (
+    DEFAULT_FLASK_ENDPOINTS,
+    first_reachable_endpoint,
+    get_wifi_reconnect_status,
+    probe_flask_endpoint,
+    probe_pcfixe_endpoints,
+    resolve_flask_base_url,
+    request_with_endpoint_fallback,
+    trigger_wifi_reconnect,
+)
 
 try:
     from docx import Document
@@ -121,6 +130,226 @@ def _local_ip() -> str:
     except Exception:
         return socket.gethostbyname(socket.gethostname())
 
+def _pcfixe_vpn_adapter(
+    vpn_subnet: str = "10.0.1.0/24",
+    adapter_keywords=("tap", "wintun", "openvpn", "dco"),
+) -> tuple[bool, str, str]:
+    stats = psutil.net_if_stats()
+    addrs = psutil.net_if_addrs()
+    net = ipaddress.ip_network(vpn_subnet)
+    for name, lst in addrs.items():
+        if not any(k in name.lower() for k in adapter_keywords):
+            continue
+        st = stats.get(name)
+        if not st or not st.isup:
+            continue
+        v4 = [
+            item.address for item in lst
+            if item.family == socket.AF_INET and not item.address.startswith("169.254.")
+        ]
+        for ip in v4:
+            if ipaddress.ip_address(ip) in net:
+                return True, name, ip
+    return False, "", ""
+
+
+def _pcfixe_vpn_active() -> bool:
+    try:
+        active, _, _ = _pcfixe_vpn_adapter()
+        return active
+    except Exception as exc:
+        print(f"[VPN] Erreur détection contexte PC fixe : {exc}")
+        return False
+
+
+PCFIXE_AFFAIRES_SHARE_CANDIDATES = (
+    r"\\192.168.0.120\Affaires",
+    r"\\192.168.0.155\Affaires",
+    r"\\10.0.1.10\Affaires",
+)
+PCFIXE_SMB_TEST_TIMEOUT_SECONDS = float(os.getenv("PCFIXE_SMB_TEST_TIMEOUT_SECONDS", "2.5"))
+
+
+def get_pcfixe_smb_host() -> str:
+    # Variables optionnelles .env :
+    # PCFIXE_SMB_HOST_LAN=192.168.0.120, PCFIXE_SMB_HOST_VPN=10.0.1.10
+    if _pcfixe_vpn_active():
+        return os.getenv("PCFIXE_SMB_HOST_VPN", "10.0.1.10").strip() or "10.0.1.10"
+    return os.getenv("PCFIXE_SMB_HOST_LAN", "192.168.0.120").strip() or "192.168.0.120"
+
+
+def _test_path_with_timeout(path: str | Path, timeout_seconds: float = PCFIXE_SMB_TEST_TIMEOUT_SECONDS) -> tuple[bool, str]:
+    raw = str(path)
+    if os.name != "nt":
+        try:
+            return Path(raw).exists(), ""
+        except Exception as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+    ps_path = "'" + raw.replace("'", "''") + "'"
+    command = (
+        "$ErrorActionPreference='Stop'; "
+        f"if (Test-Path -LiteralPath {ps_path}) "
+        "{ Write-Output '1' } else { Write-Output '0' }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", command],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Timeout après {int(timeout_seconds * 1000)} ms"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    output = (result.stdout or "").strip()
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip() or f"exit {result.returncode}"
+        return False, detail
+    return output == "1", ""
+
+
+def probe_pcfixe_affaires_shares(require_jobs_queue: bool = True) -> list[dict]:
+    vpn_active = _pcfixe_vpn_active()
+    rows: list[dict] = []
+    for raw_root in PCFIXE_AFFAIRES_SHARE_CANDIDATES:
+        root = Path(raw_root)
+        host = raw_root.strip("\\").split("\\", 1)[0]
+        queue = root / "_jobs" / "queued"
+        row = {
+            "root": str(root),
+            "host": host,
+            "tested": True,
+            "root_accessible": False,
+            "queue_ready": False,
+            "ok": False,
+            "status": "Indisponible",
+            "detail": "",
+        }
+        if host in {"192.168.0.120", "192.168.0.155"} and vpn_active:
+            row.update({
+                "tested": False,
+                "status": "Non testé",
+                "detail": "VPN OpenVPN actif",
+            })
+            rows.append(row)
+            continue
+        if host == "10.0.1.10" and not vpn_active:
+            row.update({
+                "tested": False,
+                "status": "Non testé",
+                "detail": "VPN OpenVPN inactif",
+            })
+            rows.append(row)
+            continue
+        try:
+            root_ok, root_detail = _test_path_with_timeout(root)
+            queue_ok, queue_detail = _test_path_with_timeout(queue) if root_ok else (False, "")
+            row["root_accessible"] = root_ok
+            row["queue_ready"] = queue_ok
+            row["ok"] = bool(row["root_accessible"] and (row["queue_ready"] or not require_jobs_queue))
+            if row["ok"]:
+                row["status"] = "Disponible"
+                row["detail"] = "racine et queue accessibles" if require_jobs_queue else "racine accessible"
+            elif not row["root_accessible"]:
+                row["detail"] = root_detail or "racine inaccessible"
+            else:
+                row["detail"] = queue_detail or "_jobs\\queued absent ou inaccessible"
+        except Exception as exc:
+            row["detail"] = f"{type(exc).__name__}: {exc}"
+        rows.append(row)
+    return rows
+
+
+def resolve_pcfixe_affaires_share(require_jobs_queue: bool = True) -> tuple[Path, list[dict]]:
+    probes = probe_pcfixe_affaires_shares(require_jobs_queue=require_jobs_queue)
+    for row in probes:
+        if row.get("ok"):
+            return Path(str(row["root"])), probes
+    configured = get_pcfixe_share_path_resolved("Affaires", resolve_accessible=False)
+    return configured, probes
+
+
+def get_pcfixe_share_path(share: str, *parts: str) -> Path:
+    return get_pcfixe_share_path_resolved(share, *parts)
+
+
+def get_pcfixe_share_path_resolved(share: str, *parts: str, resolve_accessible: bool = True) -> Path:
+    share_name = str(share or "").strip().strip("\\/")
+    if not share_name:
+        raise ValueError("Nom de partage PC fixe obligatoire.")
+    if share_name.casefold() == "affaires" and resolve_accessible:
+        root, _ = resolve_pcfixe_affaires_share(require_jobs_queue=False)
+        return root.joinpath(*[str(p) for p in parts if str(p)])
+    return Path(rf"\\{get_pcfixe_smb_host()}\{share_name}").joinpath(*[str(p) for p in parts if str(p)])
+
+
+def remap_pcfixe_unc_path(path: str | Path) -> str:
+    raw = str(path or "").strip().rstrip("\\/ ")
+    if not raw.startswith("\\\\"):
+        return raw
+    parts = [p for p in raw.strip("\\").split("\\") if p]
+    if len(parts) < 2:
+        return raw
+    host = parts[0].lower()
+    if host not in {"192.168.0.120", "192.168.0.155", "10.0.1.10"}:
+        return raw
+    return str(get_pcfixe_share_path(parts[1], *parts[2:]))
+
+
+def get_pcfixe_affaires_root() -> Path:
+    return get_pcfixe_share_path("Affaires")
+
+
+def get_pcfixe_jobs_queued_dir() -> Path:
+    root, _ = resolve_pcfixe_affaires_share(require_jobs_queue=True)
+    return root / "_jobs" / "queued"
+
+
+def get_pcfixe_jobs_root() -> Path:
+    root, _ = resolve_pcfixe_affaires_share(require_jobs_queue=True)
+    return root / "_jobs"
+
+
+def get_nas_affaires_root() -> Path:
+    # Variable optionnelle .env : NAS_AFFAIRES_HOST=192.168.1.20
+    host = os.getenv("NAS_AFFAIRES_HOST", "192.168.1.20").strip() or "192.168.1.20"
+    return Path(rf"\\{host}\Affaires")
+
+
+def validate_pcfixe_smb_path(path: str | Path) -> None:
+    raw = str(path or "")
+    raw_lower = raw.lower()
+    if _pcfixe_vpn_active() and (
+        raw_lower.startswith(r"\\192.168.0.120")
+        or raw_lower.startswith(r"\\192.168.0.155")
+    ):
+        raise RuntimeError(f"Chemin SMB LAN interdit lorsque le VPN est actif : {raw}")
+
+
+def preflight_pcfixe_target_dir(target_dir: str | Path) -> dict:
+    target = Path(target_dir)
+    validate_pcfixe_smb_path(target)
+    root = get_pcfixe_affaires_root()
+    info = {
+        "smb_host": get_pcfixe_smb_host(),
+        "share_root": str(root),
+        "target_dir": str(target),
+        "share_accessible": False,
+        "target_ready": False,
+    }
+    info["share_accessible"] = root.exists()
+    if not info["share_accessible"]:
+        raise FileNotFoundError(f"Partage PC fixe inaccessible : {root}")
+    target.mkdir(parents=True, exist_ok=True)
+    info["target_ready"] = target.exists() and target.is_dir()
+    if not info["target_ready"]:
+        raise FileNotFoundError(f"Dossier cible PC fixe non disponible : {target}")
+    return info
+
+
 def detect_vpn_server_ip(default_ip: str,
                          vpn_ip: str = "10.0.1.5",
                          vpn_subnet: str = "10.0.1.0/24",
@@ -129,24 +358,10 @@ def detect_vpn_server_ip(default_ip: str,
        Ignore APIPA (169.254.x.x) and disconnected adapters.
     """
     try:
-        stats = psutil.net_if_stats()
-        addrs = psutil.net_if_addrs()
-        net = ipaddress.ip_network(vpn_subnet)
-
-        for name, lst in addrs.items():
-            if not any(k in name.lower() for k in adapter_keywords):
-                continue
-            st = stats.get(name)
-            if not st or not st.isup:                 # interface must be UP
-                continue
-            v4 = [a.address for a in lst if a.family == socket.AF_INET]
-            v4 = [ip for ip in v4 if not ip.startswith("169.254.")]  # ignore APIPA
-            if not v4:
-                continue
-            if any(ipaddress.ip_address(ip) in net for ip in v4):
-                print(f"[VPN] Adaptateur {name} actif ({v4[0]}) → bascule sur IP serveur VPN {vpn_ip}")
-                return vpn_ip
-
+        active, name, ip = _pcfixe_vpn_adapter(vpn_subnet, adapter_keywords)
+        if active:
+            print(f"[VPN] Adaptateur {name} actif ({ip}) → bascule sur IP serveur VPN {vpn_ip}")
+            return vpn_ip
         print(f"[VPN] Aucun adaptateur VPN UP avec IPv4 valide → IP serveur normale {default_ip}")
         return default_ip
     except Exception as e:
@@ -184,22 +399,29 @@ ON_PCFIXE    = (os.getenv("ON_PCFIXE", "0") == "1") or ("PCFIXE" in HOSTNAME)
 LOCAL_IP     = _local_ip()
 
 URL_HAY_PUBLIQUE    = os.getenv("URL_HAY_PUBLIQUE", "")
+PREDICAT_WEBHOOK    = os.getenv("PREDICAT_WEBHOOK", "/api/webhook/")
 WEBHOOK_WAKE_PCFIXE = os.getenv("WEBHOOK_WAKE_PCFIXE", "")
 
 if URL_HAY_PUBLIQUE and WEBHOOK_WAKE_PCFIXE:
-    WEBHOOK_URL = f"https://{URL_HAY_PUBLIQUE}/api/webhook/{WEBHOOK_WAKE_PCFIXE}"
+    webhook_base = URL_HAY_PUBLIQUE.strip().rstrip("/")
+    if "://" not in webhook_base:
+        webhook_base = "https://" + webhook_base
+    webhook_predicate = PREDICAT_WEBHOOK.strip().strip("/") or "api/webhook"
+    webhook_id = WEBHOOK_WAKE_PCFIXE.strip().strip("/")
+    WEBHOOK_URL = f"{webhook_base}/{webhook_predicate}/{webhook_id}"
+    print(f"[WEBHOOK] URL construite : {WEBHOOK_URL}")
 else:
     WEBHOOK_URL = ""
 
 SEED_SCRIPT = r"C:\LLM_Assistant\tools\sync\seed_captation.py"
-ROOT_DST_DEFAULT = r"\\192.168.1.20\Affaires"
+NAS_AFFAIRES_ROOT = get_nas_affaires_root()
+ROOT_DST_DEFAULT = str(NAS_AFFAIRES_ROOT)
 AFFAIRES_ROOT = Path(r"C:\Affaires")
 AUDIO_VOXTRAL_TOOL_DIR = Path(__file__).resolve().parent / "tools" / "audio_voxtral"
-PCFIXE_AFFAIRES_UNC_ROOT = Path(r"\\192.168.0.155\Affaires")
+PCFIXE_AFFAIRES_UNC_ROOT = get_pcfixe_affaires_root()
 ASR_JOBS_UNC_ROOT = PCFIXE_AFFAIRES_UNC_ROOT / "_jobs"
 PCFIXE_AFFAIRES_ROOT = Path(r"C:\Affaires")
 PCFIXE_BOOST_FILE = Path(r"D:\GPT4All_Local\config\boost_vocab.txt")
-NAS_AFFAIRES_ROOT = Path(r"\\192.168.1.20\Affaires")
 ANNOTATION_PHOTOS_CONFIG_DIR_CANDIDATES = [
     Path(r"C:\AnnotationPhotosGPT\config"),
     Path(r"C:\CodexWorkspace\AnnotationPhotosGPT\config"),
@@ -209,7 +431,7 @@ ANNOTATION_PHOTOS_CONFIG_DIR_CANDIDATES = [
 
 # ---------- choose server endpoint ----------
 enforce = os.getenv("ENFORCE_SERVER_IP", "").strip()
-extra_candidates = [f"http://{enforce}:{PORT}"] if enforce else []
+extra_candidates = []
 disable_vpn_auto = (os.getenv("DISABLE_VPN_AUTODETECT", "0") == "1")
 
 if enforce:
@@ -226,6 +448,9 @@ else:
 
 SERVER_URL = f"http://{SERVER_IP}:{PORT}"
 SERVER_PORT = PORT
+extra_candidates.append(SERVER_URL)
+if enforce:
+    extra_candidates.insert(0, f"http://{enforce}:{PORT}")
 SERVER_URL = resolve_flask_base_url(extra_candidates=extra_candidates)
 _server_parsed = urlparse(SERVER_URL)
 SERVER_IP = _server_parsed.hostname or SERVER_IP_ENV
@@ -251,10 +476,10 @@ PROJETS_INDEX_PATH = os.getenv(
     "PROJETS_INDEX_PATH",
     r"C:\LLM_Assistant\config\projets_index.json"
 )
-SERVER_PROJETS_INDEX_PATH = os.getenv(
+SERVER_PROJETS_INDEX_PATH = remap_pcfixe_unc_path(os.getenv(
     "SERVER_PROJETS_INDEX_PATH",
-    r"\\192.168.0.155\GPT4all_local\config\projets_index.json"
-)
+    str(get_pcfixe_share_path("GPT4all_local", "config", "projets_index.json"))
+))
 # Racine des données (miroir NAS sur PC fixe ; Laptop via Syncthing sélectif)
 
 def iter_project_config_candidates(project_id: str, projets_index_path: str | None = None):
@@ -894,7 +1119,7 @@ def pcfixe_scaffold_root(cfg: dict, aff_id: str) -> str:
         return root
     if root and ON_PCFIXE:
         return root
-    return rf"\\{SERVER_IP_ENV}\Affaires\{aff_id}"
+    return str(get_pcfixe_affaires_root() / aff_id)
 
 
 def filter_light_paths(paths: dict) -> dict:
@@ -1191,7 +1416,7 @@ def initialize_existing_affaire_config_only(aff_id: str, titre: str = "") -> Pat
     )
     cfg["titre"] = titre or aff_id
     cfg["title"] = cfg["titre"]
-    cfg["roots"]["pcfixe"] = fr"\\{SERVER_IP}\Affaires\{aff_id}"
+    cfg["roots"]["pcfixe"] = str(get_pcfixe_affaires_root() / aff_id)
     cfg["roots"]["nas"] = root_unc.rstrip("\\/")
     cfg["roots"]["laptop"] = str(local_root)
 
@@ -4699,11 +4924,19 @@ def ingestion_technical_depot(cfg: dict) -> dict:
 def pcfixe_unc_root_for_laptop(cfg: dict, aff_id: str) -> str:
     root = ((cfg.get("roots") or {}).get("pcfixe") or "").rstrip("\\/ ")
     if root.startswith("\\\\"):
+        root = remap_pcfixe_unc_path(root)
+        parts = [p for p in root.strip("\\").split("\\") if p]
+        if len(parts) >= 2 and parts[1].lower() == "affaires":
+            suffix = Path(*parts[2:]) if len(parts) > 2 else Path()
+            mapped = get_pcfixe_affaires_root() / suffix
+            return str(mapped)
+        validate_pcfixe_smb_path(root)
         return root
     if root.lower().startswith(r"c:\affaires"):
         suffix = root[len(r"C:\Affaires"):].strip("\\/ ")
-        return pj(rf"\\{SERVER_IP_ENV}\Affaires", suffix) if suffix else rf"\\{SERVER_IP_ENV}\Affaires"
-    return rf"\\{SERVER_IP_ENV}\Affaires\{aff_id}"
+        pcfixe_root = str(get_pcfixe_affaires_root())
+        return pj(pcfixe_root, suffix) if suffix else pcfixe_root
+    return str(get_pcfixe_affaires_root() / aff_id)
 
 def pcfixe_local_root_for_server(cfg: dict, aff_id: str) -> str:
     root = ((cfg.get("roots") or {}).get("pcfixe") or "").rstrip("\\/ ")
@@ -4773,7 +5006,10 @@ def copy_ingestion_file_to_technical_depots(local_source: str, cfg: dict, aff_id
             result[f"{target}_error"] = "dossier cible absent"
             continue
         try:
-            Path(dir_path).mkdir(parents=True, exist_ok=True)
+            if target == "pcfixe":
+                result["pcfixe_preflight"] = preflight_pcfixe_target_dir(dir_path)
+            else:
+                Path(dir_path).mkdir(parents=True, exist_ok=True)
             dst = Path(dst_path)
             result[f"{target}_exists_before"] = dst.exists()
             if dst.exists():
@@ -4835,7 +5071,7 @@ def copy_ingestion_file_to_pcfixe_party(local_source: str, cfg: dict, aff_id: st
             result["nas_error"] = str(e)
 
     try:
-        Path(unc_dir).mkdir(parents=True, exist_ok=True)
+        result["pcfixe_preflight"] = preflight_pcfixe_target_dir(unc_dir)
         dst = Path(result["destination_pcfixe_unc"])
         result["pcfixe_exists_before"] = dst.exists()
         if dst.exists():
@@ -5326,7 +5562,7 @@ from pathlib import Path
 import streamlit as st
 
 SEED_SCRIPT = r"C:\LLM_Assistant\tools\sync\seed_captation.py"
-ROOT_DST_DEFAULT = r"\\192.168.1.20\Affaires"
+ROOT_DST_DEFAULT = str(NAS_AFFAIRES_ROOT)
 AFFAIRES_ROOT = Path(r"C:\Affaires")
 
 
@@ -5528,7 +5764,7 @@ def submit_asr_v2_job(
         "diarize": bool(diarize),
     }
 
-    queued_path = ASR_JOBS_UNC_ROOT / "queued" / f"{job_id}.json"
+    queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
     result = {
         "job_id": job_id,
         "job_path": str(queued_path),
@@ -5538,8 +5774,8 @@ def submit_asr_v2_job(
     if dry_run:
         return result
 
-    unc_audio_dir.mkdir(parents=True, exist_ok=True)
-    unc_trans_dir.mkdir(parents=True, exist_ok=True)
+    audio_preflight = preflight_pcfixe_target_dir(unc_audio_dir)
+    trans_preflight = preflight_pcfixe_target_dir(unc_trans_dir)
     shutil.copy2(audio_source, unc_audio_dir / audio_source.name)
     (unc_trans_dir / "infos_projet.json").write_text(
         json.dumps(infos_for_pcfixe, ensure_ascii=False, indent=2),
@@ -5550,45 +5786,323 @@ def submit_asr_v2_job(
     if pc_debrief:
         shutil.copy2(debrief_source, unc_trans_dir / debrief_source.name)
 
-    queued_path.parent.mkdir(parents=True, exist_ok=True)
+    preflight_pcfixe_target_dir(queued_path.parent)
     tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp_path, queued_path)
+    result["pcfixe_preflight"] = {
+        "audio": audio_preflight,
+        "transcriptions": trans_preflight,
+    }
     return result
 
-ANN_PHOTOS_LLM_BACKENDS = {"openai", "local"}
+def _quote_nas_arg(value: str) -> str:
+    """Quote minimal pour afficher une commande NAS lisible en dry-run."""
+    return "'" + str(value).replace("'", "'\"'\"'") + "'"
 
-def _normalize_annotation_llm_backend(llm_backend: str) -> str:
+def _compte_rendu_nas_infos_path(id_affaire: str, id_captation: str) -> str:
+    return (
+        f"/volume1/Affaires/{id_affaire}/AF_Expert_ASR/"
+        f"transcriptions/{id_captation}/infos_projet.json"
+    )
+
+def _compte_rendu_nas_command(job: dict) -> str:
+    args = [
+        "./run_compte_rendu_avec_sujets.sh",
+        job.get("infos_projet") or _compte_rendu_nas_infos_path(
+            job.get("id_affaire", ""),
+            job.get("id_captation", ""),
+        ),
+    ]
+    if job.get("force"):
+        args.append("--force")
+    if job.get("strict_sync"):
+        args.append("--strict-sync")
+    if job.get("docx_only"):
+        args.append("--docx-only")
+    if job.get("existing_run"):
+        args.extend(["--existing-run", str(job["existing_run"])])
+    if job.get("only_pass2b_batches"):
+        args.extend(["--only-pass2b-batches", str(job["only_pass2b_batches"])])
+    if job.get("only_subjects"):
+        args.extend(["--only-subjects", str(job["only_subjects"])])
+    if "mirror_pc" in job:
+        args.append("--mirror-pc" if job.get("mirror_pc") else "--no-mirror-pc")
+    rendered = " ".join(_quote_nas_arg(arg) for arg in args)
+    return (
+        "ssh nicolas@AS6604T-0BA3 "
+        + _quote_nas_arg(
+            "cd /volume1/home/nicolas/Docker/compte-rendu/Scripts && "
+            + rendered
+        )
+    )
+
+CR_LLM_BACKENDS = {"openai", "local"}
+CR_LLM_ROUTING_KEYS = (
+    "provider",
+    "api_base",
+    "preset",
+    "model_pass1",
+    "model_pass2",
+    "model_report",
+    "model_pass2e",
+    "model_pass3",
+    "model_pass3e",
+    "model_pass3a",
+    "model_pass3b",
+    "model_pass3c",
+    "model_pass3d",
+)
+CR_LLM_PASS_LABELS = (
+    ("Pass1", "model_pass1"),
+    ("Pass2", "model_pass2"),
+    ("Report", "model_report"),
+    ("Pass2E", "model_pass2e"),
+    ("Pass3", "model_pass3"),
+    ("Pass3E", "model_pass3e"),
+    ("Pass3A", "model_pass3a"),
+    ("Pass3B", "model_pass3b"),
+    ("Pass3C", "model_pass3c"),
+    ("Pass3D", "model_pass3d"),
+)
+CR_LLM_DEFAULT_ROUTING = {
+    "profil_llm": "standard_openai",
+    "provider": "openai",
+    "api_base": "http://openai-adapter:5055",
+    "preset": "equilibre",
+    "model_pass1": "annoter_segments_remote",
+    "model_pass2": "annoter_segments_remote",
+    "model_report": "report_remote",
+    "model_pass2e": "annoter_segments_remote_alt",
+    "model_pass3": "annoter_segments_remote_alt",
+    "model_pass3e": "pass3e_remote",
+    "model_pass3a": "pass3a_remote",
+    "model_pass3b": "pass3b_remote",
+    "model_pass3c": "pass3c_remote",
+    "model_pass3d": "pass3d_remote",
+}
+CR_LLM_PROFILES = {
+    "standard_openai": {
+        "label": "Standard OpenAI",
+        "values": CR_LLM_DEFAULT_ROUTING,
+    },
+    "personnalise": {
+        "label": "Personnalisé",
+        "values": {
+            **CR_LLM_DEFAULT_ROUTING,
+            "profil_llm": "personnalise",
+        },
+    },
+}
+CR_LLM_PROFILE_LABELS = {key: spec["label"] for key, spec in CR_LLM_PROFILES.items()}
+
+def _normalize_cr_llm_backend(llm_backend: str) -> str:
     backend = (llm_backend or "openai").strip().lower()
-    if backend not in ANN_PHOTOS_LLM_BACKENDS:
+    if backend not in CR_LLM_BACKENDS:
         raise ValueError("llm_backend invalide : attendu 'openai' ou 'local'.")
     return backend
 
-def _annotation_atomic_write_json(path: Path, data: dict) -> None:
+def _cr_profile_values(profile_key: str) -> dict:
+    key = profile_key if profile_key in CR_LLM_PROFILES else "standard_openai"
+    return dict(CR_LLM_PROFILES[key]["values"])
+
+def _cr_detect_profile(routing: dict) -> str:
+    current = {key: str((routing or {}).get(key) or "").strip() for key in CR_LLM_ROUTING_KEYS}
+    for key, spec in CR_LLM_PROFILES.items():
+        if key == "personnalise":
+            continue
+        profile = spec["values"]
+        expected = {field: str(profile.get(field) or "").strip() for field in CR_LLM_ROUTING_KEYS}
+        if current == expected:
+            return key
+    return "personnalise"
+
+def _cr_existing_routing(data: dict) -> dict:
+    source = data if isinstance(data, dict) else {}
+    existing = source.get("compte_rendu")
+    if not isinstance(existing, dict):
+        existing = {}
+    routing = _cr_profile_values(str(existing.get("profil_llm") or "standard_openai"))
+    routing.update({key: str(source.get(key) or routing.get(key) or "").strip() for key in ("provider", "api_base", "preset", "model_pass1", "model_pass2", "model_pass3")})
+    for key in ("profil_llm", *CR_LLM_ROUTING_KEYS):
+        value = existing.get(key)
+        if value is not None and str(value).strip():
+            routing[key] = str(value).strip()
+    return routing
+
+def _validate_cr_llm_routing(routing: dict) -> None:
+    missing = [key for key in CR_LLM_ROUTING_KEYS if not str((routing or {}).get(key) or "").strip()]
+    if missing:
+        raise ValueError("Champs routage LLM vides : " + ", ".join(missing))
+    api_base = str((routing or {}).get("api_base") or "").strip()
+    parsed = urlparse(api_base)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("api_base doit être une URL http(s) complète.")
+
+def _cr_patch_infos_routing(data: dict, routing: dict) -> dict:
+    _validate_cr_llm_routing(routing)
+    updated = json.loads(json.dumps(data if isinstance(data, dict) else {}))
+    compte_rendu = updated.get("compte_rendu")
+    if not isinstance(compte_rendu, dict):
+        compte_rendu = {}
+        updated["compte_rendu"] = compte_rendu
+    for key in ("profil_llm", *CR_LLM_ROUTING_KEYS):
+        value = routing.get(key)
+        if value is not None:
+            compte_rendu[key] = str(value).strip()
+    return updated
+
+def _atomic_write_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp_path, path)
 
+def _cr_infos_copy_candidates(
+    *,
+    infos_source: Path,
+    id_affaire: str,
+    id_captation: str,
+) -> list[Path]:
+    rel = Path(id_affaire) / "AF_Expert_ASR" / "transcriptions" / id_captation / "infos_projet.json"
+    candidates = [
+        infos_source,
+        AFFAIRES_ROOT / rel,
+        Path(ROOT_DST_DEFAULT) / rel,
+        get_pcfixe_affaires_root() / rel,
+    ]
+    out: list[Path] = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate)
+    return out
+
+def _patch_cr_llm_routing_copies(
+    *,
+    infos_source: Path,
+    id_affaire: str,
+    id_captation: str,
+    routing: dict,
+) -> list[str]:
+    patched: list[str] = []
+    for candidate in _cr_infos_copy_candidates(
+        infos_source=infos_source,
+        id_affaire=id_affaire,
+        id_captation=id_captation,
+    ):
+        if not candidate.is_file():
+            continue
+        data = load_json(str(candidate), {})
+        if not isinstance(data, dict):
+            continue
+        updated = _cr_patch_infos_routing(data, routing)
+        _atomic_write_json(candidate, updated)
+        patched.append(str(candidate))
+    return patched
+
+def submit_compte_rendu_job(
+    *,
+    infos_path: str | Path,
+    id_affaire: str,
+    id_captation: str,
+    llm_routing: dict | None = None,
+    force: bool = False,
+    strict_sync: bool = False,
+    docx_only: bool = False,
+    mirror_pc: bool = True,
+    existing_run: str = "",
+    only_pass2b_batches: str = "",
+    only_subjects: str = "",
+    dry_run: bool = False,
+) -> dict:
+    """Dépose un job compte_rendu pour le spooler PC fixe, sans lancer le CR dans Streamlit."""
+    id_affaire = (id_affaire or "").strip()
+    id_captation = (id_captation or "").strip()
+    if not id_affaire or not id_captation:
+        raise ValueError("id_affaire/id_captation obligatoires.")
+    if any(char in id_affaire + id_captation for char in '\\/:*?"<>|'):
+        raise ValueError("id_affaire/id_captation invalides.")
+    if only_pass2b_batches and only_subjects:
+        raise ValueError("Utiliser soit reprise Pass2B, soit reprise Sujets, pas les deux.")
+
+    infos_source = Path(str(infos_path).strip().strip('"'))
+    if not infos_source.is_file():
+        raise FileNotFoundError(f"infos_projet.json introuvable : {infos_source}")
+
+    infos = load_json(str(infos_source), {})
+    if not isinstance(infos, dict):
+        raise ValueError(f"infos_projet.json invalide : {infos_source}")
+    routing = llm_routing or _cr_existing_routing(infos)
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    job_id = f"cr_{id_affaire}_{id_captation}_{stamp}_{uuid.uuid4().hex[:8]}"
+    job = {
+        "job_id": job_id,
+        "type": "compte_rendu",
+        "id_affaire": id_affaire,
+        "id_captation": id_captation,
+        "infos_projet": _compte_rendu_nas_infos_path(id_affaire, id_captation),
+        "force": bool(force),
+        "strict_sync": bool(strict_sync),
+        "docx_only": bool(docx_only),
+        "existing_run": (existing_run or "").strip(),
+        "only_pass2b_batches": (only_pass2b_batches or "").strip(),
+        "only_subjects": (only_subjects or "").strip(),
+        "mirror_pc": bool(mirror_pc),
+    }
+
+    queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
+    result = {
+        "job_id": job_id,
+        "job_path": str(queued_path),
+        "status": "dry-run" if dry_run else "queued",
+        "job": job,
+        "nas_command": _compte_rendu_nas_command(job),
+        "llm_routing": routing,
+    }
+    if dry_run:
+        return result
+
+    patched_infos = _patch_cr_llm_routing_copies(
+        infos_source=infos_source,
+        id_affaire=id_affaire,
+        id_captation=id_captation,
+        routing=routing,
+    )
+
+    preflight_pcfixe_target_dir(queued_path.parent)
+    tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, queued_path)
+    result["patched_infos"] = patched_infos
+    return result
+
 PHOTO_BATCH_ACTIONS = {
     "initial": {
         "label": "Lancer le traitement initial",
+        "status_label": "traitement initial",
         "profile": "vlm_strict",
         "options": ["--reset-vlm", "1", "--vlm-strict", "1"],
     },
     "weak_dry_run": {
-        "label": "Analyser les weak - simulation",
+        "label": "Analyser les annotations restantes — dry-run batch",
+        "status_label": "analyse dry-run batch",
         "profile": "rerun_weak_dry_run",
         "options": ["--rerun-weak", "1", "--dry-run", "1"],
     },
     "weak_rerun": {
         "label": "Relancer les weak",
+        "status_label": "reprise weak",
         "profile": "rerun_weak",
         "options": ["--rerun-weak", "1"],
     },
 }
 
-PHOTO_REPORT_JOB_SUPPORTED = False
+PHOTO_REPORT_JOB_SUPPORTED = True
 
 def _safe_job_token(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("_") or "na"
@@ -5652,13 +6166,29 @@ def _copy_exact_file(source: str | Path, target: Path, *, overwrite: bool = Fals
         raise FileNotFoundError(f"Fichier source introuvable : {src}")
     if target.exists() and not overwrite:
         raise FileExistsError(f"Fichier cible déjà présent, copie refusée sans écrasement explicite : {target}")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if str(target).startswith("\\\\"):
+        preflight_pcfixe_target_dir(target.parent)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_suffix(target.suffix + ".tmp")
     shutil.copy2(src, tmp)
     os.replace(tmp, target)
 
-def _annotation_job_statuses(id_affaire: str, id_captation: str) -> dict[str, str]:
-    status = {key: "absent" for key in PHOTO_BATCH_ACTIONS}
+def _annotation_job_details(id_affaire: str, id_captation: str) -> dict[str, dict]:
+    details = {
+        key: {
+            "status": "absent",
+            "job_id": "",
+            "job_path": "",
+            "log_path": "",
+            "report_path": "",
+            "total_photos": "",
+            "annotated_photos": "",
+            "remaining_photos": "",
+            "weak_photos": "",
+        }
+        for key in PHOTO_BATCH_ACTIONS
+    }
     priority = {"queued": 1, "running": 2, "completed": 3, "failed": 4}
     folders = {
         "queued": "queued",
@@ -5667,7 +6197,7 @@ def _annotation_job_statuses(id_affaire: str, id_captation: str) -> dict[str, st
         "failed": "failed",
     }
     for folder, state in folders.items():
-        root = ASR_JOBS_UNC_ROOT / folder
+        root = get_pcfixe_jobs_root() / folder
         if not root.exists():
             continue
         for job_file in root.glob("*.json"):
@@ -5678,9 +6208,63 @@ def _annotation_job_statuses(id_affaire: str, id_captation: str) -> dict[str, st
                 continue
             options = [str(x) for x in (job.get("options") or [])]
             for action_key, spec in PHOTO_BATCH_ACTIONS.items():
-                if options == spec["options"] and priority[state] >= priority.get(status[action_key], 0):
-                    status[action_key] = state
-    return status
+                if options != spec["options"]:
+                    continue
+                if priority[state] < priority.get(details[action_key]["status"], 0):
+                    continue
+                result = job.get("result") if isinstance(job.get("result"), dict) else {}
+                summary = job.get("summary") if isinstance(job.get("summary"), dict) else {}
+                counts = result.get("counts") if isinstance(result.get("counts"), dict) else {}
+                details[action_key] = {
+                    "status": state,
+                    "job_id": str(job.get("job_id") or job_file.stem),
+                    "job_path": str(job_file),
+                    "log_path": str(
+                        job.get("log_path")
+                        or job.get("stdout_path")
+                        or result.get("log_path")
+                        or result.get("stdout_path")
+                        or ""
+                    ),
+                    "report_path": str(
+                        job.get("report_path")
+                        or result.get("report_path")
+                        or result.get("manifest_path")
+                        or ""
+                    ),
+                    "total_photos": str(
+                        summary.get("total_photos")
+                        or counts.get("total_photos")
+                        or counts.get("total")
+                        or ""
+                    ),
+                    "annotated_photos": str(
+                        summary.get("annotated_photos")
+                        or counts.get("annotated_photos")
+                        or counts.get("annotated")
+                        or ""
+                    ),
+                    "remaining_photos": str(
+                        summary.get("remaining_photos")
+                        or counts.get("remaining_photos")
+                        or counts.get("remaining")
+                        or ""
+                    ),
+                    "weak_photos": str(
+                        summary.get("weak_photos")
+                        or counts.get("weak_photos")
+                        or counts.get("weak")
+                        or ""
+                    ),
+                }
+    return details
+
+
+def _annotation_job_statuses(id_affaire: str, id_captation: str) -> dict[str, str]:
+    return {
+        key: value.get("status", "absent")
+        for key, value in _annotation_job_details(id_affaire, id_captation).items()
+    }
 
 def submit_annotation_photos_batch_job(
     *,
@@ -5712,10 +6296,9 @@ def submit_annotation_photos_batch_job(
         "affaire": id_affaire,
         "captation": id_captation,
         "infos_projet": str(infos),
-        "profile": spec["profile"],
         "options": list(spec["options"]),
     }
-    queued_path = ASR_JOBS_UNC_ROOT / "queued" / f"{job_id}.json"
+    queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
     result = {
         "job_id": job_id,
         "job_path": str(queued_path),
@@ -5724,21 +6307,21 @@ def submit_annotation_photos_batch_job(
     }
     if dry_run:
         return result
-    queued_path.parent.mkdir(parents=True, exist_ok=True)
+    preflight_pcfixe_target_dir(queued_path.parent)
     tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp_path, queued_path)
     return result
 
 def _patch_infos_llm_backend(infos_path: Path, backend: str) -> tuple[str, str]:
-    backend = _normalize_annotation_llm_backend(backend)
+    backend = _normalize_cr_llm_backend(backend)
     data = load_json(str(infos_path), {})
     if not isinstance(data, dict):
         raise ValueError(f"infos_projet.json invalide : {infos_path}")
     old = str(data.get("llm_backend") or "")
     updated = json.loads(json.dumps(data))
     updated["llm_backend"] = backend
-    _annotation_atomic_write_json(infos_path, updated)
+    _atomic_write_json(infos_path, updated)
     return old, backend
 
 def _photo_report_job_preview(
@@ -5748,7 +6331,17 @@ def _photo_report_job_preview(
     infos_pcfixe: Path,
     mode: str,
     only_retenue: bool,
+    dry_run: bool = True,
 ) -> dict:
+    id_affaire = (id_affaire or "").strip()
+    id_captation = (id_captation or "").strip()
+    if not id_affaire or not id_captation:
+        raise ValueError("id_affaire/id_captation obligatoires.")
+    if any(char in id_affaire + id_captation for char in '\\/:*?"<>|'):
+        raise ValueError("id_affaire/id_captation invalides.")
+    mode = (mode or "").strip().lower()
+    if mode not in {"provisoire", "valide"}:
+        raise ValueError("mode rapport Word invalide : attendu 'provisoire' ou 'valide'.")
     report_mode = "UI" if mode == "provisoire" else "GTP"
     retenue = "oui" if only_retenue else "non"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -5757,22 +6350,26 @@ def _photo_report_job_preview(
         f"{_safe_job_token(id_captation)}_{stamp}_{uuid.uuid4().hex[:8]}"
     )
     job = {
-        "schema_version": 1,
         "job_id": job_id,
         "type": "annotation_photos_word_report",
-        "affaire": id_affaire,
-        "captation": id_captation,
+        "id_affaire": id_affaire,
+        "id_captation": id_captation,
         "infos_projet": str(infos_pcfixe),
         "mode": mode,
         "retenue": retenue,
     }
+    queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
+    status = "dry-run" if dry_run else "queued"
+    if not dry_run:
+        preflight_pcfixe_target_dir(queued_path.parent)
+        tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
+        tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, queued_path)
     return {
-        "status": "dry-run",
+        "status": status,
         "supported_by_spooler": PHOTO_REPORT_JOB_SUPPORTED,
-        "message": "Support spooler serveur requis avant exécution réelle",
-        "reason": "Aucun type de job rapport Word n'est présent dans le spooler audité.",
         "job": job,
-        "job_path": str(ASR_JOBS_UNC_ROOT / "queued" / f"{job_id}.json"),
+        "job_path": str(queued_path),
         "batch_reference": (
             "run_generate_word_report_n8n.bat --infos <infos> "
             "--mode <provisoire|valide> --retenue <oui|non>"
@@ -5852,6 +6449,305 @@ def update_infos_projet_debrief(
     infos["debrief"] = debrief_block
     save_json(str(path), infos)
     return infos
+
+DEBRIEF_CSV_KEYWORDS = ("debrief", "debref", "amendement", "correction", "complément", "complement")
+
+def _is_debrief_csv_excluded(path: Path, main_transcription: str | Path | None = None) -> bool:
+    name = path.name.casefold()
+    main_name = Path(str(main_transcription)).name.casefold() if main_transcription else ""
+    return (
+        name.endswith("(photo).csv")
+        or name in {"photos.csv", "photos_batch.csv", "sujets.csv"}
+        or (bool(main_name) and name == main_name)
+        or name in {"manifest.csv", "segments.csv", "speakers.csv"}
+    )
+
+def _debrief_csv_keyword_score(path: Path) -> int:
+    name = path.name.casefold()
+    return 50 if any(keyword in name for keyword in DEBRIEF_CSV_KEYWORDS) else 0
+
+def _debrief_wav_match_score(csv_path: Path, wav_path: str | Path | None) -> int:
+    if not wav_path:
+        return 0
+    wav_name = Path(str(wav_path)).name.casefold()
+    wav_stem = Path(str(wav_path)).stem.casefold()
+    csv_name = csv_path.name.casefold()
+    if not wav_stem:
+        return 0
+    if csv_name == f"{wav_stem}(wav).csv":
+        return 100
+    if csv_name.startswith(wav_stem) and "(photo)" not in csv_name:
+        return 80
+    if wav_stem in csv_name and "(photo)" not in csv_name:
+        return 60
+    if wav_name.replace(".wav", "") in csv_name and "(photo)" not in csv_name:
+        return 40
+    return 0
+
+def list_debrief_csv_candidates(
+    directory: str | Path | None,
+    wav_path: str | Path | None = None,
+    main_transcription: str | Path | None = None,
+) -> list[dict]:
+    """Liste les CSV de debrief utilisables, triés par correspondance WAV puis date."""
+    root = Path(str(directory or "").strip().strip('"')) if directory else None
+    if not root or not root.exists() or not root.is_dir():
+        return []
+    rows = []
+    for csv_path in sorted(root.glob("*.csv"), key=lambda p: p.name.casefold()):
+        excluded = _is_debrief_csv_excluded(csv_path, main_transcription)
+        score = _debrief_wav_match_score(csv_path, wav_path) + _debrief_csv_keyword_score(csv_path)
+        try:
+            mtime = csv_path.stat().st_mtime
+        except Exception:
+            mtime = 0.0
+        rows.append({
+            "path": csv_path,
+            "name": csv_path.name,
+            "excluded": excluded,
+            "score": score,
+            "mtime": mtime,
+        })
+    return sorted(rows, key=lambda r: (r["excluded"], -int(r["score"]), float(r["mtime"]), r["name"].casefold()))
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _read_csv_rows_with_dialect(path: Path) -> tuple[list[str], list[dict], str]:
+    raw = path.read_text(encoding="utf-8-sig")
+    sample = raw[:4096]
+    delimiter = ";"
+    try:
+        dialect = csv.Sniffer().sniff(sample, delimiters=";,")
+        delimiter = dialect.delimiter
+    except Exception:
+        delimiter = ";" if ";" in sample else ","
+    reader = csv.DictReader(io.StringIO(raw), delimiter=delimiter)
+    if not reader.fieldnames:
+        raise ValueError(f"CSV sans en-tête : {path}")
+    rows = list(reader)
+    return list(reader.fieldnames), rows, delimiter
+
+def build_debrief_global_csv(
+    *,
+    sources: list[str | Path],
+    output_csv: str | Path,
+    id_affaire: str,
+    id_captation: str,
+    allow_overwrite: bool = False,
+) -> dict:
+    selected = [Path(str(p).strip().strip('"')) for p in sources if str(p).strip()]
+    if not selected:
+        raise ValueError("Sélectionner au moins un CSV de debrief.")
+    missing = [str(p) for p in selected if not p.is_file()]
+    if missing:
+        raise FileNotFoundError("CSV de debrief introuvable(s) : " + ", ".join(missing))
+
+    output = Path(str(output_csv).strip().strip('"'))
+    if output.exists() and not allow_overwrite:
+        mtime = datetime.fromtimestamp(output.stat().st_mtime).isoformat(timespec="seconds")
+        raise FileExistsError(f"{output.name} existe déjà ({mtime}). Confirmer l’écrasement ou choisir une version horodatée.")
+
+    expected_header: list[str] | None = None
+    all_rows: list[dict] = []
+    manifest_sources: list[dict] = []
+    delimiters: list[str] = []
+    for order, source in enumerate(selected, start=1):
+        header, rows, delimiter = _read_csv_rows_with_dialect(source)
+        delimiters.append(delimiter)
+        if expected_header is None:
+            expected_header = header
+        elif header != expected_header:
+            raise ValueError(
+                "Colonnes incompatibles pour "
+                f"{source.name}. Attendu={expected_header}; trouvé={header}"
+            )
+        all_rows.extend(rows)
+        manifest_sources.append({
+            "order": order,
+            "path": str(source),
+            "filename": source.name,
+            "rows": len(rows),
+            "sha256": _sha256_file(source),
+        })
+
+    if expected_header is None:
+        raise ValueError("Aucun en-tête CSV exploitable.")
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    tmp = output.with_suffix(output.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=expected_header, delimiter=";", extrasaction="ignore")
+        writer.writeheader()
+        for row in all_rows:
+            writer.writerow({key: row.get(key, "") for key in expected_header})
+    os.replace(tmp, output)
+
+    manifest = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "id_affaire": id_affaire,
+        "id_captation": id_captation,
+        "output": output.name,
+        "output_path": str(output),
+        "format": {"encoding": "utf-8", "delimiter": ";"},
+        "source_delimiters": delimiters,
+        "sources": manifest_sources,
+        "total_rows": len(all_rows),
+    }
+    manifest_path = output.with_suffix(".manifest.json")
+    tmp_manifest = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    tmp_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp_manifest, manifest_path)
+    manifest["manifest_path"] = str(manifest_path)
+    return manifest
+
+def update_infos_projet_debrief_csv(
+    infos_path: str | Path,
+    *,
+    csv_path: str | Path,
+    id_affaire: str,
+    id_captation: str,
+    nas_trans_dir: str | Path | None,
+) -> dict:
+    """Enregistre le vrai CSV de debrief produit par Voxtral, sans renommer le fichier."""
+    path = Path(str(infos_path).strip().strip('"'))
+    if not path.is_file():
+        raise FileNotFoundError(f"infos_projet.json introuvable : {path}")
+    csv_selected = Path(str(csv_path).strip().strip('"'))
+    if not csv_selected.is_file():
+        raise FileNotFoundError(f"CSV de debrief introuvable : {csv_selected}")
+
+    infos = load_json(str(path), {})
+    if not isinstance(infos, dict):
+        raise ValueError(f"infos_projet.json invalide : {path}")
+
+    csv_name = csv_selected.name
+    nas_csv = Path(str(nas_trans_dir).strip().strip('"')) / csv_name if nas_trans_dir else csv_selected
+    pcfixe_csv = PCFIXE_AFFAIRES_ROOT / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation / csv_name
+
+    debrief = infos.get("debrief")
+    if not isinstance(debrief, dict):
+        debrief = {}
+    debrief.update({
+        "csv": str(nas_csv),
+        "pcfixe_csv": str(pcfixe_csv),
+        "transcribed": True,
+    })
+    infos["debrief"] = debrief
+    infos["fichier_debrief"] = str(nas_csv)
+
+    pcfixe = infos.get("pcfixe")
+    if not isinstance(pcfixe, dict):
+        pcfixe = {}
+    pcfixe["fichier_debrief"] = str(pcfixe_csv)
+    infos["pcfixe"] = pcfixe
+
+    save_json(str(path), infos)
+    return infos
+
+def update_infos_projet_debrief_global_csv(
+    infos_path: str | Path,
+    *,
+    global_csv: str | Path,
+    csv_sources: list[str | Path],
+    id_affaire: str,
+    id_captation: str,
+    nas_trans_dir: str | Path,
+) -> dict:
+    path = Path(str(infos_path).strip().strip('"'))
+    if not path.is_file():
+        raise FileNotFoundError(f"infos_projet.json introuvable : {path}")
+    global_path = Path(str(global_csv).strip().strip('"'))
+    if not global_path.is_file():
+        raise FileNotFoundError(f"CSV global de debrief introuvable : {global_path}")
+
+    infos = load_json(str(path), {})
+    if not isinstance(infos, dict):
+        raise ValueError(f"infos_projet.json invalide : {path}")
+
+    global_name = global_path.name
+    nas_csv = Path(str(nas_trans_dir).strip().strip('"')) / global_name
+    pcfixe_csv = PCFIXE_AFFAIRES_ROOT / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation / global_name
+
+    debrief = infos.get("debrief")
+    if not isinstance(debrief, dict):
+        debrief = {}
+    debrief.update({
+        "csv_sources": [str(Path(str(p).strip().strip('"'))) for p in csv_sources],
+        "global_csv": str(nas_csv),
+        "pcfixe_global_csv": str(pcfixe_csv),
+        "csv": str(nas_csv),
+        "pcfixe_csv": str(pcfixe_csv),
+        "transcribed": True,
+    })
+    infos["debrief"] = debrief
+    infos["fichier_debrief"] = str(nas_csv)
+    pcfixe = infos.get("pcfixe")
+    if not isinstance(pcfixe, dict):
+        pcfixe = {}
+    pcfixe["fichier_debrief"] = str(pcfixe_csv)
+    infos["pcfixe"] = pcfixe
+    save_json(str(path), infos)
+    return infos
+
+def _pcfixe_affaires_to_nas_path(path_value: str | Path, id_affaire: str | None = None) -> Path | None:
+    raw = str(path_value or "").strip().strip('"')
+    if not raw:
+        return None
+    norm = raw.replace("/", "\\")
+    prefixes = (
+        str(PCFIXE_AFFAIRES_ROOT),
+        r"\\192.168.0.120\Affaires",
+        r"\\192.168.0.155\Affaires",
+        r"\\10.0.1.10\Affaires",
+    )
+    for prefix in prefixes:
+        prefix_norm = prefix.replace("/", "\\").rstrip("\\")
+        if norm.casefold().startswith(prefix_norm.casefold() + "\\"):
+            rel = norm[len(prefix_norm):].lstrip("\\")
+            return AFFAIRES_ROOT / Path(rel)
+    return None
+
+def resolve_debrief_resource(infos: dict, id_affaire: str | None = None) -> dict:
+    debrief = infos.get("debrief") if isinstance(infos, dict) else {}
+    if not isinstance(debrief, dict):
+        debrief = {}
+    pcfixe = infos.get("pcfixe") if isinstance(infos, dict) else {}
+    if not isinstance(pcfixe, dict):
+        pcfixe = {}
+    values = [
+        pcfixe.get("fichier_debrief"),
+        infos.get("fichier_debrief") if isinstance(infos, dict) else "",
+        debrief.get("global_csv"),
+        debrief.get("csv"),
+    ]
+    for value in values:
+        raw = str(value or "").strip()
+        if not raw:
+            continue
+        candidates = [Path(raw)]
+        mapped = _pcfixe_affaires_to_nas_path(raw, id_affaire)
+        if mapped is not None:
+            candidates.append(mapped)
+        for candidate in candidates:
+            if candidate.is_file():
+                return {
+                    "declared": raw,
+                    "path": candidate,
+                    "present": True,
+                    "sources_count": len(debrief.get("csv_sources") or []),
+                }
+        return {
+            "declared": raw,
+            "path": candidates[-1],
+            "present": False,
+            "sources_count": len(debrief.get("csv_sources") or []),
+        }
+    return {"declared": "", "path": Path(""), "present": False, "sources_count": 0}
 
 ASR_MEDIA_EXTENSIONS = (".wav", ".mp3", ".flac", ".m4a", ".ogg", ".mp4", ".mkv", ".mov")
 
@@ -6037,12 +6933,12 @@ def resolve_asr_captation_context(project_config: dict, affaire_id: str, id_capt
     boost_candidates = [
         Path(r"C:\LLM_Assistant\config\boost_vocab.txt"),
         Path(r"C:\CodexWorkspace\LLM_Assistant\config\boost_vocab.txt"),
-        Path(r"\\192.168.0.155\GPT4All_Local\config\boost_vocab.txt"),
+        get_pcfixe_share_path("GPT4All_Local", "config", "boost_vocab.txt"),
         Path(r"D:\GPT4All_Local\config\boost_vocab.txt"),
         Path(infos_pc.get("boost_file") or "") if infos_pc.get("boost_file") else None,
     ]
     boost_local_path = _pick_existing_path(*boost_candidates)
-    boost_server_path = infos_pc.get("boost_file") or str(Path(r"\\192.168.0.155\GPT4All_Local\config\boost_vocab.txt"))
+    boost_server_path = infos_pc.get("boost_file") or str(PCFIXE_BOOST_FILE)
 
     proper_names_lines = _read_text_list_file(proper_names_local_path)
     boost_lines = _read_text_list_file(boost_local_path)
@@ -6242,7 +7138,233 @@ def wake_server(mac_normalized: str | None):
         print("⚠️ MAC invalide ou absente (.env: MAC_ADRESSE_PCFIXE). WOL non envoyé.")
         return
     send_magic_packet(mac_normalized)
-    time.sleep(10)
+
+
+def _pcfixe_network_mode() -> str:
+    return "VPN" if _pcfixe_vpn_active() else "LAN"
+
+
+def _pcfixe_admin_endpoint_specs() -> list[dict]:
+    vpn_active = _pcfixe_vpn_active()
+    specs = []
+    for url in DEFAULT_FLASK_ENDPOINTS:
+        host = urlparse(url).hostname or ""
+        in_vpn_range = host.startswith("10.")
+        testable = bool(vpn_active or not in_vpn_range)
+        specs.append({
+            "url": url,
+            "testable": testable,
+            "inactive_reason": "" if testable else "VPN inactif",
+        })
+    return specs
+
+
+def _pcfixe_contextual_probes() -> list[dict]:
+    specs = _pcfixe_admin_endpoint_specs()
+    tested_urls = [item["url"] for item in specs if item["testable"]]
+    tested = {
+        item.get("url"): item
+        for item in probe_pcfixe_endpoints(tested_urls)
+    }
+    probes = []
+    for spec in specs:
+        if spec["testable"]:
+            probes.append(tested.get(spec["url"]) or {
+                "url": spec["url"],
+                "ok": False,
+                "status": "Non testé",
+                "detail": "test non exécuté",
+                "elapsed_ms": None,
+            })
+        else:
+            probes.append({
+                "url": spec["url"],
+                "ok": False,
+                "status": "Non testé",
+                "detail": spec["inactive_reason"],
+                "elapsed_ms": None,
+            })
+    return probes
+
+
+def _pcfixe_probe_rows(probes: list[dict]) -> list[dict]:
+    rows = []
+    for item in probes:
+        rows.append({
+            "Endpoint": item.get("url") or "",
+            "État": item.get("status") or "Non testé",
+            "Détail": item.get("detail") or "",
+            "Temps (ms)": item.get("elapsed_ms") if item.get("elapsed_ms") is not None else "",
+        })
+    return rows
+
+
+def _pcfixe_status_value(payload: dict, *keys: str):
+    if not isinstance(payload, dict):
+        return ""
+    for key in keys:
+        if key in payload:
+            return payload.get(key)
+    return ""
+
+
+def _render_pcfixe_admin_section() -> None:
+    st.markdown("### Disponibilité du serveur PC fixe")
+    st.caption("Diagnostic administratif indépendant de l’endpoint utilisé par les traitements métier.")
+
+    col_info = st.columns(4)
+    with col_info[0]:
+        st.metric("Adresse locale laptop", LOCAL_IP or "inconnue")
+    with col_info[1]:
+        st.metric("Mode réseau détecté", _pcfixe_network_mode())
+    with col_info[2]:
+        st.metric("Endpoint Flask actif", SERVER_URL)
+    with col_info[3]:
+        st.metric("Hôte SMB PC fixe", get_pcfixe_smb_host())
+
+    st.text_input(
+        "SMB PC fixe actif",
+        value=str(get_pcfixe_affaires_root()),
+        disabled=True,
+        key="pcfixe_admin_smb_root",
+    )
+    st.text_input(
+        "Racine NAS active",
+        value=str(get_nas_affaires_root()),
+        disabled=True,
+        key="pcfixe_admin_nas_root",
+    )
+
+    if "pcfixe_endpoint_probes" not in st.session_state:
+        st.session_state["pcfixe_endpoint_probes"] = [
+            {
+                "url": spec["url"],
+                "ok": False,
+                "status": "Non testé",
+                "detail": spec["inactive_reason"],
+                "elapsed_ms": None,
+            }
+            for spec in _pcfixe_admin_endpoint_specs()
+        ]
+
+    if st.button("Tester les endpoints PC fixe", key="pcfixe_admin_probe"):
+        probes = _pcfixe_contextual_probes()
+        st.session_state["pcfixe_endpoint_probes"] = probes
+        answered = first_reachable_endpoint(probes)
+        if answered:
+            st.session_state["pcfixe_last_admin_endpoint"] = answered
+            print(f"[PCFIXE] endpoint joignable : {answered}")
+        else:
+            st.session_state["pcfixe_last_admin_endpoint"] = ""
+            print("[PCFIXE] aucun endpoint joignable")
+
+    probes = st.session_state.get("pcfixe_endpoint_probes", [])
+    st.dataframe(_pcfixe_probe_rows(probes), width="stretch", hide_index=True)
+    answered = first_reachable_endpoint(probes)
+    st.write("Endpoint ayant répondu :", answered or "aucun")
+
+    st.markdown("#### Statut de reconnexion Wi-Fi")
+    if st.button("Actualiser le statut Wi-Fi du PC fixe", key="pcfixe_wifi_status_refresh"):
+        probes = _pcfixe_contextual_probes()
+        st.session_state["pcfixe_endpoint_probes"] = probes
+        endpoint = first_reachable_endpoint(probes)
+        if not endpoint:
+            st.session_state["pcfixe_wifi_status"] = {
+                "ok": False,
+                "status": "Aucun endpoint joignable",
+                "payload": None,
+            }
+        else:
+            st.session_state["pcfixe_last_admin_endpoint"] = endpoint
+            st.session_state["pcfixe_wifi_status"] = get_wifi_reconnect_status(endpoint, API_KEY)
+
+    wifi_status = st.session_state.get("pcfixe_wifi_status")
+    if wifi_status:
+        st.write("Statut route :", wifi_status.get("status", ""))
+        payload = wifi_status.get("payload") or {}
+        if isinstance(payload, dict):
+            st.json({
+                "endpoint": st.session_state.get("pcfixe_last_admin_endpoint", ""),
+                "task_exists": _pcfixe_status_value(payload, "task_exists", "scheduled_task_exists", "exists"),
+                "task_state": _pcfixe_status_value(payload, "task_state", "state"),
+                "last_result": _pcfixe_status_value(payload, "last_result", "last_run_result"),
+                "last_run": _pcfixe_status_value(payload, "last_run", "last_run_time", "last_execution"),
+                "wifi_adapter_state": _pcfixe_status_value(payload, "wifi_adapter_state", "adapter_status", "wifi_status"),
+                "ipv4": _pcfixe_status_value(payload, "ipv4", "ip", "ip_address"),
+                "raw": payload,
+            })
+        elif wifi_status.get("error"):
+            st.warning(wifi_status.get("error"))
+
+    st.markdown("#### Actions de disponibilité")
+    confirm_wifi = st.checkbox(
+        "Je confirme vouloir demander au PC fixe de réactiver sa carte Wi-Fi",
+        key="pcfixe_wifi_reconnect_confirm",
+    )
+    if st.button(
+        "Réactiver le Wi-Fi du PC fixe",
+        key="pcfixe_wifi_reconnect",
+        disabled=not confirm_wifi,
+    ):
+        probes = _pcfixe_contextual_probes()
+        st.session_state["pcfixe_endpoint_probes"] = probes
+        target_155_ok = any(
+            item.get("ok") and item.get("url", "").startswith("http://192.168.0.155:")
+            for item in probes
+        )
+        endpoint = first_reachable_endpoint(
+            probes,
+            avoid_host=None if target_155_ok else "192.168.0.155",
+        )
+        if not endpoint:
+            st.error("Échec du déclenchement : aucun endpoint Flask joignable.")
+        else:
+            result = trigger_wifi_reconnect(endpoint, API_KEY)
+            st.session_state["pcfixe_wifi_reconnect_result"] = result
+            st.write("Endpoint utilisé :", endpoint)
+            st.json(result.get("payload") if result.get("payload") is not None else result)
+            if result.get("ok"):
+                print(f"[WIFI] tâche de reconnexion déclenchée via {endpoint}")
+                with st.spinner("Reconnexion demandée. Nouveau test de 192.168.0.155 dans environ 15 secondes…"):
+                    time.sleep(15)
+                probe_155 = probe_flask_endpoint("http://192.168.0.155:5050")
+                if probe_155.get("ok"):
+                    print("[WIFI] adresse .155 rétablie")
+                    st.success("Wi-Fi rétabli : 192.168.0.155 répond à /ping.")
+                else:
+                    st.warning("Reconnexion déclenchée mais adresse .155 encore indisponible.")
+                    st.json(probe_155)
+            else:
+                st.error("Échec du déclenchement.")
+
+    if st.button("Réveiller le PC fixe", key="pcfixe_wake_button"):
+        probes = _pcfixe_contextual_probes()
+        st.session_state["pcfixe_endpoint_probes"] = probes
+        endpoint = first_reachable_endpoint(probes)
+        if endpoint:
+            st.info(f"Un endpoint Flask répond déjà ({endpoint}) : webhook non déclenché automatiquement.")
+        else:
+            sent = send_magic_packet()
+            if sent:
+                print("[WAKE] webhook envoyé")
+                progress = st.progress(0)
+                found = ""
+                for idx in range(5):
+                    time.sleep(4)
+                    probes = _pcfixe_contextual_probes()
+                    st.session_state["pcfixe_endpoint_probes"] = probes
+                    found = first_reachable_endpoint(probes)
+                    progress.progress(int(((idx + 1) / 5) * 100))
+                    if found:
+                        break
+                if found:
+                    st.success(f"PC fixe réveillé : endpoint joignable {found}.")
+                    if not any(item.get("ok") and item.get("url", "").startswith("http://192.168.0.155:") for item in probes):
+                        st.info("Le PC répond, mais .155 reste indisponible : la reconnexion Wi-Fi peut être tentée séparément.")
+                else:
+                    st.warning("Webhook envoyé, mais aucun endpoint Flask ne répond encore.")
+            else:
+                st.error("Webhook de réveil non configuré ou en échec.")
 
 
 def csv_to_text(csv_path: str, sep: str = ";") -> str:
@@ -6259,7 +7381,7 @@ def csv_to_text(csv_path: str, sep: str = ";") -> str:
         return out.getvalue().strip()
     except Exception:
         return ""
-    
+
 def composer_prompt_structuré(obj, ctx, fmt, contraintes, exemples, question):
     blocs = []
     if obj: blocs.append(f"L’objectif est : {obj}")
@@ -6309,7 +7431,7 @@ def copy_bytes_to_path(file_bytes: bytes, dst_path: str) -> str:
 
 def copy_to_network_share(file_bytes: bytes, filename: str, unc_dir: str) -> str:
     """
-    Copie vers un partage UNC (ex: \\\\PC-Fixe\\Drop_transcrip\\).
+    Copie vers un partage UNC (ex: \\\\10.0.1.10\\Drop_transcrip\\ en VPN).
     Renvoie le chemin UNC complet.
     """
     unc_dir = pj(unc_dir)
@@ -6318,6 +7440,7 @@ def copy_to_network_share(file_bytes: bytes, filename: str, unc_dir: str) -> str
     dest_unc = unc_dir + filename
     # Sur certains partages, mkdir peut échouer (droits) → on ignore proprement
     try:
+        validate_pcfixe_smb_path(unc_dir)
         Path(unc_dir).mkdir(parents=True, exist_ok=True)
     except Exception:
         pass
@@ -6671,7 +7794,25 @@ selection = st.selectbox(
     options,
     index=default_index,
     format_func=affaire_select_label,
+    key="global_affaire_selection",
 )
+
+if selection != "➕ Créer une nouvelle affaire…":
+    previous_active_affaire = st.session_state.get("_active_affaire_id")
+    if previous_active_affaire and previous_active_affaire != selection:
+        for key in list(st.session_state.keys()):
+            if key.startswith((
+                "voxtral_asr_",
+                "voxtral_debrief_",
+                "cr_job_",
+                "cr_debrief_",
+                "ann_photos_",
+            )) or key in {
+                "voxtral_selected_captation",
+                "ann_photos_id_captation_manual",
+            }:
+                del st.session_state[key]
+    st.session_state["_active_affaire_id"] = selection
 
 aff_root_local = None
 project_config = None
@@ -7685,7 +8826,8 @@ elif page == "Voxtral (ASR / CR)":
 
     # Chemins projet depuis la config
     proj_pcfixe = (project_config.get("roots") or {}).get("pcfixe") or ""
-    affaire_id = get_project_id(project_config, "")
+    affaire_id = selection if selection != "➕ Créer une nouvelle affaire…" else get_project_id(project_config, "")
+    st.text_input("Affaire active", value=affaire_id, disabled=True, key="voxtral_active_affaire_display")
     proj_laptop = pj(AFFAIRES_ROOT, affaire_id)
 
     pcfixe_root = proj_pcfixe
@@ -7702,7 +8844,14 @@ elif page == "Voxtral (ASR / CR)":
 
     captations = list_captations(affaire_id) if affaire_id else []
     captation_options = ["(aucune)"] + [c["id_captation"] for c in captations]
-    selected_captation = st.selectbox("Captation liÃ©e Ã  l'ASR", captation_options, index=0)
+    if st.session_state.get("voxtral_selected_captation") not in captation_options:
+        st.session_state["voxtral_selected_captation"] = "(aucune)"
+    selected_captation = st.selectbox(
+        "Captation liÃ©e Ã  l'ASR",
+        captation_options,
+        index=captation_options.index(st.session_state["voxtral_selected_captation"]),
+        key="voxtral_selected_captation",
+    )
     asr_ctx = {}
     if selected_captation != "(aucune)":
         asr_ctx = resolve_asr_captation_context(project_config, affaire_id, selected_captation)
@@ -7869,6 +9018,101 @@ elif page == "Voxtral (ASR / CR)":
     )
     debrief_infos = load_json(debrief_infos_path, {}) if debrief_infos_path else {}
     existing_debrief = debrief_infos.get("debrief", {}) if isinstance(debrief_infos, dict) else {}
+    existing_debrief_csv = ""
+    if isinstance(existing_debrief, dict):
+        existing_debrief_csv = str(existing_debrief.get("csv") or existing_debrief.get("pcfixe_csv") or "")
+    if isinstance(debrief_infos, dict):
+        existing_debrief_csv = (
+            existing_debrief_csv
+            or str((debrief_infos.get("pcfixe", {}) or {}).get("fichier_debrief") or "")
+            or str(debrief_infos.get("fichier_debrief") or "")
+        )
+
+    st.markdown("#### CSV de debrief transcrit")
+    debrief_csv_scan_dir = Path(asr_ctx.get("trans_dir_nas") or str(debrief_trans_dir or "")) if asr_ctx else (debrief_trans_dir or Path(""))
+    st.text_input(
+        "Dossier canonique détecté",
+        value=str(debrief_csv_scan_dir),
+        disabled=True,
+        key="voxtral_debrief_csv_canonical_dir",
+    )
+    debrief_csv_candidates = list_debrief_csv_candidates(debrief_csv_scan_dir, debrief_wav_path)
+    visible_debrief_csv_candidates = [
+        item for item in debrief_csv_candidates
+        if debrief_advanced or not item["excluded"]
+    ]
+    debrief_csv_labels: list[str] = []
+    debrief_csv_lookup: dict[str, Path] = {}
+    for item in visible_debrief_csv_candidates:
+        suffix = ""
+        if item["excluded"]:
+            suffix = " — exclu par défaut"
+        elif item["score"] > 0:
+            suffix = " — correspond au WAV"
+        label = f"{item['name']}{suffix}"
+        debrief_csv_labels.append(label)
+        debrief_csv_lookup[label] = item["path"]
+
+    selected_debrief_csv_path = ""
+    if debrief_csv_labels:
+        default_csv_index = 0
+        if existing_debrief_csv:
+            existing_name = Path(existing_debrief_csv).name.casefold()
+            for idx, label in enumerate(debrief_csv_labels):
+                if debrief_csv_lookup[label].name.casefold() == existing_name:
+                    default_csv_index = idx
+                    break
+        selected_debrief_csv_label = st.selectbox(
+            "CSV de debrief à utiliser",
+            debrief_csv_labels,
+            index=default_csv_index,
+            key="voxtral_debrief_csv_select",
+        )
+        selected_debrief_csv_path = str(debrief_csv_lookup[selected_debrief_csv_label])
+        top_score = visible_debrief_csv_candidates[0]["score"] if visible_debrief_csv_candidates else 0
+        ambiguous_top = [
+            item for item in visible_debrief_csv_candidates
+            if item["score"] == top_score and not item["excluded"]
+        ]
+        if top_score > 0 and len(ambiguous_top) > 1:
+            st.warning("Plusieurs CSV correspondent au WAV de debrief : vérifier la sélection avant enregistrement.")
+    else:
+        st.warning("Aucun CSV de debrief utilisable détecté dans le dossier canonique.")
+        if debrief_advanced:
+            selected_debrief_csv_path = st.text_input(
+                "CSV de debrief manuel",
+                value=existing_debrief_csv,
+                key="voxtral_debrief_csv_manual",
+            )
+
+    st.text_input(
+        "Chemin complet du CSV sélectionné",
+        value=selected_debrief_csv_path,
+        disabled=bool(debrief_csv_labels),
+        key="voxtral_debrief_csv_selected_path",
+    )
+    selected_debrief_csv_exists = bool(selected_debrief_csv_path and Path(selected_debrief_csv_path).is_file())
+    st.write("État CSV debrief :", "présent" if selected_debrief_csv_exists else "absent")
+    if st.button("Enregistrer le CSV de debrief dans infos_projet.json", key="voxtral_save_debrief_csv"):
+        try:
+            if not selected_debrief_csv_exists:
+                raise FileNotFoundError(f"CSV de debrief introuvable : {selected_debrief_csv_path}")
+            updated_infos = update_infos_projet_debrief_csv(
+                debrief_infos_path,
+                csv_path=selected_debrief_csv_path,
+                id_affaire=affaire_id,
+                id_captation=selected_captation,
+                nas_trans_dir=asr_ctx.get("trans_dir_nas") if asr_ctx else str(debrief_csv_scan_dir),
+            )
+            st.success("CSV de debrief enregistré dans infos_projet.json.")
+            st.json({
+                "debrief": updated_infos.get("debrief", {}),
+                "fichier_debrief": updated_infos.get("fichier_debrief", ""),
+                "pcfixe.fichier_debrief": (updated_infos.get("pcfixe", {}) or {}).get("fichier_debrief", ""),
+            })
+        except Exception as e:
+            st.error(f"Enregistrement du CSV de debrief impossible : {e}")
+
     proposed_debrief_block = None
     if debrief_wav_path.strip():
         try:
@@ -8115,7 +9359,7 @@ elif page == "Voxtral (ASR / CR)":
         with colt[1]:
             sub_out = st.text_input("Sous-dossier ASR (sorties)", value="ASR_Out", key="voxtral_asr_transfer_output_subdir")
         with colt[2]:
-            share_unc = st.text_input("UNC dépôt (serveur)", value="\\\\PC-Fixe\\Drop_transcrip\\",
+            share_unc = st.text_input("UNC dépôt (serveur)", value=str(get_pcfixe_share_path("Drop_transcrip")),
                               help="Si vous avez un partage dédié; sinon vide et on utilisera un UNC dérivé.",
                               key="voxtral_asr_deposit_unc")
 
@@ -8207,123 +9451,644 @@ elif page == "Voxtral (ASR / CR)":
 
     # --- TAB 2 : compte-rendu (C/D) ---
     with tabs[1]:
-        media = st.text_input(
-            "Média (PC fixe) — CR",
-            value=prepared_voxtral_audio or project_config.get("ocr_input_pcfixe", ""),
-            key="voxtral_cr_media",
+        cr_mode = st.radio(
+            "Mode compte-rendu",
+            ["Affaire / captation", "Libre / hors affaire"],
+            horizontal=True,
+            key="voxtral_cr_mode",
         )
-        csv_dir2 = st.text_input("Dossier CSV sortie (PC fixe) — CR", value=project_config.get("csv_output_pcfixe",""), key="voxtral_cr_csv_output_dir")
-        also_csv = st.checkbox("Produire aussi un CSV de transcription pure", value=True)
 
-        scn = llm_scenarios.get("rapport", {})
-        st.markdown("**Paramètres LLM (scénario 'rapport', modifiables)**")
- 
-        # --- Choix du scénario CR (défaut: "rapport" si présent) ---
-        cr_scenarios = [k for k, v in llm_scenarios.items() if isinstance(v, dict)]
-        default_cr = "rapport" if "rapport" in llm_scenarios else (cr_scenarios[0] if cr_scenarios else "")
-        cr_choice = st.selectbox("Scénario CR", cr_scenarios or ["(aucun)"],
-                                index=cr_scenarios.index(default_cr) if default_cr in cr_scenarios else 0)
+        if cr_mode == "Affaire / captation":
+            st.markdown("### 🧾 Compte-rendu métier via spooler")
+            cr_affaire_id = affaire_id
+            st.text_input("id_affaire", value=cr_affaire_id, disabled=True, key="cr_job_id_affaire_display")
+            cr_captations = list_captations(cr_affaire_id) if cr_affaire_id else []
+            cr_captation_values = [c["id_captation"] for c in cr_captations]
+            cr_captation_options = cr_captation_values or ["(aucune)"]
+            if st.session_state.get("cr_job_id_captation") not in cr_captation_options:
+                preferred_captation = selected_captation if selected_captation in cr_captation_options else cr_captation_options[0]
+                st.session_state["cr_job_id_captation"] = preferred_captation
+            cr_id_captation = st.selectbox(
+                "id_captation",
+                cr_captation_options,
+                index=cr_captation_options.index(st.session_state["cr_job_id_captation"]),
+                key="cr_job_id_captation",
+            )
 
-        scn = llm_scenarios.get(cr_choice, {})
+            cr_advanced = st.checkbox("Mode avancé (corriger infos_projet.json)", value=False, key="cr_job_advanced")
+            cr_nas_root = _normalize_nas_affaire_root(cr_affaire_id, None) if cr_affaire_id else ""
+            cr_trans_dir_nas = (
+                Path(cr_nas_root) / "AF_Expert_ASR" / "transcriptions" / cr_id_captation
+                if cr_nas_root and cr_id_captation != "(aucune)"
+                else None
+            )
+            cr_trans_dir_laptop = (
+                AFFAIRES_ROOT / cr_affaire_id / "AF_Expert_ASR" / "transcriptions" / cr_id_captation
+                if cr_affaire_id and cr_id_captation != "(aucune)"
+                else None
+            )
+            cr_infos_nas = cr_trans_dir_nas / "infos_projet.json" if cr_trans_dir_nas else None
+            cr_infos_laptop = cr_trans_dir_laptop / "infos_projet.json" if cr_trans_dir_laptop else None
+            cr_infos_default = _pick_existing_path(cr_infos_nas, cr_infos_laptop) or (str(cr_infos_nas) if cr_infos_nas else "")
+            if cr_advanced:
+                cr_infos_path = st.text_input("infos_projet.json", value=cr_infos_default, key="cr_job_infos_manual").strip().strip('"')
+            else:
+                cr_infos_path = cr_infos_default
+                st.text_input("infos_projet.json déduit", value=cr_infos_path, disabled=True, key="cr_job_infos_auto")
 
-        # Champs UI pré-remplis par le scénario choisi
-        col = st.columns(5)
-        with col[0]: ui_temp  = st.number_input("Temp.", 0.0, 1.5, float(scn.get("temperature",0.7)), 0.05)
-        with col[1]: ui_top_p = st.number_input("top_p", 0.0, 1.0, float(scn.get("top_p",0.9)), 0.05)
-        with col[2]: ui_top_k = st.number_input("top_k", 1, 200, int(scn.get("top_k",40)), 1)
-        with col[3]: ui_rp    = st.number_input("repeat_penalty", 0.5, 2.0, float(scn.get("repeat_penalty",1.1)), 0.05)
-        with col[4]: ui_maxt  = st.number_input("max_tokens", 32, 8192, int(scn.get("max_tokens",1024)), 32)
+            cr_infos = load_json(cr_infos_path, {}) if cr_infos_path and Path(cr_infos_path).is_file() else {}
+            cr_pcfixe = cr_infos.get("pcfixe", {}) if isinstance(cr_infos.get("pcfixe"), dict) else {}
+            cr_trans_dir = Path(cr_infos_path).parent if cr_infos_path else (cr_trans_dir_nas or Path(""))
+            cr_pcfixe_trans_dir = PCFIXE_AFFAIRES_ROOT / cr_affaire_id / "AF_Expert_ASR" / "transcriptions" / cr_id_captation
+            cr_queue_root, cr_queue_probes = resolve_pcfixe_affaires_share(require_jobs_queue=True)
+            st.markdown("#### Queue PC fixe")
+            st.text_input(
+                "Racine PC fixe retenue",
+                value=str(cr_queue_root),
+                disabled=True,
+                key="cr_job_pcfixe_root_resolved",
+            )
+            st.dataframe(
+                [
+                    {
+                        "adresse testée": row.get("root", ""),
+                        "testé": "oui" if row.get("tested") else "non",
+                        "racine": "oui" if row.get("root_accessible") else "non",
+                        "_jobs\\queued": "oui" if row.get("queue_ready") else "non",
+                        "résultat": row.get("status", ""),
+                        "détail": row.get("detail", ""),
+                    }
+                    for row in cr_queue_probes
+                ],
+                width="stretch",
+                hide_index=True,
+            )
+            if cr_queue_probes and str(cr_queue_root) != str(Path(PCFIXE_AFFAIRES_SHARE_CANDIDATES[0])):
+                st.caption(f"Fallback utilisé : {cr_queue_root}")
 
-        st.markdown("**Prompt monolithique (CR)**")
-        src = st.radio("Source prompt", ["Bibliothèque LLM_Assistant", "Template défaut"], index=0)
-        if src == "Bibliothèque LLM_Assistant":
-            keys = list(llm_scenarios.keys())
-            candidates = [k for k in keys if "compte" in k.lower() or "rapport" in k.lower()] or keys
-            key = st.selectbox("Scénario de prompt", candidates, index=0)
-            report_prompt = st.text_area("Prompt (éditable)", value=llm_scenarios.get(key, {}).get("prompt",""), height=200)
-        else:
-            report_templates = load_json("config/voxtral_report_prompts.json", {})
-            ids = list(report_templates.keys())
-            tid = st.selectbox("Template défaut", ids, index=0) if ids else None
-            report_prompt = st.text_area("Prompt (éditable)", value=(report_templates.get(tid, {}).get("instructions","") if tid else ""), height=200)
+            declared_csv = cr_pcfixe.get("fichier_transcription") or cr_infos.get("fichier_transcription") or ""
+            csv_name = Path(declared_csv).name if declared_csv else ""
+            if not csv_name and cr_trans_dir.exists():
+                csv_candidates = [
+                    p for p in sorted(cr_trans_dir.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+                    if "(photo)" not in p.name.lower() and "debrief" not in p.name.lower()
+                ]
+                csv_name = csv_candidates[0].name if csv_candidates else ""
+            cr_debrief = cr_infos.get("debrief", {}) if isinstance(cr_infos.get("debrief"), dict) else {}
+            declared_debrief_csv = (
+                cr_pcfixe.get("fichier_debrief")
+                or cr_infos.get("fichier_debrief")
+                or cr_debrief.get("global_csv")
+                or cr_debrief.get("csv")
+                or ""
+            )
+            debrief_resource = resolve_debrief_resource(cr_infos if isinstance(cr_infos, dict) else {}, cr_affaire_id)
+            debrief_sources_count = int(debrief_resource.get("sources_count") or 0)
 
-        if st.button("📨 Soumettre l’ASR au spooler avant génération du CR"):
-            submit_current_asr_job()
-            st.info("Le compte-rendu pourra être généré après publication des sorties ASR.")
+            st.markdown("#### Debriefs CSV à intégrer")
+            debrief_csv_default_dir = cr_trans_dir_nas or cr_trans_dir
+            st.text_input(
+                "Dossier canonique proposé",
+                value=str(debrief_csv_default_dir or ""),
+                disabled=True,
+                key="cr_debrief_csv_canonical_dir",
+            )
+            debrief_csv_custom_dir = st.text_input(
+                "Dossier contenant les CSV de debrief",
+                value=str(debrief_csv_default_dir or ""),
+                key="cr_debrief_csv_dir",
+                help="Le dossier par défaut est AF_Expert_ASR/transcriptions/<id_captation>/ ; il peut être remplacé par un dossier laptop ou réseau.",
+            ).strip().strip('"')
+            debrief_csv_advanced = st.checkbox(
+                "Mode avancé CSV debrief",
+                value=False,
+                key="cr_debrief_csv_advanced",
+                help="Permet d’inclure des CSV exclus par défaut ou d’ajouter des chemins manuels.",
+            )
+            debrief_csv_scan_dir = Path(debrief_csv_custom_dir) if debrief_csv_custom_dir else Path("")
+            debrief_csv_candidates = list_debrief_csv_candidates(
+                debrief_csv_scan_dir,
+                None,
+                main_transcription=declared_csv,
+            )
+            visible_debrief_csv_candidates = [
+                item for item in debrief_csv_candidates
+                if debrief_csv_advanced or not item["excluded"]
+            ]
+            if debrief_csv_candidates:
+                st.dataframe(
+                    [
+                        {
+                            "nom": item["name"],
+                            "détecté": "oui" if not item["excluded"] else "non",
+                            "priorité": int(item["score"]),
+                            "modifié": datetime.fromtimestamp(float(item["mtime"])).isoformat(timespec="seconds")
+                            if item["mtime"] else "",
+                            "chemin": str(item["path"]),
+                        }
+                        for item in visible_debrief_csv_candidates
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                st.caption("Aucun CSV détecté dans ce dossier.")
 
-        st.markdown("### ☁️ Upload ressources (vers PC fixe)")
-        up = st.file_uploader("Uploader un fichier ressource (txt/json)", type=["txt","json"], key="res_up")
-        if up and st.button("⬆️ Envoyer au serveur"):
-            files = {"file": (up.name, up.getvalue(), "application/octet-stream")}
-            form  = {
-                "project_id": get_project_id(project_config,""),
-                "area": "rag_pc",            # écris ça dans la racine RAG_PC du projet
-                "subdir": cfg_subdir,        # ex: "Config_ASR"
-                "filename": up.name,
-                "overwrite": "true"
+            debrief_csv_options: list[str] = []
+            debrief_csv_lookup: dict[str, Path] = {}
+            for item in visible_debrief_csv_candidates:
+                label = item["name"]
+                if item["excluded"]:
+                    label = f"{label} — exclu par défaut"
+                elif int(item["score"]) > 0:
+                    label = f"{label} — candidat debrief"
+                if label in debrief_csv_lookup:
+                    label = f"{label} ({item['path']})"
+                debrief_csv_options.append(label)
+                debrief_csv_lookup[label] = item["path"]
+
+            default_selected_labels: list[str] = []
+            if len(debrief_csv_options) == 1:
+                default_selected_labels = debrief_csv_options
+            elif declared_debrief_csv:
+                declared_name = Path(str(declared_debrief_csv)).name.casefold()
+                default_selected_labels = [
+                    label for label, path in debrief_csv_lookup.items()
+                    if path.name.casefold() == declared_name
+                ]
+            selected_debrief_csv_labels = st.multiselect(
+                "CSV de debrief à intégrer",
+                debrief_csv_options,
+                default=default_selected_labels,
+                key="cr_debrief_csv_sources",
+            )
+            if len(debrief_csv_options) > 1 and not selected_debrief_csv_labels:
+                st.info("Plusieurs CSV sont disponibles : sélectionner explicitement ceux à intégrer.")
+
+            manual_debrief_csv_paths: list[Path] = []
+            if debrief_csv_advanced:
+                manual_csv_text = st.text_area(
+                    "CSV supplémentaires manuels (un chemin par ligne)",
+                    value="",
+                    key="cr_debrief_csv_manual_paths",
+                )
+                manual_debrief_csv_paths = [
+                    Path(line.strip().strip('"'))
+                    for line in manual_csv_text.splitlines()
+                    if line.strip()
+                ]
+
+            selected_debrief_csv_paths = [debrief_csv_lookup[label] for label in selected_debrief_csv_labels]
+            selected_debrief_csv_paths.extend(manual_debrief_csv_paths)
+            default_order_paths = sorted(
+                selected_debrief_csv_paths,
+                key=lambda p: (
+                    p.stat().st_mtime if p.exists() else 0.0,
+                    p.name.casefold(),
+                ),
+            )
+            order_text_default = "\n".join(p.name for p in default_order_paths)
+            order_text = st.text_area(
+                "Ordre d’intégration visible et modifiable",
+                value=order_text_default,
+                key="cr_debrief_csv_order",
+                help="Réordonner les noms ou chemins : une ligne par CSV. Les CSV sélectionnés absents de cette liste seront ajoutés à la fin.",
+            )
+            order_lookup = {p.name.casefold(): p for p in selected_debrief_csv_paths}
+            order_lookup.update({str(p).casefold(): p for p in selected_debrief_csv_paths})
+            ordered_debrief_csv_paths: list[Path] = []
+            for line in order_text.splitlines():
+                key = line.strip().strip('"')
+                if not key:
+                    continue
+                resolved = order_lookup.get(key.casefold()) or Path(key)
+                if resolved in selected_debrief_csv_paths and resolved not in ordered_debrief_csv_paths:
+                    ordered_debrief_csv_paths.append(resolved)
+            for path in default_order_paths:
+                if path not in ordered_debrief_csv_paths:
+                    ordered_debrief_csv_paths.append(path)
+
+            canonical_global_dir = Path(str(debrief_csv_default_dir or debrief_csv_scan_dir or cr_trans_dir))
+            global_output_path = canonical_global_dir / "debrief_global.csv"
+            output_exists = global_output_path.exists()
+            if output_exists:
+                existing_mtime = datetime.fromtimestamp(global_output_path.stat().st_mtime).isoformat(timespec="seconds")
+                st.warning(f"debrief_global.csv existe déjà ({existing_mtime}).")
+            write_timestamped_global = st.checkbox(
+                "Créer une version horodatée si debrief_global.csv existe",
+                value=True,
+                key="cr_debrief_global_timestamped",
+            )
+            overwrite_debrief_global = st.checkbox(
+                "Confirmer l’écrasement de debrief_global.csv existant",
+                value=False,
+                key="cr_debrief_global_overwrite",
+            )
+            effective_global_output_path = global_output_path
+            if output_exists and write_timestamped_global and not overwrite_debrief_global:
+                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                effective_global_output_path = canonical_global_dir / f"debrief_global_{stamp}.csv"
+            st.text_input(
+                "Destination du CSV global",
+                value=str(effective_global_output_path),
+                disabled=True,
+                key="cr_debrief_global_output_display",
+            )
+            st.caption("Format de sortie : UTF-8, séparateur canonique ';'. Les sources restent inchangées ; la composition est tracée dans un manifeste JSON.")
+
+            can_build_debrief_global = bool(
+                cr_affaire_id
+                and cr_id_captation != "(aucune)"
+                and cr_infos_path
+                and canonical_global_dir
+            )
+            if st.button(
+                "Construire le CSV global de debrief",
+                key="cr_debrief_build_global",
+                disabled=not can_build_debrief_global,
+            ):
+                try:
+                    if not can_build_debrief_global:
+                        raise ValueError("Sélectionner une affaire, une captation et un infos_projet.json avant génération.")
+                    manifest = build_debrief_global_csv(
+                        sources=ordered_debrief_csv_paths,
+                        output_csv=effective_global_output_path,
+                        id_affaire=cr_affaire_id,
+                        id_captation=cr_id_captation,
+                        allow_overwrite=overwrite_debrief_global,
+                    )
+                    cr_infos = update_infos_projet_debrief_global_csv(
+                        cr_infos_path,
+                        global_csv=manifest["output_path"],
+                        csv_sources=ordered_debrief_csv_paths,
+                        id_affaire=cr_affaire_id,
+                        id_captation=cr_id_captation,
+                        nas_trans_dir=canonical_global_dir,
+                    )
+                    cr_pcfixe = cr_infos.get("pcfixe", {}) if isinstance(cr_infos.get("pcfixe"), dict) else {}
+                    cr_debrief = cr_infos.get("debrief", {}) if isinstance(cr_infos.get("debrief"), dict) else {}
+                    debrief_resource = resolve_debrief_resource(cr_infos, cr_affaire_id)
+                    debrief_sources_count = int(debrief_resource.get("sources_count") or 0)
+                    st.success("CSV global de debrief construit et inscrit dans infos_projet.json.")
+                    st.json({
+                        "global_csv": cr_debrief.get("global_csv", ""),
+                        "pcfixe_global_csv": cr_debrief.get("pcfixe_global_csv", ""),
+                        "sources": cr_debrief.get("csv_sources", []),
+                        "manifest": manifest.get("manifest_path", ""),
+                    })
+                except Exception as e:
+                    st.error(f"Construction du CSV global impossible : {e}")
+
+            resource_paths = {
+                "infos_projet.json": Path(cr_infos_path) if cr_infos_path else (cr_infos_nas or Path("")),
+                "transcription CSV": cr_trans_dir / csv_name if csv_name else cr_trans_dir / "transcription.csv",
+                "contexte_general_compte_rendu.json": cr_trans_dir / "contexte_general_compte_rendu.json",
+                "contexte_general.json": cr_trans_dir / "contexte_general.json",
+                "Sujets.xlsx": cr_trans_dir / "Sujets.xlsx",
+                "Participants.xlsx": cr_trans_dir / "Participants.xlsx",
+                "CSV debrief global": Path(debrief_resource.get("path") or ""),
+                "manifest ASR": cr_trans_dir / "manifest.json",
             }
-            r = requests.post(f"{SERVER_URL}/upload_file",
-                            headers={"x-api-key": API_KEY}, files=files, data=form, timeout=timeout)
-            st.write(r.json())
-
-
-elif page == "Prompts & Bibliothèque":
-    st.subheader("🧰 Prompts structurés (par projet)")
-
-    proj_id = get_project_id(project_config,"")
-    if st.button("🔄 Recharger depuis serveur"):
-        if not ensure_ready():
-            st.error("❌ Serveur injoignable après WOL"); st.stop()
-        r = requests.get(f"{SERVER_URL}/prompts_structures",
-                         headers={"x-api-key": API_KEY},
-                         params={"project_id": proj_id}, timeout=timeout)
-        data = r.json()
-        st.session_state.prompts_structures = data.get("prompts_structures", []) if data.get("ok") else []
-
-    prompts = st.session_state.get("prompts_structures", [])
-    st.write(f"Entrées: {len(prompts)}")
-    if prompts:
-        noms = [p.get("nom","(sans nom)") for p in prompts]
-        idx = st.selectbox("Sélection", list(range(len(noms))), format_func=lambda i: noms[i])
-        cur = prompts[idx]
-        nom = st.text_input("Nom", cur.get("nom",""))
-        objectif = st.text_input("Objectif", cur.get("objectif",""))
-        contexte = st.text_area("Contexte", cur.get("contexte",""), height=80)
-        fmt = st.text_input("Format", cur.get("format",""))
-        contraintes = st.text_area("Contraintes", cur.get("contraintes",""), height=80)
-        exemples = st.text_area("Exemples", cur.get("exemples",""), height=120)
-
-        col = st.columns(3)
-        with col[0]:
-            if st.button("💾 Enregistrer (écraser)"):
-                prompts[idx] = {
-                    "nom": nom, "objectif": objectif, "contexte": contexte,
-                    "format": fmt, "contraintes": contraintes, "exemples": exemples
+            context_ok = (
+                resource_paths["contexte_general_compte_rendu.json"].is_file()
+                or resource_paths["contexte_general.json"].is_file()
+            )
+            resource_required = {
+                "infos_projet.json": True,
+                "transcription CSV": True,
+                "contexte_general_compte_rendu.json": not context_ok,
+                "contexte_general.json": False,
+                "Sujets.xlsx": True,
+                "Participants.xlsx": True,
+                "CSV debrief global": False,
+                "manifest ASR": False,
+            }
+            st.markdown("#### Contrôle des ressources")
+            st.table([
+                {
+                    "ressource": name,
+                    "obligatoire": "oui" if resource_required[name] else "non",
+                    "présent": "oui" if (debrief_resource.get("present") if name == "CSV debrief global" else path.is_file()) else "non",
+                    "sources": str(debrief_sources_count) if name == "CSV debrief global" else "",
+                    "chemin": (
+                        str(debrief_resource.get("declared") or debrief_resource.get("path") or "")
+                        if name == "CSV debrief global"
+                        else str(path)
+                    ),
                 }
-                r = requests.put(f"{SERVER_URL}/prompts_structures",
-                                 headers={"x-api-key": API_KEY},
-                                 json={"project_id": proj_id, "prompts_structures": prompts}, timeout=timeout)
+                for name, path in resource_paths.items()
+            ])
+
+            def copy_cr_resource(source_value: str, target: Path, resource_name: str) -> None:
+                source = Path((source_value or "").strip().strip('"'))
+                if not source.is_file():
+                    raise FileNotFoundError(f"Fichier source introuvable : {source}")
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
+                if resource_name == "infos_projet.json":
+                    return
+                infos_file = Path(cr_infos_path)
+                if not infos_file.is_file():
+                    return
+                data = load_json(str(infos_file), {})
+                if not isinstance(data, dict):
+                    return
+                data.setdefault("pcfixe", {})
+                pc = data["pcfixe"] if isinstance(data["pcfixe"], dict) else {}
+                data["pcfixe"] = pc
+                pc["root_affaires"] = str(PCFIXE_AFFAIRES_ROOT)
+                if resource_name == "transcription CSV":
+                    data["fichier_transcription"] = str(target)
+                    pc["fichier_transcription"] = str(cr_pcfixe_trans_dir / target.name)
+                elif resource_name.startswith("contexte_general"):
+                    data["fichier_contexte_general"] = str(target)
+                    pc["fichier_contexte_general"] = str(cr_pcfixe_trans_dir / target.name)
+                elif resource_name == "Sujets.xlsx":
+                    data["fichier_sujets"] = str(target)
+                    pc["fichier_sujets"] = str(cr_pcfixe_trans_dir / target.name)
+                elif resource_name == "Participants.xlsx":
+                    data["fichier_participants"] = str(target)
+                    pc["fichier_participants"] = str(cr_pcfixe_trans_dir / target.name)
+                elif resource_name == "CSV debrief global":
+                    data["fichier_debrief"] = str(target)
+                    pc["fichier_debrief"] = str(cr_pcfixe_trans_dir / target.name)
+                    data.setdefault("debrief", {})
+                    if isinstance(data["debrief"], dict):
+                        data["debrief"]["csv"] = str(target)
+                        data["debrief"]["pcfixe_csv"] = str(cr_pcfixe_trans_dir / target.name)
+                        data["debrief"]["transcribed"] = True
+                save_json(str(infos_file), data)
+
+            missing_required = [
+                name for name, required in resource_required.items()
+                if required and not resource_paths[name].is_file()
+            ]
+            if missing_required:
+                st.warning("Ressources obligatoires absentes : " + ", ".join(missing_required))
+                with st.expander("Ajouter/copier une ressource manquante", expanded=True):
+                    copy_name = st.selectbox("Ressource à copier", missing_required, key="cr_resource_copy_name")
+                    source_path = st.text_input(
+                        "Fichier source sur le laptop",
+                        value="",
+                        key="cr_resource_copy_source",
+                        help="Chaque ressource peut venir d’un dossier différent.",
+                    )
+                    target_path = st.text_input(
+                        "Destination canonique",
+                        value=str(resource_paths[copy_name]),
+                        disabled=True,
+                        key="cr_resource_copy_target",
+                    )
+                    if st.button("Copier vers l’emplacement canonique", key="cr_resource_copy_button"):
+                        try:
+                            copy_cr_resource(source_path, resource_paths[copy_name], copy_name)
+                            st.success(f"{copy_name} copié vers {target_path}")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Copie impossible : {e}")
+
+            st.markdown("#### Profil LLM")
+            current_routing = _cr_existing_routing(cr_infos if isinstance(cr_infos, dict) else {})
+            current_profile = _cr_detect_profile(current_routing)
+            profile_keys = list(CR_LLM_PROFILES.keys())
+            selected_profile = st.selectbox(
+                "Profil LLM",
+                profile_keys,
+                format_func=lambda key: CR_LLM_PROFILE_LABELS.get(key, key),
+                index=profile_keys.index(current_profile),
+                key="cr_job_llm_profile",
+            )
+            selected_routing = (
+                dict(current_routing)
+                if selected_profile == "personnalise"
+                else _cr_profile_values(selected_profile)
+            )
+            selected_routing["profil_llm"] = selected_profile
+
+            if selected_profile != "personnalise" and cr_infos_path and Path(cr_infos_path).is_file():
+                desired = _cr_patch_infos_routing(cr_infos, selected_routing)
+                if desired.get("compte_rendu") != cr_infos.get("compte_rendu"):
+                    _atomic_write_json(Path(cr_infos_path), desired)
+                    cr_infos = desired
+                    current_routing = _cr_existing_routing(cr_infos)
+                    st.success("Profil LLM enregistré dans infos_projet.json.")
+
+            if selected_profile == "personnalise":
+                st.caption("Le profil personnalisé modifie uniquement la section compte_rendu.")
+                custom_cols = st.columns(3)
+                with custom_cols[0]:
+                    selected_routing["provider"] = st.text_input("provider", value=str(current_routing.get("provider", "")), key="cr_llm_provider")
+                with custom_cols[1]:
+                    selected_routing["api_base"] = st.text_input("api_base", value=str(current_routing.get("api_base", "")), key="cr_llm_api_base")
+                with custom_cols[2]:
+                    selected_routing["preset"] = st.text_input("preset", value=str(current_routing.get("preset", "")), key="cr_llm_preset")
+                for pass_label, routing_key in CR_LLM_PASS_LABELS:
+                    selected_routing[routing_key] = st.text_input(
+                        f"{pass_label} ({routing_key})",
+                        value=str(current_routing.get(routing_key, "")),
+                        key=f"cr_llm_{routing_key}",
+                    )
+                if st.button("Enregistrer le profil LLM personnalisé", key="cr_llm_custom_save"):
+                    try:
+                        if not cr_infos_path or not Path(cr_infos_path).is_file():
+                            raise FileNotFoundError(f"infos_projet.json introuvable : {cr_infos_path}")
+                        updated_infos = _cr_patch_infos_routing(cr_infos, selected_routing)
+                        _atomic_write_json(Path(cr_infos_path), updated_infos)
+                        cr_infos = updated_infos
+                        st.success("Profil LLM personnalisé enregistré dans infos_projet.json.")
+                    except Exception as e:
+                        st.error(f"Enregistrement du profil LLM impossible : {e}")
+
+            if st.button("Afficher le routage LLM", key="cr_llm_show_routing"):
+                st.table([
+                    {"Passe": pass_label, "Alias": selected_routing.get(routing_key, "")}
+                    for pass_label, routing_key in CR_LLM_PASS_LABELS
+                ])
+
+            st.markdown("#### Paramètres du job")
+            reprise_mode = st.radio(
+                "Type de lancement",
+                ["run complet", "reprise Pass2B", "reprise Sujets"],
+                horizontal=True,
+                key="cr_job_reprise_mode",
+            )
+            col_resume = st.columns(3)
+            with col_resume[0]:
+                existing_run = st.text_input("existing_run", value="", key="cr_job_existing_run")
+            with col_resume[1]:
+                only_pass2b_batches = st.text_input(
+                    "only_pass2b_batches",
+                    value="",
+                    disabled=(reprise_mode != "reprise Pass2B"),
+                    key="cr_job_only_pass2b",
+                )
+            with col_resume[2]:
+                only_subjects = st.text_input(
+                    "only_subjects",
+                    value="",
+                    disabled=(reprise_mode != "reprise Sujets"),
+                    key="cr_job_only_subjects",
+                )
+            if reprise_mode == "run complet":
+                only_pass2b_batches = ""
+                only_subjects = ""
+            elif reprise_mode == "reprise Pass2B":
+                only_subjects = ""
+            elif reprise_mode == "reprise Sujets":
+                only_pass2b_batches = ""
+
+            col_opts = st.columns(5)
+            with col_opts[0]:
+                cr_force = st.checkbox("force", value=False, key="cr_job_force")
+            with col_opts[1]:
+                cr_strict_sync = st.checkbox("strict_sync", value=False, key="cr_job_strict_sync")
+            with col_opts[2]:
+                cr_docx_only = st.checkbox("docx_only", value=False, key="cr_job_docx_only")
+            with col_opts[3]:
+                cr_mirror_pc = st.checkbox("mirror_pc", value=True, key="cr_job_mirror_pc")
+            with col_opts[4]:
+                cr_dry_run = st.checkbox("dry-run", value=True, key="cr_job_dry_run")
+
+            if st.button("📨 Soumettre le compte-rendu au spooler", key="cr_job_submit"):
+                if cr_id_captation == "(aucune)":
+                    st.error("Sélectionner une captation.")
+                elif missing_required:
+                    st.error("Compléter les ressources obligatoires avant de déposer le job.")
+                else:
+                    try:
+                        job_result = submit_compte_rendu_job(
+                            infos_path=cr_infos_path,
+                            id_affaire=cr_affaire_id,
+                            id_captation=cr_id_captation,
+                            llm_routing=selected_routing,
+                            force=cr_force,
+                            strict_sync=cr_strict_sync,
+                            docx_only=cr_docx_only,
+                            mirror_pc=cr_mirror_pc,
+                            existing_run=existing_run,
+                            only_pass2b_batches=only_pass2b_batches,
+                            only_subjects=only_subjects,
+                            dry_run=cr_dry_run,
+                        )
+                        st.session_state["voxtral_last_compte_rendu_job"] = job_result
+                        st.write("job_id :", job_result["job_id"])
+                        st.write("chemin JSON :", job_result["job_path"])
+                        st.write("statut initial :", job_result["status"])
+                        if job_result.get("patched_infos"):
+                            st.write("infos_projet.json mis à jour :", job_result["patched_infos"])
+                        st.markdown("Commande NAS reconstruite :")
+                        st.code(job_result["nas_command"], language="bash")
+                        st.markdown("Routage LLM transmis :")
+                        st.json(job_result["llm_routing"])
+                        st.json(job_result["job"])
+                        if not cr_dry_run:
+                            st.success("Job compte_rendu déposé. Streamlit n’attend pas la fin du traitement.")
+                    except Exception as e:
+                        st.error(f"Soumission du job compte_rendu impossible : {e}")
+
+            if st.button("📨 Soumettre l’ASR au spooler avant génération du CR", key="cr_submit_asr_before_cr"):
+                submit_current_asr_job()
+                st.info("Le compte-rendu pourra être soumis après publication des sorties ASR.")
+
+        else:
+            st.markdown("### 🧪 Mode libre / hors affaire")
+            st.caption("Usages ponctuels conservés : CSV/audio manuel, /voxtral_chat et /asr_voxtral restent disponibles.")
+            media = st.text_input(
+                "Média (PC fixe) — CR libre",
+                value=prepared_voxtral_audio or project_config.get("ocr_input_pcfixe", ""),
+                key="voxtral_cr_media",
+            )
+            csv_dir2 = st.text_input("Dossier CSV sortie (PC fixe) — CR libre", value=project_config.get("csv_output_pcfixe",""), key="voxtral_cr_csv_output_dir")
+            also_csv = st.checkbox("Produire aussi un CSV de transcription pure", value=True, key="voxtral_cr_also_csv")
+
+            st.markdown("**Paramètres LLM (scénario 'rapport', modifiables)**")
+            cr_scenarios = [k for k, v in llm_scenarios.items() if isinstance(v, dict)]
+            default_cr = "rapport" if "rapport" in llm_scenarios else (cr_scenarios[0] if cr_scenarios else "")
+            cr_choice = st.selectbox(
+                "Scénario CR libre",
+                cr_scenarios or ["(aucun)"],
+                index=cr_scenarios.index(default_cr) if default_cr in cr_scenarios else 0,
+                key="voxtral_cr_free_scenario",
+            )
+            scn = llm_scenarios.get(cr_choice, {})
+            col = st.columns(5)
+            with col[0]: ui_temp  = st.number_input("Temp. CR libre", 0.0, 1.5, float(scn.get("temperature",0.7)), 0.05, key="voxtral_cr_free_temp")
+            with col[1]: ui_top_p = st.number_input("top_p CR libre", 0.0, 1.0, float(scn.get("top_p",0.9)), 0.05, key="voxtral_cr_free_top_p")
+            with col[2]: ui_top_k = st.number_input("top_k CR libre", 1, 200, int(scn.get("top_k",40)), 1, key="voxtral_cr_free_top_k")
+            with col[3]: ui_rp    = st.number_input("repeat_penalty CR libre", 0.5, 2.0, float(scn.get("repeat_penalty",1.1)), 0.05, key="voxtral_cr_free_repeat_penalty")
+            with col[4]: ui_maxt  = st.number_input("max_tokens CR libre", 32, 8192, int(scn.get("max_tokens",1024)), 32, key="voxtral_cr_free_max_tokens")
+
+            st.markdown("**Prompt monolithique (CR libre)**")
+            src = st.radio("Source prompt libre", ["Bibliothèque LLM_Assistant", "Template défaut"], index=0, key="voxtral_cr_free_prompt_source")
+            if src == "Bibliothèque LLM_Assistant":
+                keys = list(llm_scenarios.keys())
+                candidates = [k for k in keys if "compte" in k.lower() or "rapport" in k.lower()] or keys
+                key = st.selectbox("Scénario de prompt libre", candidates, index=0, key="voxtral_cr_free_prompt_key")
+                report_prompt = st.text_area("Prompt libre (éditable)", value=llm_scenarios.get(key, {}).get("prompt",""), height=200, key="voxtral_cr_free_prompt")
+            else:
+                report_templates = load_json("config/voxtral_report_prompts.json", {})
+                ids = list(report_templates.keys())
+                tid = st.selectbox("Template défaut libre", ids, index=0, key="voxtral_cr_free_template") if ids else None
+                report_prompt = st.text_area("Prompt libre (éditable)", value=(report_templates.get(tid, {}).get("instructions","") if tid else ""), height=200, key="voxtral_cr_free_template_prompt")
+
+            csv_for_chat = st.text_input("CSV brut (chemin serveur)", value="", key="voxtral_chat_source_csv_free")
+            csv_out_cr = st.text_input("Dossier sortie CR libre (PC fixe)", value=csv_dir2, key="voxtral_chat_output_dir_free")
+            template_key = st.text_input("Template key libre", value="expert_compte_rendu_v1", key="voxtral_chat_template_key_free")
+            report_prompts_path = st.text_input(
+                "Chemin serveur des templates CR libres",
+                value=build_server_local_path(proj_pcfixe, cfg_subdir, "voxtral_report_prompts.json"),
+                key="voxtral_chat_report_prompts_path_free",
+            )
+            if st.button("🧾 Générer CR libre via /voxtral_chat", key="voxtral_chat_free_submit"):
+                names_list = [l.strip() for l in (names_text or "").splitlines() if l.strip()]
+                names_list = _dedupe_keep_order(names_list + list(asr_ctx.get("auto_vocab_lines") or []))
+                payload = {
+                    "mode": "summarize",
+                    "csv_path": csv_for_chat,
+                    "model_key": asr_model_key,
+                    "report_prompts_path": (report_prompts_path.strip() or None),
+                    "template_key": template_key.strip() or "expert_compte_rendu_v1",
+                    "export_chat_csv": True,
+                    "export_chat_docx": True,
+                    "names_hint": names_list or None,
+                    "excel_encoding": excel_enc,
+                    "excel_decimal":  excel_dec,
+                    "project_id": get_project_id(project_config, ""),
+                }
+                if (csv_out_cr or "").strip():
+                    payload["output_csv_dir"] = csv_out_cr.strip()
+                r = requests.post(f"{SERVER_URL}/voxtral_chat", headers={"x-api-key": API_KEY}, json=payload, timeout=timeout)
                 st.write(r.json())
 
-        with col[1]:
-            if st.button("➕ Ajouter nouveau"):
-                prompts.append({"nom":"", "objectif":"", "contexte":"", "format":"", "contraintes":"", "exemples":""})
-                # pas d’envoi serveur tant que non enregistré
+            if st.button("📨 Soumettre l’ASR libre au spooler", key="voxtral_cr_free_asr_submit"):
+                submit_current_asr_job()
 
-        with col[2]:
-            if st.button("🗑️ Supprimer l’élément"):
-                r = requests.delete(f"{SERVER_URL}/prompts_structures/item",
-                                    headers={"x-api-key": API_KEY},
-                                    params={"project_id": proj_id, "nom": cur.get("nom","")}, timeout=timeout)
+            st.markdown("### ☁️ Upload ressources libre (vers PC fixe)")
+            up = st.file_uploader("Uploader un fichier ressource libre (txt/json)", type=["txt","json"], key="res_up_free")
+            if up and st.button("⬆️ Envoyer au serveur", key="res_up_free_submit"):
+                files = {"file": (up.name, up.getvalue(), "application/octet-stream")}
+                form  = {
+                    "project_id": get_project_id(project_config,""),
+                    "area": "rag_pc",
+                    "subdir": cfg_subdir,
+                    "filename": up.name,
+                    "overwrite": "true"
+                }
+                r = requests.post(
+                    f"{SERVER_URL}/upload_file",
+                    headers={"x-api-key": API_KEY},
+                    files=files,
+                    data=form,
+                    timeout=timeout,
+                )
                 st.write(r.json())
-                # resync local
-                st.session_state.prompts_structures = [p for p in prompts if p.get("nom") != cur.get("nom","")]
+
 
 elif page == "Annotation photos / Rapport Word":
     st.subheader("Annotation photos / Rapport Word")
 
-    default_affaire = get_project_id(project_config, "")
-    ann_id_affaire = st.text_input("id_affaire", value=default_affaire, key="ann_photos_id_affaire").strip()
+    ann_id_affaire = selection if selection != "➕ Créer une nouvelle affaire…" else get_project_id(project_config, "")
+    st.text_input("id_affaire", value=ann_id_affaire, disabled=True, key="ann_photos_id_affaire_display")
     ann_known_captations: list[str] = []
     if ann_id_affaire:
         ann_known_captations.extend([c["id_captation"] for c in list_captations(ann_id_affaire)])
@@ -8331,9 +10096,13 @@ elif page == "Annotation photos / Rapport Word":
         if ann_nas_trans_root.exists():
             ann_known_captations.extend([p.name for p in sorted(ann_nas_trans_root.iterdir()) if p.is_dir()])
     ann_known_captations = list(dict.fromkeys([x for x in ann_known_captations if x]))
+    ann_captation_options = ann_known_captations or ["(saisir manuellement)"]
+    if st.session_state.get("ann_photos_id_captation_select") not in ann_captation_options:
+        st.session_state["ann_photos_id_captation_select"] = ann_captation_options[0]
     ann_selected_captation = st.selectbox(
         "id_captation",
-        ann_known_captations or ["(saisir manuellement)"],
+        ann_captation_options,
+        index=ann_captation_options.index(st.session_state["ann_photos_id_captation_select"]),
         key="ann_photos_id_captation_select",
     )
     ann_manual_captation = ""
@@ -8387,7 +10156,8 @@ elif page == "Annotation photos / Rapport Word":
         )
 
         ann_resources = _annotation_resource_paths(ann_infos_path, ann_infos if isinstance(ann_infos, dict) else {})
-        ann_job_statuses = _annotation_job_statuses(ann_id_affaire, ann_id_captation)
+        ann_job_details = _annotation_job_details(ann_id_affaire, ann_id_captation)
+        ann_job_statuses = {key: value.get("status", "absent") for key, value in ann_job_details.items()}
         ann_report_files = []
         for report_root in (ann_paths["pcfixe_report_unc_dir"], ann_paths["nas_report_dir"]):
             if report_root.exists():
@@ -8403,9 +10173,21 @@ elif page == "Annotation photos / Rapport Word":
             for name, path in ann_resources.items()
         ]
         status_rows.extend([
-            {"élément": "traitement initial", "état": ann_job_statuses["initial"], "chemin": ""},
-            {"élément": "analyse weak", "état": ann_job_statuses["weak_dry_run"], "chemin": ""},
-            {"élément": "reprise weak", "état": ann_job_statuses["weak_rerun"], "chemin": ""},
+            {
+                "élément": PHOTO_BATCH_ACTIONS["initial"]["status_label"],
+                "état": ann_job_statuses["initial"],
+                "chemin": ann_job_details["initial"].get("job_path", ""),
+            },
+            {
+                "élément": PHOTO_BATCH_ACTIONS["weak_dry_run"]["status_label"],
+                "état": ann_job_statuses["weak_dry_run"],
+                "chemin": ann_job_details["weak_dry_run"].get("job_path", ""),
+            },
+            {
+                "élément": PHOTO_BATCH_ACTIONS["weak_rerun"]["status_label"],
+                "état": ann_job_statuses["weak_rerun"],
+                "chemin": ann_job_details["weak_rerun"].get("job_path", ""),
+            },
             {
                 "élément": "rapport Word",
                 "état": ann_report_status,
@@ -8413,7 +10195,26 @@ elif page == "Annotation photos / Rapport Word":
             },
         ])
         st.markdown("#### Tableau d'état")
-        st.dataframe(status_rows, use_container_width=True, hide_index=True)
+        st.dataframe(status_rows, width="stretch", hide_index=True)
+        job_follow_rows = [
+            {
+                "action": PHOTO_BATCH_ACTIONS[action_key]["status_label"],
+                "statut": detail.get("status", "absent"),
+                "job_id": detail.get("job_id", ""),
+                "total": detail.get("total_photos", ""),
+                "annoté": detail.get("annotated_photos", ""),
+                "restant": detail.get("remaining_photos", ""),
+                "weak": detail.get("weak_photos", ""),
+                "log / rapport": detail.get("report_path") or detail.get("log_path") or "",
+            }
+            for action_key, detail in ann_job_details.items()
+        ]
+        st.markdown("#### Suivi des jobs batch")
+        st.dataframe(job_follow_rows, width="stretch", hide_index=True)
+        st.caption(
+            "Les compteurs ne sont affichés que si le spooler ou le batch les écrit dans le JSON de job. "
+            "Le batch PC fixe écrit aussi stdout et batch_all_photos_pcfixe.log, mais pas de JSON de synthèse dédié."
+        )
 
         st.markdown("#### Ressources obligatoires")
         copy_candidates = {
@@ -8498,10 +10299,10 @@ elif page == "Annotation photos / Rapport Word":
                 st.error(f"Mise à jour impossible : {e}")
 
         st.markdown("#### Actions de traitement")
-        ann_job_dry_run = st.checkbox(
-            "Dry-run job photos (afficher le JSON sans le déposer)",
+        ann_job_preview_only = st.checkbox(
+            "Prévisualiser le JSON sans déposer le job",
             value=True,
-            key="ann_photos_job_dry_run",
+            key="ann_photos_job_preview_only",
         )
         for action_key, spec in PHOTO_BATCH_ACTIONS.items():
             st.markdown(f"#### {spec['label']}")
@@ -8520,13 +10321,17 @@ elif page == "Annotation photos / Rapport Word":
                         id_captation=ann_id_captation,
                         infos_pcfixe=ann_paths["pcfixe_infos"],
                         action_key=action_key,
-                        dry_run=ann_job_dry_run,
+                        dry_run=ann_job_preview_only,
                     )
                     st.write("job_id :", result["job_id"])
                     st.write("chemin JSON :", result["job_path"])
                     st.write("statut initial :", result["status"])
                     st.json(result["job"])
-                    if not ann_job_dry_run:
+                    if ann_job_preview_only:
+                        st.info("Aucun job déposé : prévisualisation UI uniquement.")
+                    elif action_key == "weak_dry_run":
+                        st.success("Job d’analyse déposé. Le batch analysera les CSV sans modifier les annotations.")
+                    else:
                         st.success("Job annotation_photos_batch déposé. Streamlit n'attend pas la fin du traitement.")
                 except Exception as e:
                     st.error(f"Soumission impossible : {e}")
@@ -8544,23 +10349,109 @@ elif page == "Annotation photos / Rapport Word":
             horizontal=True,
             key="ann_photos_report_filter",
         )
+        ann_report_dry_run = st.checkbox(
+            "Dry-run rapport Word (afficher le JSON sans le déposer)",
+            value=True,
+            key="ann_photos_report_job_dry_run",
+        )
         report_preview = _photo_report_job_preview(
             id_affaire=ann_id_affaire,
             id_captation=ann_id_captation,
             infos_pcfixe=ann_paths["pcfixe_infos"],
             mode=report_mode,
             only_retenue=report_filter == "uniquement photos retenues",
+            dry_run=True,
         )
-        st.warning("Support spooler serveur requis avant exécution réelle.")
-        if st.button("Préparer le job rapport Word (dry-run)", key="ann_photos_report_dry_run"):
-            st.write("job_id :", report_preview["job"]["job_id"])
-            st.write("chemin JSON prévu :", report_preview["job_path"])
-            st.write("statut initial :", report_preview["status"])
-            st.json(report_preview)
+        st.json(report_preview["job"])
+        initial_status = ann_job_statuses.get("initial", "absent")
+        weak_analysis_status = ann_job_statuses.get("weak_dry_run", "absent")
+        weak_rerun_status = ann_job_statuses.get("weak_rerun", "absent")
+        report_block_reasons: list[str] = []
+        if initial_status in {"queued", "running", "failed", "absent"}:
+            report_block_reasons.append(f"traitement initial {initial_status}")
+        if report_mode == "valide" and weak_rerun_status in {"queued", "running", "failed"}:
+            report_block_reasons.append(f"reprise weak {weak_rerun_status}")
+        if weak_analysis_status in {"queued", "running"}:
+            st.info("Analyse dry-run batch en cours : le rapport provisoire peut rester soumis si le traitement initial est terminé.")
+        if report_block_reasons:
+            st.warning("Rapport Word bloqué : " + ", ".join(report_block_reasons))
+        if st.button(
+            "Soumettre le rapport Word au spooler",
+            key="ann_photos_report_submit",
+            disabled=bool(report_block_reasons),
+        ):
+            try:
+                report_result = _photo_report_job_preview(
+                    id_affaire=ann_id_affaire,
+                    id_captation=ann_id_captation,
+                    infos_pcfixe=ann_paths["pcfixe_infos"],
+                    mode=report_mode,
+                    only_retenue=report_filter == "uniquement photos retenues",
+                    dry_run=ann_report_dry_run,
+                )
+                st.write("job_id :", report_result["job"]["job_id"])
+                st.write("chemin JSON :", report_result["job_path"])
+                st.write("statut initial :", report_result["status"])
+                st.json(report_result["job"])
+                if not ann_report_dry_run:
+                    st.success("Job annotation_photos_word_report déposé. Streamlit n'attend pas la fin du traitement.")
+            except Exception as e:
+                st.error(f"Soumission impossible : {e}")
         st.caption(
-            "Aucun JSON n'est déposé et aucun traitement long n'est lancé depuis Streamlit "
-            "tant que le type de job serveur n'existe pas."
+            "Le rapport Word est exécuté par le spooler PC fixe ; aucun traitement long n'est lancé depuis Streamlit."
         )
+
+elif page == "Prompts & Bibliothèque":
+    st.subheader("🧰 Prompts structurés (par projet)")
+
+    proj_id = get_project_id(project_config,"")
+    if st.button("🔄 Recharger depuis serveur"):
+        if not ensure_ready():
+            st.error("❌ Serveur injoignable après WOL"); st.stop()
+        r = requests.get(f"{SERVER_URL}/prompts_structures",
+                         headers={"x-api-key": API_KEY},
+                         params={"project_id": proj_id}, timeout=timeout)
+        data = r.json()
+        st.session_state.prompts_structures = data.get("prompts_structures", []) if data.get("ok") else []
+
+    prompts = st.session_state.get("prompts_structures", [])
+    st.write(f"Entrées: {len(prompts)}")
+    if prompts:
+        noms = [p.get("nom","(sans nom)") for p in prompts]
+        idx = st.selectbox("Sélection", list(range(len(noms))), format_func=lambda i: noms[i])
+        cur = prompts[idx]
+        nom = st.text_input("Nom", cur.get("nom",""))
+        objectif = st.text_input("Objectif", cur.get("objectif",""))
+        contexte = st.text_area("Contexte", cur.get("contexte",""), height=80)
+        fmt = st.text_input("Format", cur.get("format",""))
+        contraintes = st.text_area("Contraintes", cur.get("contraintes",""), height=80)
+        exemples = st.text_area("Exemples", cur.get("exemples",""), height=120)
+
+        col = st.columns(3)
+        with col[0]:
+            if st.button("💾 Enregistrer (écraser)"):
+                prompts[idx] = {
+                    "nom": nom, "objectif": objectif, "contexte": contexte,
+                    "format": fmt, "contraintes": contraintes, "exemples": exemples
+                }
+                r = requests.put(f"{SERVER_URL}/prompts_structures",
+                                 headers={"x-api-key": API_KEY},
+                                 json={"project_id": proj_id, "prompts_structures": prompts}, timeout=timeout)
+                st.write(r.json())
+
+        with col[1]:
+            if st.button("➕ Ajouter nouveau"):
+                prompts.append({"nom":"", "objectif":"", "contexte":"", "format":"", "contraintes":"", "exemples":""})
+                # pas d’envoi serveur tant que non enregistré
+
+        with col[2]:
+            if st.button("🗑️ Supprimer l’élément"):
+                r = requests.delete(f"{SERVER_URL}/prompts_structures/item",
+                                    headers={"x-api-key": API_KEY},
+                                    params={"project_id": proj_id, "nom": cur.get("nom","")}, timeout=timeout)
+                st.write(r.json())
+                # resync local
+                st.session_state.prompts_structures = [p for p in prompts if p.get("nom") != cur.get("nom","")]
 
 elif page == "Historique Q&A":
     st.subheader("🗂️ Historique Q&A — projet courant")
@@ -8640,17 +10531,7 @@ elif page == "Historique Q&A":
 
 elif page == "Administration":
     st.subheader("🔧 Administration")
-    col = st.columns(3)
-    with col[0]:
-        if st.button("🔔 Wake-on-LAN"):
-            wake_server(MAC_PCFIXE); time.sleep(3)
-            st.info("WOL envoyé.")
-    with col[1]:
-        if st.button("📶 Ping serveur"):
-            ok = is_server_reachable(SERVER_IP, int(SERVER_PORT))
-            st.success("Serveur OK") if ok else st.error("Serveur KO")
-    with col[2]:
-        st.json({"SERVER_IP": SERVER_IP, "SERVER_PORT": SERVER_PORT, "MAC_PCFIXE": MAC_PCFIXE})
+    _render_pcfixe_admin_section()
 
     st.markdown("### Correction ciblée d’un libellé documentaire")
     st.text_input(
@@ -9234,7 +11115,7 @@ elif page == "Pré-traitement dépôt PDF":
             pass
 
         try:
-            unc_dst.parent.mkdir(parents=True, exist_ok=True)
+            result["pcfixe_preflight"] = preflight_pcfixe_target_dir(unc_dst.parent)
             shutil.copy2(str(local_src), str(unc_dst))
             result["copied"] = True
         except Exception as exc:
@@ -9336,14 +11217,14 @@ elif page == "Pré-traitement dépôt PDF":
         }
 
     def pcfixe_jobs_queued_unc() -> str:
-        return r"\\192.168.0.155\Affaires\_jobs\queued"
+        return str(get_pcfixe_affaires_root() / "_jobs" / "queued")
 
     def pcfixe_jobs_root_unc() -> str:
-        return r"\\192.168.0.155\Affaires\_jobs"
+        return str(get_pcfixe_affaires_root() / "_jobs")
 
     def write_deepseek_ocr_job(job: dict, queued_dir_unc: str) -> str:
         queued_dir = Path(queued_dir_unc)
-        queued_dir.mkdir(parents=True, exist_ok=True)
+        preflight_pcfixe_target_dir(queued_dir)
         safe_job_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(job.get("job_id") or "deepseek_ocr_job")).strip("_")
         target = queued_dir / f"{safe_job_id}.json"
         if target.exists():
@@ -9356,7 +11237,7 @@ elif page == "Pré-traitement dépôt PDF":
         prefix = _norm(r"C:\Affaires")
         if raw.lower().startswith(prefix.lower()):
             rel = raw[len(prefix):].strip("\\/ ")
-            return pj(r"\\192.168.0.155\Affaires", rel)
+            return pj(str(get_pcfixe_affaires_root()), rel)
         return path_value or ""
 
     def _read_json_file_best_effort(path_value: str) -> dict:
@@ -10980,7 +12861,7 @@ elif page == "Pré-traitement dépôt PDF":
             try:
                 source_unc = Path(input_path_unc)
                 if not source_unc.is_file():
-                    source_unc.parent.mkdir(parents=True, exist_ok=True)
+                    preflight_pcfixe_target_dir(source_unc.parent)
                     shutil.copy2(str(this_pdf), str(source_unc))
                 if not source_unc.is_file():
                     st.error(f"PDF source absent côté PC fixe après copie : {input_path_unc}")
@@ -12156,7 +14037,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                         row["nas_dir_exists_before"] = nas_dst_dir.exists()
                         row["pcfixe_dir_exists_before"] = pc_unc_dst_dir.exists()
                         nas_dst_dir.mkdir(parents=True, exist_ok=True)
-                        pc_unc_dst_dir.mkdir(parents=True, exist_ok=True)
+                        row["pcfixe_preflight"] = preflight_pcfixe_target_dir(pc_unc_dst_dir)
                         row["nas_exists_before"] = nas_dst.exists()
                         row["pcfixe_exists_before"] = pc_unc_dst.exists()
     
@@ -13095,6 +14976,7 @@ if affaire_id:
             "--affaire", affaire_id,
             "--cwd", str(jpg_dir),
             "--root-dst", ROOT_DST_DEFAULT,
+            "--root-pcfixe", str(get_pcfixe_affaires_root()),
             "--mode", "FULL",
             "--photos-csv-path", str(photos_csv_path),
         ]
