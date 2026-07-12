@@ -16,6 +16,8 @@ DEFAULT_FLASK_ENDPOINTS = (
 )
 
 _CACHE_TTL_SECONDS = float(os.getenv("FLASK_ENDPOINT_CACHE_TTL", "60"))
+_PING_CONNECT_TIMEOUT = float(os.getenv("FLASK_PING_CONNECT_TIMEOUT", "1.5"))
+_PING_READ_TIMEOUT = float(os.getenv("FLASK_PING_READ_TIMEOUT", "5"))
 _cached_url: str | None = None
 _cached_until = 0.0
 
@@ -70,20 +72,145 @@ def _candidate_urls(extra_candidates: Iterable[str] | None = None) -> list[str]:
     return urls
 
 
-def ping_endpoint(url: str, timeout: float = 1.5) -> bool:
+def _timeout_ms(timeout: float | tuple[float, float], index: int = 1) -> int:
+    if isinstance(timeout, tuple):
+        timeout = timeout[index]
+    return int(float(timeout) * 1000)
+
+
+def _is_connection_refused(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return "connection refused" in text or "winerror 10061" in text or "errno 111" in text
+
+
+def ping_endpoint(url: str, timeout: float | tuple[float, float] | None = None) -> bool:
+    return bool(probe_flask_endpoint(url, timeout=timeout).get("ok"))
+
+
+def probe_flask_endpoint(url: str, timeout: float | tuple[float, float] | None = None) -> dict:
     base_url = _normalize_url(url)
     if not base_url:
-        return False
+        return {"url": "", "ok": False, "status": "Non testé", "detail": "URL vide", "elapsed_ms": None}
+    effective_timeout = timeout if timeout is not None else (_PING_CONNECT_TIMEOUT, _PING_READ_TIMEOUT)
+    started = time.monotonic()
+    host = urlparse(base_url).hostname or base_url
     try:
         response = requests.get(
             base_url + "/ping",
             headers={"Connection": "close"},
+            timeout=effective_timeout,
+        )
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if response.ok:
+            _log(f"{host} repondu en {elapsed_ms} ms")
+            return {
+                "url": base_url,
+                "ok": True,
+                "status": "Disponible",
+                "detail": f"HTTP {response.status_code}",
+                "elapsed_ms": elapsed_ms,
+            }
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            _log(f"{host} HTTPError {response.status_code} apres {elapsed_ms} ms: {exc}")
+        else:
+            _log(f"{host} reponse HTTP non OK {response.status_code} apres {elapsed_ms} ms")
+        return {
+            "url": base_url,
+            "ok": False,
+            "status": "Indisponible",
+            "detail": f"HTTPError {response.status_code}",
+            "elapsed_ms": elapsed_ms,
+        }
+    except requests.ConnectTimeout as exc:
+        _log(f"{host} ConnectTimeout apres {_timeout_ms(effective_timeout, 0)} ms: {exc}")
+        return {"url": base_url, "ok": False, "status": "Délai dépassé", "detail": "ConnectTimeout", "elapsed_ms": _timeout_ms(effective_timeout, 0)}
+    except requests.ReadTimeout as exc:
+        _log(f"{host} ReadTimeout apres {_timeout_ms(effective_timeout)} ms: {exc}")
+        return {"url": base_url, "ok": False, "status": "Délai dépassé", "detail": "ReadTimeout", "elapsed_ms": _timeout_ms(effective_timeout)}
+    except requests.ConnectionError as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        kind = "ConnectionRefused" if _is_connection_refused(exc) else "ConnectionError"
+        _log(f"{host} {kind} apres {elapsed_ms} ms: {exc}")
+        return {"url": base_url, "ok": False, "status": "Indisponible", "detail": kind, "elapsed_ms": elapsed_ms}
+    except requests.HTTPError as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _log(f"{host} HTTPError apres {elapsed_ms} ms: {exc}")
+        return {"url": base_url, "ok": False, "status": "Indisponible", "detail": f"HTTPError: {exc}", "elapsed_ms": elapsed_ms}
+    except requests.RequestException as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        _log(f"{host} RequestException apres {elapsed_ms} ms: {exc}")
+        return {"url": base_url, "ok": False, "status": "Indisponible", "detail": f"RequestException: {exc}", "elapsed_ms": elapsed_ms}
+
+
+def probe_pcfixe_endpoints(
+    endpoints: Iterable[str] | None = None,
+    timeout: float | tuple[float, float] | None = None,
+) -> list[dict]:
+    probes = [probe_flask_endpoint(url, timeout=timeout) for url in (endpoints or DEFAULT_FLASK_ENDPOINTS)]
+    reachable = [item["url"] for item in probes if item.get("ok")]
+    if reachable:
+        _log("[PCFIXE] endpoint joignable : " + ", ".join(reachable))
+    else:
+        _log("[PCFIXE] aucun endpoint joignable")
+    return probes
+
+
+def first_reachable_endpoint(probes: Iterable[dict], *, avoid_host: str | None = None) -> str:
+    reachable = [item for item in probes if item.get("ok") and item.get("url")]
+    if not reachable:
+        return ""
+    if avoid_host:
+        for item in reachable:
+            if (urlparse(item["url"]).hostname or "") != avoid_host:
+                return item["url"]
+    return reachable[0]["url"]
+
+
+def _request_admin_json(method: str, base_url: str, path: str, api_key: str, timeout: float | tuple[float, float] = (1.5, 8)) -> dict:
+    endpoint = _normalize_url(base_url)
+    if not endpoint:
+        return {"ok": False, "status": "Non testé", "error": "endpoint vide", "payload": None}
+    try:
+        response = requests.request(
+            method,
+            endpoint + path,
+            headers={"x-api-key": api_key or "", "Connection": "close"},
             timeout=timeout,
         )
-        return bool(response.ok)
+        status_code = response.status_code
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+            if response.ok:
+                return {"ok": False, "status": "JSON invalide", "status_code": status_code, "error": response.text[:500], "payload": None}
+        if status_code in {401, 403}:
+            return {"ok": False, "status": "Erreur d'authentification", "status_code": status_code, "payload": payload}
+        if not response.ok:
+            return {"ok": False, "status": "Erreur HTTP", "status_code": status_code, "payload": payload}
+        return {"ok": True, "status": "Disponible", "status_code": status_code, "payload": payload}
+    except requests.ConnectTimeout as exc:
+        return {"ok": False, "status": "ConnectTimeout", "error": str(exc), "payload": None}
+    except requests.ReadTimeout as exc:
+        return {"ok": False, "status": "ReadTimeout", "error": str(exc), "payload": None}
+    except requests.ConnectionError as exc:
+        kind = "ConnectionRefused" if _is_connection_refused(exc) else "ConnectionError"
+        return {"ok": False, "status": kind, "error": str(exc), "payload": None}
     except requests.RequestException as exc:
-        _log(f"ping failed for {base_url}: {exc}")
-        return False
+        return {"ok": False, "status": "RequestException", "error": str(exc), "payload": None}
+
+
+def get_wifi_reconnect_status(base_url: str, api_key: str) -> dict:
+    return _request_admin_json("GET", base_url, "/system/reconnect-wifi/status", api_key)
+
+
+def trigger_wifi_reconnect(base_url: str, api_key: str) -> dict:
+    result = _request_admin_json("POST", base_url, "/system/reconnect-wifi", api_key)
+    if result.get("ok"):
+        _log(f"[WIFI] tache de reconnexion declenchee via {_normalize_url(base_url)}")
+    return result
 
 
 def invalidate_flask_base_url(url: str | None = None) -> None:
@@ -97,7 +224,7 @@ def resolve_flask_base_url(
     *,
     force_refresh: bool = False,
     extra_candidates: Iterable[str] | None = None,
-    timeout: float = 1.5,
+    timeout: float | tuple[float, float] | None = None,
 ) -> str:
     global _cached_url, _cached_until
     now = time.monotonic()
@@ -112,10 +239,12 @@ def resolve_flask_base_url(
             _log(f"selected Flask endpoint: {url}")
             return url
 
-    fallback = candidates[0] if candidates else DEFAULT_FLASK_ENDPOINTS[0]
+    fallback = candidates[0] if candidates else _normalize_url(os.getenv("SERVER_URL", ""))
+    if not fallback:
+        fallback = _normalize_url(DEFAULT_FLASK_ENDPOINTS[0])
     _cached_url = fallback
     _cached_until = now + min(_CACHE_TTL_SECONDS, 5)
-    _log(f"no endpoint answered /ping; fallback configured endpoint: {fallback}")
+    _log(f"aucun endpoint n'a repondu correctement a /ping; conservation du serveur configure/detecte: {fallback}")
     return fallback
 
 
@@ -123,7 +252,7 @@ def _resolve_next_flask_base_url(
     failed_url: str,
     *,
     extra_candidates: Iterable[str] | None = None,
-    timeout: float = 1.5,
+    timeout: float | tuple[float, float] | None = None,
 ) -> str | None:
     global _cached_url, _cached_until
     for url in _candidate_urls(extra_candidates):
