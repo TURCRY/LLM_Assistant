@@ -9561,7 +9561,7 @@ elif page == "Voxtral (ASR / CR)":
                 audio_prepared=prepared_debrief_audio,
                 proper_names_path=(updated_infos.get("debrief", {}) or {}).get("proper_names_file") or None,
                 model=asr_model_key,
-                diarize=bool(use_diar),
+                diarize=False,
                 debrief_csv=(updated_infos.get("debrief", {}) or {}).get("csv") or None,
                 nas_root=(project_config.get("roots") or {}).get("nas") or None,
                 audio_target_dir_pcfixe=pc_debrief_audio_dir,
