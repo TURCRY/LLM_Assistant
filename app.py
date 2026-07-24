@@ -6247,7 +6247,7 @@ def _unc_host(path: str | Path) -> str:
     return parts[0] if parts else ""
 
 
-def _tcp_port_open(host: str, port: int = 445, timeout_seconds: float = ANNOTATION_JOBS_SMB_TCP_TIMEOUT_SECONDS) -> tuple[bool, str]:
+def _annotation_tcp_port_open(host: str, port: int = 445, timeout_seconds: float = ANNOTATION_JOBS_SMB_TCP_TIMEOUT_SECONDS) -> tuple[bool, str]:
     if not host:
         return False, "hôte vide"
     try:
@@ -6306,7 +6306,7 @@ def _annotation_jobs_roots() -> tuple[list[dict], list[dict]]:
         }
         host = _unc_host(root)
         if host:
-            tcp_ok, tcp_detail = _tcp_port_open(host)
+            tcp_ok, tcp_detail = _annotation_tcp_port_open(host, 445)
             row["tcp_445"] = "oui" if tcp_ok else "non"
             if not tcp_ok:
                 row["detail"] = f"SMB 445 inaccessible ({tcp_detail})"
