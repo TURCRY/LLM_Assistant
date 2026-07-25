@@ -34,6 +34,7 @@ from urllib.parse import urlparse
 from server_locator import (
     DEFAULT_FLASK_ENDPOINTS,
     first_reachable_endpoint,
+    get_flask_resolution_diagnostics,
     get_wifi_reconnect_status,
     probe_flask_endpoint,
     probe_pcfixe_endpoints,
@@ -167,6 +168,18 @@ PCFIXE_AFFAIRES_SHARE_CANDIDATES = (
     r"\\10.0.1.10\Affaires",
 )
 PCFIXE_SMB_TEST_TIMEOUT_SECONDS = float(os.getenv("PCFIXE_SMB_TEST_TIMEOUT_SECONDS", "2.5"))
+ANNOTATION_JOBS_DIAGNOSTIC_TTL_SECONDS = float(os.getenv("ANNOTATION_JOBS_DIAGNOSTIC_TTL_SECONDS", "45"))
+ANNOTATION_FILE_PROFILE_TTL_SECONDS = float(os.getenv("ANNOTATION_FILE_PROFILE_TTL_SECONDS", "45"))
+ANNOTATION_JOB_SCAN_LIMIT_LIGHT = int(os.getenv("ANNOTATION_JOB_SCAN_LIMIT_LIGHT", "20"))
+ANNOTATION_JOB_SCAN_LIMIT_DETAILED = int(os.getenv("ANNOTATION_JOB_SCAN_LIMIT_DETAILED", "50"))
+ANNOTATION_UNC_LIST_TIMEOUT_SECONDS = float(os.getenv("ANNOTATION_UNC_LIST_TIMEOUT_SECONDS", "4.0"))
+ANNOTATION_SLOW_BLOCK_SECONDS = float(os.getenv("ANNOTATION_SLOW_BLOCK_SECONDS", "15.0"))
+PCFIXE_FLASK_HOST_VPN = (os.getenv("PCFIXE_FLASK_HOST_VPN") or "10.0.1.10").strip()
+PCFIXE_FLASK_HOST_LAN_PRIMARY = (os.getenv("PCFIXE_FLASK_HOST_LAN_PRIMARY") or "192.168.0.120").strip()
+PCFIXE_FLASK_HOST_LAN_FALLBACK = (os.getenv("PCFIXE_FLASK_HOST_LAN_FALLBACK") or "192.168.0.155").strip()
+
+_ANNOTATION_JOB_DETAILS_CACHE: dict[tuple, dict] = {}
+_ANNOTATION_FILE_PROFILE_CACHE: dict[tuple, dict] = {}
 
 
 def _sanitize_pcfixe_smb_host(host: str, fallback: str) -> str:
@@ -175,6 +188,42 @@ def _sanitize_pcfixe_smb_host(host: str, fallback: str) -> str:
         print("[SMB] 192.168.0.120 ignoré pour les partages SMB ; utilisation de " + fallback)
         return fallback
     return value
+
+
+def _sanitize_pcfixe_flask_host(host: str, fallback: str) -> str:
+    value = str(host or "").strip() or fallback
+    if value == "10.0.1.5":
+        corrected = "10.0.1.10"
+        print(f"[VPN] cible Flask VPN obsolète {value} ignorée ; utilisation de {corrected}")
+        return corrected
+    return value
+
+
+def _pcfixe_flask_host_candidates(vpn_active: bool | None = None, preferred_host: str = "") -> list[str]:
+    if vpn_active is None:
+        vpn_active = _pcfixe_vpn_active()
+    ordered = (
+        [PCFIXE_FLASK_HOST_VPN, PCFIXE_FLASK_HOST_LAN_PRIMARY, PCFIXE_FLASK_HOST_LAN_FALLBACK]
+        if vpn_active
+        else [PCFIXE_FLASK_HOST_LAN_PRIMARY, PCFIXE_FLASK_HOST_LAN_FALLBACK, PCFIXE_FLASK_HOST_VPN]
+    )
+    if preferred_host:
+        ordered.insert(0, preferred_host)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_host in ordered:
+        fallback = PCFIXE_FLASK_HOST_VPN if str(raw_host).startswith("10.") else PCFIXE_FLASK_HOST_LAN_FALLBACK
+        host = _sanitize_pcfixe_flask_host(raw_host, fallback)
+        key = host.lower()
+        if not host or key in seen:
+            continue
+        seen.add(key)
+        out.append(host)
+    return out
+
+
+def _ordered_flask_candidate_urls(port: str | int, *, preferred_host: str = "", vpn_active: bool | None = None) -> list[str]:
+    return [f"http://{host}:{port}" for host in _pcfixe_flask_host_candidates(vpn_active=vpn_active, preferred_host=preferred_host)]
 
 
 def get_pcfixe_smb_host() -> str:
@@ -216,6 +265,123 @@ def _test_path_with_timeout(path: str | Path, timeout_seconds: float = PCFIXE_SM
         detail = (result.stderr or "").strip() or f"exit {result.returncode}"
         return False, detail
     return output == "1", ""
+
+
+def _annotation_cache_prune(cache: dict[tuple, dict], ttl_seconds: float) -> None:
+    now = time.time()
+    expired = [key for key, value in cache.items() if now - float(value.get("ts", 0.0) or 0.0) > ttl_seconds]
+    for key in expired:
+        cache.pop(key, None)
+
+
+def _annotation_clear_runtime_caches(*, id_affaire: str = "", id_captation: str = "") -> None:
+    if not id_affaire and not id_captation:
+        _ANNOTATION_JOB_DETAILS_CACHE.clear()
+        _ANNOTATION_FILE_PROFILE_CACHE.clear()
+        return
+    wanted_affaire = str(id_affaire or "")
+    wanted_captation = str(id_captation or "")
+    for key in list(_ANNOTATION_JOB_DETAILS_CACHE.keys()):
+        if len(key) < 2:
+            continue
+        if wanted_affaire and key[0] != wanted_affaire:
+            continue
+        if wanted_captation and key[1] != wanted_captation:
+            continue
+        _ANNOTATION_JOB_DETAILS_CACHE.pop(key, None)
+
+
+def _annotation_perf_begin(diagnostics: dict) -> float:
+    origin = time.perf_counter()
+    diagnostics["_perf_origin"] = origin
+    diagnostics.setdefault("perf_blocks", [])
+    diagnostics.setdefault("slow_block_stacks", [])
+    return origin
+
+
+def _annotation_perf_end(
+    diagnostics: dict,
+    block_name: str,
+    started_at: float,
+    *,
+    file_count: int = 0,
+    network_path: str = "",
+) -> float:
+    finished_at = time.perf_counter()
+    origin = float(diagnostics.get("_perf_origin") or started_at)
+    duration_ms = int((finished_at - started_at) * 1000)
+    diagnostics.setdefault("perf_blocks", []).append(
+        {
+            "block": block_name,
+            "start_s": round(started_at - origin, 4),
+            "end_s": round(finished_at - origin, 4),
+            "duration_ms": duration_ms,
+            "file_count": int(file_count or 0),
+            "network_path": str(network_path or ""),
+        }
+    )
+    if duration_ms >= int(ANNOTATION_SLOW_BLOCK_SECONDS * 1000):
+        diagnostics.setdefault("slow_block_stacks", []).append(
+            {
+                "block": block_name,
+                "duration_ms": duration_ms,
+                "stack": traceback.format_stack(limit=12),
+            }
+        )
+    return finished_at
+
+
+def _annotation_list_json_candidates(
+    folder_path: Path,
+    *,
+    name_terms: list[str] | tuple[str, ...] = (),
+    limit: int = ANNOTATION_JOB_SCAN_LIMIT_LIGHT,
+    recursive: bool = False,
+    timeout_seconds: float = ANNOTATION_UNC_LIST_TIMEOUT_SECONDS,
+) -> list[Path]:
+    path = Path(folder_path)
+    terms = [str(term).strip().lower() for term in (name_terms or []) if str(term).strip()]
+    host = _unc_host(path)
+    if host and os.name == "nt":
+        quoted_path = "'" + str(path).replace("'", "''") + "'"
+        clause_parts = []
+        for term in terms:
+            safe_term = term.replace("'", "''")
+            clause_parts.append(f"$_.Name.ToLower().Contains('{safe_term}')")
+        where_clause = f" | Where-Object {{ {' -and '.join(clause_parts)} }}" if clause_parts else ""
+        recurse_value = "$true" if recursive else "$false"
+        command = (
+            "$ErrorActionPreference='Stop'; "
+            f"$items = Get-ChildItem -LiteralPath {quoted_path} -Filter '*.json' -File -Recurse:{recurse_value}; "
+            + (f"$items = $items{where_clause}; " if where_clause else "")
+            + f"$items | Sort-Object LastWriteTime -Descending | Select-Object -First {int(limit)} -ExpandProperty FullName"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", command],
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0,
+            )
+        except subprocess.TimeoutExpired:
+            return []
+        except Exception:
+            return []
+        if result.returncode != 0:
+            return []
+        return [Path(line.strip()) for line in (result.stdout or "").splitlines() if line.strip()]
+
+    try:
+        iterator = path.rglob("*.json") if recursive else path.glob("*.json")
+        candidates = [p for p in iterator if p.is_file()]
+    except Exception:
+        return []
+    if terms:
+        candidates = [p for p in candidates if all(term in p.name.lower() for term in terms)]
+    candidates.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+    return candidates[:limit]
 
 
 def probe_pcfixe_affaires_shares(require_jobs_queue: bool = True) -> list[dict]:
@@ -395,21 +561,20 @@ def preflight_pcfixe_target_dir(target_dir: str | Path) -> dict:
 
 
 def detect_vpn_server_ip(default_ip: str,
-                         vpn_ip: str = "10.0.1.5",
+                         vpn_ip: str | None = None,
                          vpn_subnet: str = "10.0.1.0/24",
                          adapter_keywords=("tap", "wintun", "openvpn")) -> str:
-    """Return vpn_ip only if a TAP/Wintun/OpenVPN adapter is UP and has a valid IPv4 in vpn_subnet.
-       Ignore APIPA (169.254.x.x) and disconnected adapters.
-    """
+    """Return the configured PC fixe VPN host only when a VPN adapter is locally active."""
+    vpn_ip = _sanitize_pcfixe_flask_host(vpn_ip or PCFIXE_FLASK_HOST_VPN, PCFIXE_FLASK_HOST_VPN)
     try:
         active, name, ip = _pcfixe_vpn_adapter(vpn_subnet, adapter_keywords)
         if active:
-            print(f"[VPN] Adaptateur {name} actif ({ip}) → bascule sur IP serveur VPN {vpn_ip}")
+            print(f"[VPN] Adaptateur local {name} actif ({ip}) → priorité endpoint Flask VPN {vpn_ip}")
             return vpn_ip
-        print(f"[VPN] Aucun adaptateur VPN UP avec IPv4 valide → IP serveur normale {default_ip}")
+        print(f"[VPN] Aucun adaptateur VPN UP avec IPv4 valide → priorité endpoint Flask LAN {default_ip}")
         return default_ip
     except Exception as e:
-        print(f"[VPN] Erreur détection : {e} → IP serveur normale {default_ip}")
+        print(f"[VPN] Erreur détection : {e} → priorité endpoint Flask LAN {default_ip}")
         return default_ip
 
 def sanitize_filename(name: str, max_len: int = 120) -> str:
@@ -475,8 +640,8 @@ ANNOTATION_PHOTOS_CONFIG_DIR_CANDIDATES = [
 
 # ---------- choose server endpoint ----------
 enforce = os.getenv("ENFORCE_SERVER_IP", "").strip()
-extra_candidates = []
 disable_vpn_auto = (os.getenv("DISABLE_VPN_AUTODETECT", "0") == "1")
+vpn_active_for_flask = _pcfixe_vpn_active()
 
 if enforce:
     SERVER_IP = enforce
@@ -492,9 +657,10 @@ else:
 
 SERVER_URL = f"http://{SERVER_IP}:{PORT}"
 SERVER_PORT = PORT
-extra_candidates.append(SERVER_URL)
+extra_candidates = _ordered_flask_candidate_urls(PORT, preferred_host=SERVER_IP, vpn_active=vpn_active_for_flask)
 if enforce:
     extra_candidates.insert(0, f"http://{enforce}:{PORT}")
+print("[ENV] Candidats Flask ordonnés : " + ", ".join(extra_candidates))
 SERVER_URL = resolve_flask_base_url(extra_candidates=extra_candidates)
 _server_parsed = urlparse(SERVER_URL)
 SERVER_IP = _server_parsed.hostname or SERVER_IP_ENV
@@ -6277,22 +6443,22 @@ def _annotation_pcfixe_job_hosts() -> list[str]:
     return out
 
 
-def _annotation_jobs_roots() -> tuple[list[dict], list[dict]]:
+def _annotation_jobs_roots(*, detail_level: str = "light") -> tuple[list[dict], list[dict]]:
     roots: list[dict] = []
     probes: list[dict] = []
     vpn_active = _pcfixe_vpn_active()
-    candidates: list[tuple[str, Path, str, int]] = []
+    folders_to_probe = ("queued", "running", "done") if detail_level != "detailed" else ANNOTATION_JOBS_FOLDERS
+    pcfixe_candidates: list[tuple[str, Path, str, int]] = []
+    fallback_candidates: list[tuple[str, Path, str, int]] = [
+        ("nas", NAS_AFFAIRES_ROOT / "_jobs", "copie NAS", 2),
+        ("local_cache", Path(AFFAIRES_ROOT) / "_jobs", "cache laptop non autoritaire", 3),
+    ]
     for host in _annotation_pcfixe_job_hosts():
-        candidates.append(("pcfixe", Path(rf"\\{host}\Affaires") / "_jobs", "PC fixe VPN" if host == "10.0.1.10" else "PC fixe LAN", 1))
-    candidates.append(("nas", NAS_AFFAIRES_ROOT / "_jobs", "copie NAS", 2))
-    candidates.append(("local_cache", Path(AFFAIRES_ROOT) / "_jobs", "cache laptop non autoritaire", 3))
+        label = "PC fixe VPN" if host == "10.0.1.10" else "PC fixe LAN"
+        pcfixe_candidates.append(("pcfixe", Path(rf"\\{host}\Affaires") / "_jobs", label, 1))
 
-    seen: set[str] = set()
-    for source, root, label, priority in candidates:
-        key = str(root).casefold()
-        if key in seen:
-            continue
-        seen.add(key)
+    def _probe_root(source: str, root: Path, label: str, priority: int) -> dict:
+        row_started = time.monotonic()
         row = {
             "source": source,
             "label": label,
@@ -6300,6 +6466,7 @@ def _annotation_jobs_roots() -> tuple[list[dict], list[dict]]:
             "priority": priority,
             "vpn_active": "oui" if vpn_active else "non",
             "tcp_445": "",
+            "probe_ms": "",
             "accessible": False,
             "folders": "",
             "detail": "",
@@ -6310,18 +6477,18 @@ def _annotation_jobs_roots() -> tuple[list[dict], list[dict]]:
             row["tcp_445"] = "oui" if tcp_ok else "non"
             if not tcp_ok:
                 row["detail"] = f"SMB 445 inaccessible ({tcp_detail})"
-                probes.append(row)
-                continue
+                row["probe_ms"] = str(int((time.monotonic() - row_started) * 1000))
+                return row
         else:
             row["tcp_445"] = "local"
         ok, detail = _test_path_with_timeout(root) if host else _path_accessible_quick(root)
         row["accessible"] = ok
         if not ok:
             row["detail"] = detail or "racine _jobs inaccessible"
-            probes.append(row)
-            continue
+            row["probe_ms"] = str(int((time.monotonic() - row_started) * 1000))
+            return row
         available_folders: list[str] = []
-        for folder in ANNOTATION_JOBS_FOLDERS:
+        for folder in folders_to_probe:
             folder_path = root / folder
             folder_ok, _ = _test_path_with_timeout(folder_path) if host else _path_accessible_quick(folder_path)
             if folder_ok:
@@ -6331,8 +6498,35 @@ def _annotation_jobs_roots() -> tuple[list[dict], list[dict]]:
             row["detail"] = "racine accessible mais aucun dossier jobs attendu"
         else:
             row["detail"] = "accessible"
-            roots.append(row)
+        row["probe_ms"] = str(int((time.monotonic() - row_started) * 1000))
+        return row
+
+    seen: set[str] = set()
+    pcfixe_accessible = False
+    for source, root, label, priority in pcfixe_candidates:
+        key = str(root).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        row = _probe_root(source, root, label, priority)
         probes.append(row)
+        if row.get("accessible") and row.get("folders"):
+            roots.append(row)
+            pcfixe_accessible = True
+            break
+
+    if not pcfixe_accessible:
+        for source, root, label, priority in fallback_candidates:
+            key = str(root).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            row = _probe_root(source, root, label, priority)
+            probes.append(row)
+            if row.get("accessible") and row.get("folders"):
+                roots.append(row)
+                if detail_level != "detailed":
+                    break
     return roots, probes
 
 def _annotation_canonical_paths(id_affaire: str, id_captation: str) -> dict[str, Path]:
@@ -6376,18 +6570,44 @@ def _annotation_source_file(filename: str) -> Path | None:
             return candidate
     return None
 
-def _infos_declared_path(infos: dict, key: str, fallback: Path | None = None) -> Path:
+def _valid_file_path(value: object) -> Path | None:
+    if value is None:
+        return None
+    try:
+        raw = str(value).strip().strip('"')
+    except Exception:
+        return None
+    if not raw or raw in {".", ".."}:
+        return None
+    try:
+        path = value if isinstance(value, Path) else Path(raw)
+    except Exception:
+        return None
+    path_text = str(path).strip()
+    if not path_text or path_text in {".", ".."}:
+        return None
+    normalized = path_text.replace("/", "\\")
+    if normalized.endswith("\\") or normalized.endswith("/"):
+        return None
+    name = str(path.name or "").strip()
+    if not name or name in {".", ".."}:
+        return None
+    return path
+
+
+def _infos_declared_path(infos: dict, key: str, fallback: Path | None = None) -> Path | None:
     pcfixe = infos.get("pcfixe", {}) if isinstance(infos.get("pcfixe"), dict) else {}
     raw = infos.get(key) or pcfixe.get(key) or ""
-    return Path(str(raw).strip().strip('"')) if raw else (fallback or Path(""))
+    return _valid_file_path(raw) or _valid_file_path(fallback)
 
-def _annotation_resource_paths(infos_path: Path, infos: dict) -> dict[str, Path]:
+def _annotation_resource_paths(infos_path: Path, infos: dict) -> dict[str, Path | None]:
     base = infos_path.parent
     photos_path = _infos_declared_path(infos, "fichier_photos")
+    fallback_batch = photos_path.with_name("photos_batch.csv") if photos_path is not None and photos_path.name not in {".", ".."} else None
     photos_batch_path = _infos_declared_path(
         infos,
         "fichier_photos_batch",
-        photos_path.with_name("photos_batch.csv") if photos_path else Path(""),
+        fallback_batch,
     )
     return {
         "infos_projet.json": infos_path,
@@ -6506,6 +6726,8 @@ def _annotation_job_details(
     *,
     paths: dict[str, Path] | None = None,
     include_diagnostics: bool = False,
+    detail_level: str = "light",
+    force_refresh: bool = False,
 ) -> dict[str, dict] | tuple[dict[str, dict], dict]:
     def _job_sort_key(job: dict, job_file: Path) -> tuple[str, float]:
         job_id = str(job.get("job_id") or job_file.stem)
@@ -6588,44 +6810,50 @@ def _annotation_job_details(
         return 0.0
 
     def _matching_log_manifests(root: Path, job_id: str) -> list[Path]:
+        if detail_level != "detailed":
+            return []
         logs = root / "logs"
+        log_probe_started = time.perf_counter()
         ok, _ = _path_accessible_quick(logs)
+        _annotation_perf_end(diagnostics, "scan logs", log_probe_started, network_path=str(logs))
         if not ok:
             return []
         safe = _safe_job_token(job_id)
-        patterns = [
-            f"{safe}.manifest.json",
-            f"{safe}_manifest.json",
-            f"{safe}*.manifest.json",
-            f"{safe}*manifest*.json",
-        ]
-        matches: list[Path] = []
-        for pattern in patterns:
-            try:
-                matches.extend([p for p in logs.glob(pattern) if p.is_file()])
-            except OSError:
-                continue
-        return sorted(set(matches), key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
+        limit = 4 if detail_level != "detailed" else 10
+        matches = _annotation_list_json_candidates(
+            logs,
+            name_terms=[safe, "manifest"],
+            limit=limit,
+            recursive=False,
+            timeout_seconds=ANNOTATION_UNC_LIST_TIMEOUT_SECONDS,
+        )
+        return [p for p in matches if p.is_file()]
 
     def _iter_job_json_files(root: Path) -> list[tuple[str, Path]]:
         out: list[tuple[str, Path]] = []
-        for folder in ANNOTATION_JOBS_FOLDERS:
+        scan_folders = ("queued", "running", "done") if detail_level != "detailed" else ("queued", "running", "done", "failed")
+        candidate_limit = ANNOTATION_JOB_SCAN_LIMIT_LIGHT if detail_level != "detailed" else ANNOTATION_JOB_SCAN_LIMIT_DETAILED
+        base_terms = [id_affaire.casefold(), id_captation.casefold()]
+        for folder in scan_folders:
             folder_path = root / folder
             host = _unc_host(folder_path)
-            folder_ok, _ = _test_path_with_timeout(folder_path) if host else _path_accessible_quick(folder_path)
+            folder_probe_started = time.perf_counter()
+            folder_ok, folder_detail = _test_path_with_timeout(folder_path) if host else _path_accessible_quick(folder_path)
+            _annotation_perf_end(diagnostics, f"scan {folder}", folder_probe_started, network_path=str(folder_path))
             if not folder_ok:
+                diagnostics["ignored"].append({"root": str(root), "folder": folder, "reason": folder_detail or "dossier inaccessible"})
                 continue
             try:
-                out.extend((folder, p) for p in folder_path.rglob("*.json"))
+                files = _annotation_list_json_candidates(
+                    folder_path,
+                    name_terms=base_terms,
+                    limit=candidate_limit,
+                    recursive=False,
+                    timeout_seconds=ANNOTATION_UNC_LIST_TIMEOUT_SECONDS,
+                )
+                out.extend((folder, p) for p in files)
             except Exception as exc:
                 diagnostics["ignored"].append({"root": str(root), "folder": folder, "reason": f"parcours impossible: {exc}"})
-        logs = root / "logs"
-        ok, _ = _path_accessible_quick(logs)
-        if ok:
-            try:
-                out.extend(("logs", p) for p in logs.rglob("*.json"))
-            except Exception as exc:
-                diagnostics["ignored"].append({"root": str(root), "folder": "logs", "reason": f"parcours logs impossible: {exc}"})
         return out
 
     details = {
@@ -6655,6 +6883,15 @@ def _annotation_job_details(
         }
         for key in PHOTO_BATCH_ACTIONS
     }
+    cache_key = (id_affaire, id_captation, detail_level, "diag" if include_diagnostics else "plain", "vpn" if _pcfixe_vpn_active() else "lan")
+    _annotation_cache_prune(_ANNOTATION_JOB_DETAILS_CACHE, ANNOTATION_JOBS_DIAGNOSTIC_TTL_SECONDS)
+    if not force_refresh:
+        cached = _ANNOTATION_JOB_DETAILS_CACHE.get(cache_key)
+        if cached:
+            if include_diagnostics:
+                return cached["details"], cached["diagnostics"]
+            return cached["details"]
+
     diagnostics = {
         "roots": [],
         "recognized": [],
@@ -6662,9 +6899,22 @@ def _annotation_job_details(
         "selected_job_id": "",
         "selected_source": "",
         "no_batch_reason": "",
+        "detail_level": detail_level,
+        "timings": {
+            "jobs_root_probe_ms": 0,
+            "job_scan_ms": 0,
+            "manifest_read_ms": 0,
+            "json_files_seen": 0,
+            "total_ms": 0,
+        },
     }
-    roots, root_probes = _annotation_jobs_roots()
+    _annotation_perf_begin(diagnostics)
+    diagnostics_started = time.monotonic()
+    roots_probe_started = time.perf_counter()
+    roots, root_probes = _annotation_jobs_roots(detail_level=detail_level)
+    _annotation_perf_end(diagnostics, "_annotation_jobs_roots", roots_probe_started, file_count=len(root_probes))
     diagnostics["roots"] = root_probes
+    diagnostics["timings"]["jobs_root_probe_ms"] = sum(int(row.get("probe_ms") or 0) for row in root_probes)
     if not roots:
         diagnostics["no_batch_reason"] = "aucun registre _jobs fiable accessible"
 
@@ -6678,9 +6928,14 @@ def _annotation_job_details(
         current_photos_hash = _annotation_file_profile(paths["nas_photos"], csv_expected=True).get("sha256", "")
         current_batch_hash = _annotation_file_profile(paths["nas_photos_batch"], csv_expected=True).get("sha256", "")
     for root_row in roots:
+        root_scan_started = time.monotonic()
+        root_perf_started = time.perf_counter()
         root = Path(str(root_row["root"]))
         for folder, job_file in _iter_job_json_files(root):
+                diagnostics["timings"]["json_files_seen"] += 1
+                manifest_started = time.monotonic()
                 raw = load_json(str(job_file), {})
+                diagnostics["timings"]["manifest_read_ms"] += int((time.monotonic() - manifest_started) * 1000)
                 if not isinstance(raw, dict):
                     continue
                 raw_job = raw.get("job") if isinstance(raw.get("job"), dict) else {}
@@ -6695,7 +6950,9 @@ def _annotation_job_details(
                 initial_job_id = str(job.get("job_id") or raw.get("job_id") or job_file.stem)
                 if folder != "logs":
                     for manifest_path in _matching_log_manifests(root, initial_job_id)[:1]:
+                        merged_manifest_started = time.monotonic()
                         manifest = load_json(str(manifest_path), {})
+                        diagnostics["timings"]["manifest_read_ms"] += int((time.monotonic() - merged_manifest_started) * 1000)
                         if isinstance(manifest, dict):
                             manifest_job = manifest.get("job") if isinstance(manifest.get("job"), dict) else {}
                             manifest_result = manifest.get("result") if isinstance(manifest.get("result"), dict) else {}
@@ -6897,14 +7154,36 @@ def _annotation_job_details(
                 if previous and previous.get("_dedupe_rank", (9, 9, 0)) <= detail["_dedupe_rank"]:
                     continue
                 by_job_id[job_id] = detail
+        diagnostics["timings"]["job_scan_ms"] += int((time.monotonic() - root_scan_started) * 1000)
+        _annotation_perf_end(
+            diagnostics,
+            "scan manifests",
+            root_perf_started,
+            file_count=diagnostics["timings"]["json_files_seen"],
+            network_path=str(root),
+        )
 
     for detail in by_job_id.values():
         action_key = detail.get("action_key") or ""
         if action_key not in details:
             continue
+        clean_detail = {k: v for k, v in detail.items() if not k.startswith("_")}
         if detail.get("status") != "completed":
             diagnostic_key = f"{action_key}_{detail.get('status')}_{detail.get('job_id')}"
-            details[diagnostic_key] = {k: v for k, v in detail.items() if not k.startswith("_")}
+            details[diagnostic_key] = clean_detail
+            previous_status = str(details[action_key].get("status") or "absent")
+            previous_key = (
+                details[action_key].get("sort_stamp", ""),
+                float(details[action_key].get("sort_mtime", "0") or 0),
+            )
+            current_key = (
+                detail.get("sort_stamp", ""),
+                float(detail.get("sort_mtime", "0") or 0),
+            )
+            if previous_status == "completed":
+                continue
+            if current_key >= previous_key:
+                details[action_key] = clean_detail
             continue
         previous = (
             1 if details[action_key].get("batch_manifest_kind") == "modern" else 0,
@@ -6916,15 +7195,20 @@ def _annotation_job_details(
             detail.get("sort_stamp", ""),
             float(detail.get("sort_mtime", "0") or 0),
         )
-        if current < previous:
-            continue
-        clean_detail = {k: v for k, v in detail.items() if not k.startswith("_")}
-        details[action_key] = clean_detail
+        if current >= previous:
+            details[action_key] = clean_detail
     latest_key, latest = _annotation_latest_completed_batch(details)
     diagnostics["selected_job_id"] = latest.get("job_id", "")
     diagnostics["selected_source"] = latest.get("registry_source", "")
     if not latest and not diagnostics["no_batch_reason"]:
         diagnostics["no_batch_reason"] = "aucun job done valide pour cette captation"
+    diagnostics["timings"]["total_ms"] = int((time.monotonic() - diagnostics_started) * 1000)
+    diagnostics.pop("_perf_origin", None)
+    _ANNOTATION_JOB_DETAILS_CACHE[cache_key] = {
+        "ts": time.time(),
+        "details": details,
+        "diagnostics": diagnostics,
+    }
     if include_diagnostics:
         return details, diagnostics
     return details
@@ -7008,50 +7292,65 @@ def _csv_row_count(path: Path) -> str:
         return ""
 
 
-def _annotation_file_profile(path: Path, *, csv_expected: bool = False) -> dict[str, str]:
-    accessible, access_error = _path_accessible_quick(path)
+def _annotation_file_profile(path: Path | None, *, csv_expected: bool = False) -> dict[str, str]:
+    valid_path = _valid_file_path(path)
     profile = {
-        "chemin": str(path),
+        "chemin": str(valid_path or ""),
         "présent": "non",
         "taille": "",
         "modifié": "",
         "sha256": "",
         "lignes": "",
         "schéma": "",
-        "erreur": access_error,
+        "erreur": "",
     }
+    if valid_path is None:
+        profile["erreur"] = "chemin non résolu"
+        return profile
+    accessible, access_error = _path_accessible_quick(valid_path)
+    profile["erreur"] = access_error
     if not accessible:
         return profile
     try:
-        if not path.is_file():
+        if not valid_path.is_file():
             profile["erreur"] = "fichier absent"
             return profile
-        st_info = path.stat()
+        st_info = valid_path.stat()
+        cache_key = (str(valid_path), int(st_info.st_size), float(st_info.st_mtime), bool(csv_expected))
+        _annotation_cache_prune(_ANNOTATION_FILE_PROFILE_CACHE, ANNOTATION_FILE_PROFILE_TTL_SECONDS)
+        cached = _ANNOTATION_FILE_PROFILE_CACHE.get(cache_key)
+        if cached:
+            return dict(cached["profile"])
         profile.update({
             "présent": "oui",
             "taille": str(st_info.st_size),
             "modifié": datetime.fromtimestamp(st_info.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
             "mtime": str(st_info.st_mtime),
-            "sha256": _sha256_file(path),
+            "sha256": _sha256_file(valid_path),
         })
         if csv_expected:
-            profile["lignes"] = _csv_row_count(path)
-            ok, detail = _csv_schema_ok(path)
+            profile["lignes"] = _csv_row_count(valid_path)
+            ok, detail = _csv_schema_ok(valid_path)
             profile["schéma"] = "cohérent" if ok else "incohérent"
             profile["erreur"] = detail
+        _ANNOTATION_FILE_PROFILE_CACHE[cache_key] = {
+            "ts": time.time(),
+            "profile": dict(profile),
+        }
     except Exception as exc:
         profile["erreur"] = str(exc)
     return profile
 
 
-def _annotation_photos_source_set(paths: dict[str, Path], infos: dict, id_affaire: str, id_captation: str) -> dict[str, dict[str, Path]]:
+def _annotation_photos_source_set(paths: dict[str, Path], infos: dict, id_affaire: str, id_captation: str) -> dict[str, dict[str, Path | None]]:
     work_photos = _infos_declared_path(infos, "fichier_photos")
-    if not str(work_photos):
+    if work_photos is None:
         work_photos = paths["nas_photos"]
+    fallback_batch = work_photos.with_name("photos_batch.csv") if work_photos is not None and work_photos.name not in {".", ".."} else paths["nas_photos_batch"]
     work_batch = _infos_declared_path(
         infos,
         "fichier_photos_batch",
-        work_photos.with_name("photos_batch.csv") if str(work_photos) else paths["nas_photos_batch"],
+        fallback_batch,
     )
     mirror_dir = _annotation_laptop_mirror_photos_dir(id_affaire, id_captation)
     return {
@@ -7283,16 +7582,18 @@ def _repair_nas_photos_from_mirror(audit: dict) -> dict[str, str]:
 
 def _file_audit_row(
     label: str,
-    ui_path: Path,
+    ui_path: Path | None,
     transmitted_path: Path | None = None,
     *,
     opened_path: Path | None = None,
     check_path: Path | None = None,
 ) -> dict[str, str]:
-    opened_path = opened_path or transmitted_path or ui_path
-    check_path = check_path or opened_path
+    ui_path = _valid_file_path(ui_path)
+    transmitted_path = _valid_file_path(transmitted_path)
+    opened_path = _valid_file_path(opened_path) or transmitted_path or ui_path
+    check_path = _valid_file_path(check_path) or opened_path
     try:
-        exists = check_path.is_file()
+        exists = bool(check_path and check_path.is_file())
     except OSError:
         exists = False
     mtime = ""
@@ -7314,8 +7615,9 @@ def _file_audit_row(
 def _annotation_report_resource_rows(paths: dict[str, Path], infos: dict | None = None) -> list[dict[str, str]]:
     infos = infos if isinstance(infos, dict) else {}
     pcfixe_infos = infos.get("pcfixe") if isinstance(infos.get("pcfixe"), dict) else {}
-    declared_photos = Path(str(pcfixe_infos.get("fichier_photos") or paths["pcfixe_photos"]))
-    declared_batch = Path(str(pcfixe_infos.get("fichier_photos_batch") or declared_photos.with_name(declared_photos.stem + "_batch.csv")))
+    declared_photos = _valid_file_path(pcfixe_infos.get("fichier_photos")) or _valid_file_path(paths["pcfixe_photos"])
+    default_batch = declared_photos.with_name(declared_photos.stem + "_batch.csv") if declared_photos is not None and declared_photos.stem else _valid_file_path(paths["pcfixe_photos_batch"])
+    declared_batch = _valid_file_path(pcfixe_infos.get("fichier_photos_batch")) or default_batch
     photos_dir = paths["pcfixe_unc_photos_dir"]
     rows = [
         _file_audit_row(
@@ -7463,11 +7765,53 @@ def _photo_report_job_preview(
     expected_photos_hash = str(photos_profile.get("sha256") or "").strip()
     expected_batch_hash = str(batch_profile.get("sha256") or "").strip()
     if not batch_job_id:
-        raise ValueError("batch_job_id obligatoire : aucun dernier batch annotation_photos_batch retenu.")
+        return {
+            "available": False,
+            "reason_code": "NO_COMPLETED_BATCH",
+            "reason": "Aucun batch photo moderne terminé et vérifié n’est disponible.",
+            "job": None,
+            "job_path": "",
+            "status": "unavailable",
+            "supported_by_spooler": PHOTO_REPORT_JOB_SUPPORTED,
+            "batch_reference": "",
+            "env": {
+                "REPORT_MODE": report_mode,
+                "REPORT_ONLY_RETENUE": "1" if only_retenue else "0",
+            },
+            "command_preview": "",
+        }
     if not expected_photos_hash:
-        raise ValueError("expected_photos_csv_sha256 obligatoire : hash photos.csv NAS indisponible.")
+        return {
+            "available": False,
+            "reason_code": "MISSING_PHOTOS_HASH",
+            "reason": "Hash photos.csv NAS indisponible.",
+            "job": None,
+            "job_path": "",
+            "status": "unavailable",
+            "supported_by_spooler": PHOTO_REPORT_JOB_SUPPORTED,
+            "batch_reference": "",
+            "env": {
+                "REPORT_MODE": report_mode,
+                "REPORT_ONLY_RETENUE": "1" if only_retenue else "0",
+            },
+            "command_preview": "",
+        }
     if not expected_batch_hash:
-        raise ValueError("expected_photos_batch_csv_sha256 obligatoire : hash photos_batch.csv NAS indisponible.")
+        return {
+            "available": False,
+            "reason_code": "MISSING_BATCH_HASH",
+            "reason": "Hash photos_batch.csv NAS indisponible.",
+            "job": None,
+            "job_path": "",
+            "status": "unavailable",
+            "supported_by_spooler": PHOTO_REPORT_JOB_SUPPORTED,
+            "batch_reference": "",
+            "env": {
+                "REPORT_MODE": report_mode,
+                "REPORT_ONLY_RETENUE": "1" if only_retenue else "0",
+            },
+            "command_preview": "",
+        }
     if latest_batch.get("batch_manifest_kind") == "modern":
         manifest_photos_hash = str(latest_batch.get("photos_csv_sha256") or "").strip()
         manifest_batch_hash = str(latest_batch.get("photos_batch_nas_sha256") or latest_batch.get("photos_batch_sha256") or "").strip()
@@ -7526,6 +7870,9 @@ def _photo_report_job_preview(
         tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp_path, queued_path)
     return {
+        "available": True,
+        "reason_code": "",
+        "reason": "",
         "status": status,
         "supported_by_spooler": PHOTO_REPORT_JOB_SUPPORTED,
         "job": job,
@@ -7551,6 +7898,122 @@ def _photo_report_job_preview(
             f'--expected-photos-batch-csv-sha256 "{expected_batch_hash}" '
             f"--mode {mode} --retenue {retenue}"
         ),
+    }
+
+
+def _annotation_report_ui_state(
+    *,
+    job_details: dict[str, dict],
+    report_preflight: dict,
+    report_mode: str,
+    gtp_present: bool,
+) -> dict[str, object]:
+    latest_batch = report_preflight.get("latest_batch", {}) if isinstance(report_preflight, dict) else {}
+    initial_detail = (job_details or {}).get("initial", {}) if isinstance(job_details, dict) else {}
+    initial_status = str(initial_detail.get("status") or "absent")
+    initial_job_id = str(initial_detail.get("job_id") or "")
+    latest_kind = str(latest_batch.get("batch_manifest_kind") or "")
+    reasons = list((report_preflight or {}).get("reasons") or [])
+    warnings = list((report_preflight or {}).get("warnings") or [])
+
+    if latest_batch.get("job_id"):
+        if latest_kind == "modern" and not reasons:
+            return {
+                "available": True,
+                "disable_word": False,
+                "status_code": "MODERN_DONE_VERIFIED",
+                "message": "Rapport Word disponible : batch moderne terminé et vérifié.",
+                "latest_batch": latest_batch,
+                "reasons": reasons,
+                "warnings": warnings,
+            }
+        if latest_kind == "legacy":
+            return {
+                "available": False,
+                "disable_word": True,
+                "status_code": "DONE_LEGACY",
+                "message": "Batch historique détecté : non retenu automatiquement pour le rapport Word.",
+                "latest_batch": latest_batch,
+                "reasons": reasons,
+                "warnings": warnings,
+            }
+        return {
+            "available": False,
+            "disable_word": True,
+            "status_code": "DONE_NOT_VERIFIED",
+            "message": "Batch moderne détecté mais non retenu : vérifier les motifs ci-dessous.",
+            "latest_batch": latest_batch,
+            "reasons": reasons,
+            "warnings": warnings,
+        }
+
+    if initial_status == "queued":
+        message = f"Traitement initial en attente ({initial_job_id or 'sans job_id'})."
+        code = "BATCH_QUEUED"
+    elif initial_status == "running":
+        message = f"Traitement initial en cours ({initial_job_id or 'sans job_id'})."
+        code = "BATCH_RUNNING"
+    elif initial_status == "failed":
+        message = f"Traitement initial en échec ({initial_job_id or 'sans job_id'})."
+        code = "BATCH_FAILED"
+    else:
+        message = "Le rapport Word sera disponible après la fin d’un traitement photo initial terminé et vérifié."
+        code = "NO_COMPLETED_BATCH"
+    if report_mode == "valide" and not gtp_present:
+        warnings = list(warnings) + ["fichier *GTP*.csv absent pour le mode valide"]
+    return {
+        "available": False,
+        "disable_word": True,
+        "status_code": code,
+        "message": message,
+        "latest_batch": latest_batch,
+        "reasons": reasons,
+        "warnings": warnings,
+    }
+
+
+def _annotation_batch_action_state(job_details: dict[str, dict], action_key: str) -> dict[str, object]:
+    detail = (job_details or {}).get(action_key, {}) if isinstance(job_details, dict) else {}
+    status = str(detail.get("status") or "absent")
+    job_id = str(detail.get("job_id") or "")
+    if status == "queued":
+        return {
+            "can_submit": False,
+            "status_code": "QUEUED",
+            "message": f"Job en attente ({job_id or 'sans job_id'}).",
+            "job_id": job_id,
+            "status": status,
+        }
+    if status == "running":
+        return {
+            "can_submit": False,
+            "status_code": "RUNNING",
+            "message": f"Traitement en cours ({job_id or 'sans job_id'}).",
+            "job_id": job_id,
+            "status": status,
+        }
+    if status == "failed":
+        return {
+            "can_submit": True,
+            "status_code": "FAILED",
+            "message": f"Dernier job en échec ({job_id or 'sans job_id'}). Nouvelle tentative autorisée.",
+            "job_id": job_id,
+            "status": status,
+        }
+    if status == "completed":
+        return {
+            "can_submit": True,
+            "status_code": "COMPLETED",
+            "message": f"Dernier job terminé ({job_id or 'sans job_id'}). Nouvelle exécution autorisée.",
+            "job_id": job_id,
+            "status": status,
+        }
+    return {
+        "can_submit": True,
+        "status_code": "ABSENT",
+        "message": "Aucun batch retenu : traitement initial disponible.",
+        "job_id": job_id,
+        "status": status,
     }
 
 def build_debrief_audio_block(
@@ -11370,8 +11833,21 @@ elif page == "Annotation photos / Rapport Word":
                 key="ann_photos_infos_auto",
             )
 
+        ann_diag_scope = f"{ann_id_affaire}|{ann_id_captation}"
+        ann_detailed_diag_key = f"ann_photos_diag_detailed::{ann_diag_scope}"
+        ann_render_perf = {"blocks": []}
+
+        def _ann_mark(block_name: str, started_at: float) -> None:
+            finished_at = time.perf_counter()
+            ann_render_perf["blocks"].append({
+                "block": block_name,
+                "duration_ms": int((finished_at - started_at) * 1000),
+            })
+
         ann_infos_path = Path(ann_infos_path_text) if ann_infos_path_text else ann_paths["nas_infos"]
+        infos_started = time.perf_counter()
         ann_infos = load_json(str(ann_infos_path), {}) if ann_infos_path.is_file() else {}
+        _ann_mark("lecture infos_projet.json", infos_started)
         if ann_infos_path.is_file() and not isinstance(ann_infos, dict):
             st.error("infos_projet.json existe mais n'est pas un objet JSON.")
             ann_infos = {}
@@ -11390,40 +11866,68 @@ elif page == "Annotation photos / Rapport Word":
         )
 
         ann_resources = _annotation_resource_paths(ann_infos_path, ann_infos if isinstance(ann_infos, dict) else {})
+        resource_audit_started = time.perf_counter()
         ann_resource_audit = _annotation_resource_audit(
             ann_paths,
             ann_infos if isinstance(ann_infos, dict) else {},
             ann_id_affaire,
             ann_id_captation,
         )
+        _ann_mark("inspection photos.csv / photos_batch.csv", resource_audit_started)
         try:
             ann_pcfixe_resources = _annotation_pcfixe_required_resources(ann_paths)
         except Exception as exc:
             st.warning(f"Ressources PC fixe utilisées par le job indisponibles : {exc}")
             ann_pcfixe_resources = {}
+        jobs_light_started = time.perf_counter()
         ann_job_details, ann_jobs_diag = _annotation_job_details(
             ann_id_affaire,
             ann_id_captation,
             paths=ann_paths,
             include_diagnostics=True,
+            detail_level="light",
         )
+        _ann_mark("construction état batch léger", jobs_light_started)
+        ann_flask_diag = get_flask_resolution_diagnostics()
         ann_job_statuses = {key: value.get("status", "absent") for key, value in ann_job_details.items()}
         ann_latest_batch_key, ann_latest_batch = _annotation_latest_completed_batch(ann_job_details)
+        report_preflight_started = time.perf_counter()
         ann_report_preflight = _annotation_report_preflight(ann_resource_audit, ann_job_details, ann_paths)
-        ann_report_files = []
-        for report_root in (ann_paths["pcfixe_report_unc_dir"], ann_paths["nas_report_dir"]):
-            if report_root.exists():
-                ann_report_files.extend(report_root.glob(f"annotation_photos_{ann_id_affaire}_{ann_id_captation}_V_*.docx"))
-        ann_report_status = "présent" if ann_report_files else "absent"
+        _ann_mark("construction état Word", report_preflight_started)
+        ann_detailed_diag_requested = bool(st.session_state.get(ann_detailed_diag_key))
+        ann_report_files: list[Path] = []
+        ann_report_status = "en attente"
+        if ann_detailed_diag_requested:
+            for report_root in (ann_paths["pcfixe_report_unc_dir"], ann_paths["nas_report_dir"]):
+                report_root_ok, _ = _path_accessible_quick(report_root)
+                if not report_root_ok:
+                    continue
+                try:
+                    ann_report_files.extend(sorted(
+                        report_root.glob(f"annotation_photos_{ann_id_affaire}_{ann_id_captation}_V_*.docx"),
+                        key=lambda p: p.stat().st_mtime if p.exists() else 0,
+                        reverse=True,
+                    )[:10])
+                except Exception:
+                    continue
+            ann_report_status = "présent" if ann_report_files else "absent"
+        elif ann_latest_batch:
+            ann_report_status = "à générer"
 
-        status_rows = [
-            {
-                "élément": name,
-                "état": "présent" if path.is_file() else "absent",
-                "chemin": str(path),
-            }
-            for name, path in ann_resources.items()
-        ]
+        ann_photos_resource_missing = ann_resources.get("photos.csv") is None
+        status_rows = []
+        for name, path in ann_resources.items():
+            valid_path = _valid_file_path(path)
+            state_label = "présent" if valid_path is not None and valid_path.is_file() else "absent"
+            if name == "photos_batch.csv" and valid_path is None and ann_photos_resource_missing:
+                state_label = "indéterminé"
+            status_rows.append(
+                {
+                    "élément": name,
+                    "état": state_label,
+                    "chemin": str(valid_path or ""),
+                }
+            )
         status_rows.extend([
             {
                 "élément": PHOTO_BATCH_ACTIONS["initial"]["status_label"],
@@ -11448,12 +11952,60 @@ elif page == "Annotation photos / Rapport Word":
         ])
         st.markdown("#### Tableau d'état")
         st.dataframe(status_rows, width="stretch", hide_index=True)
+        if ann_photos_resource_missing:
+            st.warning("Aucun fichier photos.csv n’a été résolu pour cette captation.")
         st.markdown("#### Ressources photos par niveau")
         st.caption("source retenue pour le rapport Word : NAS")
         st.dataframe(ann_resource_audit["rows"], width="stretch", hide_index=True)
         st.markdown("#### Registre jobs interrogé")
         st.caption(f"sonde SMB TCP 445 : {ANNOTATION_JOBS_SMB_TCP_TIMEOUT_SECONDS:.2f} s par racine")
+        refresh_cols = st.columns([1, 1, 4])
+        with refresh_cols[0]:
+            if st.button("Actualiser maintenant", key=f"ann_photos_refresh_jobs_{ann_diag_scope}"):
+                _annotation_clear_runtime_caches(id_affaire=ann_id_affaire, id_captation=ann_id_captation)
+                st.rerun()
+        with refresh_cols[1]:
+            if st.button("Charger le diagnostic détaillé", key=f"ann_photos_load_diag_{ann_diag_scope}"):
+                st.session_state[ann_detailed_diag_key] = True
+                _annotation_clear_runtime_caches(id_affaire=ann_id_affaire, id_captation=ann_id_captation)
+                st.rerun()
         st.dataframe(ann_jobs_diag.get("roots", []), width="stretch", hide_index=True)
+        with st.expander("Mesures techniques HTTP / SMB / manifests", expanded=False):
+            st.dataframe(ann_render_perf["blocks"], width="stretch", hide_index=True)
+            st.json(
+                {
+                    "flask_resolution": {
+                        "selected_url": ann_flask_diag.get("last_selected_url", ""),
+                        "source": ann_flask_diag.get("last_source", ""),
+                        "call_count": ann_flask_diag.get("call_count", 0),
+                        "cache_hits": ann_flask_diag.get("cache_hits", 0),
+                        "last_duration_ms": ann_flask_diag.get("last_duration_ms", 0),
+                        "total_probe_ms": ann_flask_diag.get("total_probe_ms", 0),
+                    },
+                    "annotation_jobs_scan_light": ann_jobs_diag.get("timings", {}),
+                    "annotation_jobs_perf_blocks_light": ann_jobs_diag.get("perf_blocks", []),
+                    "slow_blocks_light": ann_jobs_diag.get("slow_block_stacks", []),
+                },
+                expanded=False,
+            )
+            if not ann_detailed_diag_requested:
+                st.caption("Le diagnostic historique détaillé reste différé tant que vous ne cliquez pas sur le bouton dédié.")
+            else:
+                ann_job_details_detailed, ann_jobs_diag_detailed = _annotation_job_details(
+                    ann_id_affaire,
+                    ann_id_captation,
+                    paths=ann_paths,
+                    include_diagnostics=True,
+                    detail_level="detailed",
+                )
+                st.json(
+                    {
+                        "annotation_jobs_scan_detailed": ann_jobs_diag_detailed.get("timings", {}),
+                        "annotation_jobs_perf_blocks_detailed": ann_jobs_diag_detailed.get("perf_blocks", []),
+                        "slow_blocks_detailed": ann_jobs_diag_detailed.get("slow_block_stacks", []),
+                    },
+                    expanded=False,
+                )
         if ann_jobs_diag.get("selected_job_id"):
             st.success(
                 "Dernier batch retenu : "
@@ -11557,18 +12109,18 @@ elif page == "Annotation photos / Rapport Word":
             "prompt_gpt_batch_only.json": _annotation_source_file("prompt_gpt_batch_only.json"),
         }
         for resource_name in ("config_llm.json", "prompt_gpt.json", "prompt_gpt_batch_only.json"):
-            target = ann_resources[resource_name]
+            target = _valid_file_path(ann_resources[resource_name])
             source = copy_candidates.get(resource_name)
             col_res = st.columns([2, 4, 2])
             with col_res[0]:
                 st.write(resource_name)
             with col_res[1]:
-                st.caption(str(target))
+                st.caption(str(target or ""))
                 st.caption(f"source proposée : {source or '(introuvable)'}")
             with col_res[2]:
-                if target.is_file():
+                if target is not None and target.is_file():
                     st.warning("présent - copie bloquée pour éviter l'écrasement")
-                elif source and st.button(f"Copier {resource_name}", key=f"ann_photos_copy_{resource_name}"):
+                elif target is not None and source and st.button(f"Copier {resource_name}", key=f"ann_photos_copy_{resource_name}"):
                     try:
                         _copy_exact_file(source, target)
                         st.success("Copie effectuée.")
@@ -11579,22 +12131,24 @@ elif page == "Annotation photos / Rapport Word":
                     st.warning("absent")
 
         for resource_name in ("contexte_general.json", "contexte_general_photos.json"):
-            target = ann_resources[resource_name]
+            target = _valid_file_path(ann_resources[resource_name])
             source_value = st.text_input(
                 f"Source laptop pour {resource_name}",
                 value="",
                 key=f"ann_photos_source_{resource_name}",
                 help="Ce fichier peut provenir d'un dossier différent des autres ressources.",
             )
-            if target.is_file():
+            if target is not None and target.is_file():
                 st.warning(f"{resource_name} présent - copie bloquée pour éviter l'écrasement : {target}")
-            elif st.button(f"Copier {resource_name}", key=f"ann_photos_copy_manual_{resource_name}"):
+            elif target is not None and st.button(f"Copier {resource_name}", key=f"ann_photos_copy_manual_{resource_name}"):
                 try:
                     _copy_exact_file(source_value, target)
                     st.success("Copie effectuée.")
                     st.rerun()
                 except Exception as e:
                     st.error(f"Copie impossible : {e}")
+            else:
+                st.warning(f"{resource_name} : chemin cible non résolu")
 
         missing_required = [
             name for name in (
@@ -11607,7 +12161,7 @@ elif page == "Annotation photos / Rapport Word":
                 "photos.csv",
                 "photos_batch.csv",
             )
-            if not ann_resources[name].is_file()
+            if (_valid_file_path(ann_resources[name]) is None) or (not _valid_file_path(ann_resources[name]).is_file())
         ]
         if missing_required:
             st.warning("Ressources absentes : " + ", ".join(missing_required))
@@ -11633,40 +12187,66 @@ elif page == "Annotation photos / Rapport Word":
                 st.error(f"Mise à jour impossible : {e}")
 
         st.markdown("#### Actions de traitement")
-        ann_job_preview_only = st.checkbox(
-            "Prévisualiser le JSON sans déposer le job",
-            value=True,
-            key="ann_photos_job_preview_only",
-        )
-        for action_key, spec in PHOTO_BATCH_ACTIONS.items():
-            st.markdown(f"#### {spec['label']}")
-            preview = submit_annotation_photos_batch_job(
-                id_affaire=ann_id_affaire,
-                id_captation=ann_id_captation,
-                infos_pcfixe=ann_paths["pcfixe_infos"],
-                action_key=action_key,
-                dry_run=True,
+        pending_batch_notice = st.session_state.get("ann_photos_last_batch_submission")
+        if isinstance(pending_batch_notice, dict) and pending_batch_notice.get("id_affaire") == ann_id_affaire and pending_batch_notice.get("id_captation") == ann_id_captation:
+            st.info(
+                "Dernière soumission batch : "
+                f"{pending_batch_notice.get('action_label', '')} "
+                f"({pending_batch_notice.get('job_id', '')}) — "
+                f"{pending_batch_notice.get('status', '')}"
             )
-            st.json(preview["job"])
-            if st.button(spec["label"], key=f"ann_photos_submit_{action_key}"):
+            if pending_batch_notice.get("job_path"):
+                st.caption(f"JSON déposé : {pending_batch_notice.get('job_path')}")
+        with st.form(key=f"ann_photos_batch_form_{ann_diag_scope}"):
+            ann_job_preview_only = st.checkbox(
+                "Prévisualiser le JSON sans déposer le job",
+                value=True,
+                key="ann_photos_job_preview_only",
+            )
+            submitted_action_key = ""
+            for action_key, spec in PHOTO_BATCH_ACTIONS.items():
+                action_state = _annotation_batch_action_state(ann_job_details, action_key)
+                if ann_photos_resource_missing:
+                    action_state = {
+                        **action_state,
+                        "can_submit": False,
+                        "status_code": "MISSING_PHOTOS_CSV",
+                        "message": "Aucun fichier photos.csv n’a été résolu pour cette captation.",
+                    }
+                st.markdown(f"#### {spec['label']}")
+                st.caption(str(action_state.get("message") or ""))
+                if st.form_submit_button(spec["label"], disabled=not bool(action_state.get("can_submit"))):
+                    submitted_action_key = action_key
+            if submitted_action_key:
                 try:
                     result = submit_annotation_photos_batch_job(
                         id_affaire=ann_id_affaire,
                         id_captation=ann_id_captation,
                         infos_pcfixe=ann_paths["pcfixe_infos"],
-                        action_key=action_key,
+                        action_key=submitted_action_key,
                         dry_run=ann_job_preview_only,
                     )
+                    spec = PHOTO_BATCH_ACTIONS[submitted_action_key]
+                    st.session_state["ann_photos_last_batch_submission"] = {
+                        "id_affaire": ann_id_affaire,
+                        "id_captation": ann_id_captation,
+                        "action_key": submitted_action_key,
+                        "action_label": spec["label"],
+                        "job_id": result["job_id"],
+                        "job_path": result["job_path"],
+                        "status": result["status"],
+                    }
                     st.write("job_id :", result["job_id"])
                     st.write("chemin JSON :", result["job_path"])
                     st.write("statut initial :", result["status"])
                     st.json(result["job"])
                     if ann_job_preview_only:
                         st.info("Aucun job déposé : prévisualisation UI uniquement.")
-                    elif action_key == "weak_dry_run":
+                    elif submitted_action_key == "weak_dry_run":
                         st.success("Job d’analyse déposé. Le batch analysera les CSV sans modifier les annotations.")
                     else:
                         st.success("Job annotation_photos_batch déposé. Streamlit n'attend pas la fin du traitement.")
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Soumission impossible : {e}")
 
@@ -11688,22 +12268,32 @@ elif page == "Annotation photos / Rapport Word":
             value=True,
             key="ann_photos_report_job_dry_run",
         )
-        report_preview = _photo_report_job_preview(
-            id_affaire=ann_id_affaire,
-            id_captation=ann_id_captation,
-            infos_pcfixe=ann_paths["pcfixe_infos"],
-            paths=ann_paths,
-            audit=ann_resource_audit,
-            latest_batch=ann_report_preflight.get("latest_batch", {}),
-            mode=report_mode,
-            only_retenue=report_filter == "uniquement photos retenues",
-            dry_run=True,
-        )
-        st.json(report_preview["job"])
-        report_resource_rows = ann_resource_audit["rows"]
-        st.dataframe(report_resource_rows, width="stretch")
         report_gtp_rows = _annotation_report_resource_rows(ann_paths, ann_infos)
         gtp_row = next((row for row in report_gtp_rows if row.get("ressource") == "fichier *GTP*.csv"), {})
+        report_ui_state = _annotation_report_ui_state(
+            job_details=ann_job_details,
+            report_preflight=ann_report_preflight,
+            report_mode=report_mode,
+            gtp_present=gtp_row.get("présent") == "oui",
+        )
+        report_preview = None
+        if report_ui_state.get("available"):
+            report_preview = _photo_report_job_preview(
+                id_affaire=ann_id_affaire,
+                id_captation=ann_id_captation,
+                infos_pcfixe=ann_paths["pcfixe_infos"],
+                paths=ann_paths,
+                audit=ann_resource_audit,
+                latest_batch=ann_report_preflight.get("latest_batch", {}),
+                mode=report_mode,
+                only_retenue=report_filter == "uniquement photos retenues",
+                dry_run=True,
+            )
+            st.json(report_preview["job"])
+        else:
+            st.info(str(report_ui_state.get("message") or "Le rapport Word sera disponible après la fin d’un traitement photo initial terminé et vérifié."))
+        report_resource_rows = ann_resource_audit["rows"]
+        st.dataframe(report_resource_rows, width="stretch")
         missing_report_resources = []
         initial_status = ann_job_statuses.get("initial", "absent")
         weak_analysis_status = ann_job_statuses.get("weak_dry_run", "absent")
@@ -11726,8 +12316,15 @@ elif page == "Annotation photos / Rapport Word":
         if missing_report_resources:
             report_block_reasons.append("ressources rapport manquantes : " + ", ".join(missing_report_resources))
         report_block_reasons.extend(ann_report_preflight["reasons"])
+        if report_ui_state.get("status_code") == "DONE_LEGACY":
+            report_block_reasons.append("batch historique non retenu automatiquement")
+        elif report_ui_state.get("status_code") == "DONE_NOT_VERIFIED":
+            report_block_reasons.append("batch moderne non retenu")
         for warning_text in ann_report_preflight["warnings"]:
             st.warning(warning_text)
+        for warning_text in report_ui_state.get("warnings", []):
+            if warning_text not in ann_report_preflight["warnings"]:
+                st.warning(str(warning_text))
         if weak_analysis_status in {"queued", "running"}:
             st.info(f"Analyse dry-run batch en cours ({weak_analysis_job_id or 'sans job_id'}) : le rapport provisoire peut rester soumis si le traitement initial est terminé.")
         if report_block_reasons:
@@ -11741,7 +12338,7 @@ elif page == "Annotation photos / Rapport Word":
         if st.button(
             "Soumettre le rapport Word au spooler",
             key="ann_photos_report_submit",
-            disabled=bool(report_block_reasons),
+            disabled=bool(report_block_reasons) or not bool(report_ui_state.get("available")),
         ):
             try:
                 report_result = _photo_report_job_preview(

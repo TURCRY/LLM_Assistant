@@ -7,6 +7,8 @@ import json
 import os
 import re
 import shutil
+import time
+import traceback
 import unittest
 import uuid
 from datetime import datetime
@@ -20,11 +22,21 @@ ACTION_OPTIONS = ["--reset-vlm", "1", "--vlm-strict", "1"]
 def _load_annotation_functions():
     tree = ast.parse(APP_PATH.read_text(encoding="utf-8-sig"))
     names = {
+        "_valid_file_path",
+        "_infos_declared_path",
+        "_annotation_cache_prune",
+        "_annotation_perf_begin",
+        "_annotation_perf_end",
+        "_annotation_list_json_candidates",
+        "_annotation_jobs_roots",
         "_annotation_job_details",
         "_annotation_latest_completed_batch",
         "_annotation_has_newer_blocking_batch",
         "_annotation_report_preflight",
+        "_annotation_report_ui_state",
+        "_annotation_batch_action_state",
         "_photo_report_job_preview",
+        "submit_annotation_photos_batch_job",
     }
     module = ast.Module(
         body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names],
@@ -37,6 +49,7 @@ def _load_annotation_functions():
         "csv": csv,
         "json": json,
         "os": os,
+        "time": time,
         "uuid": uuid,
         "datetime": datetime,
         "PHOTO_BATCH_ACTIONS": {
@@ -49,7 +62,19 @@ def _load_annotation_functions():
         },
         "ANNOTATION_JOBS_FOLDERS": ("done", "failed", "running", "queued", "work"),
         "ANNOTATION_RESOURCE_MTIME_TOLERANCE_SECONDS": 5.0,
+        "ANNOTATION_JOBS_DIAGNOSTIC_TTL_SECONDS": 45.0,
+        "ANNOTATION_FILE_PROFILE_TTL_SECONDS": 45.0,
+        "ANNOTATION_JOB_SCAN_LIMIT_LIGHT": 20,
+        "ANNOTATION_JOB_SCAN_LIMIT_DETAILED": 50,
+        "ANNOTATION_UNC_LIST_TIMEOUT_SECONDS": 4.0,
+        "ANNOTATION_SLOW_BLOCK_SECONDS": 15.0,
+        "ANNOTATION_JOBS_SMB_TCP_TIMEOUT_SECONDS": 0.75,
+        "PCFIXE_SMB_TEST_TIMEOUT_SECONDS": 0.1,
+        "NAS_AFFAIRES_ROOT": Path(r"C:\nas"),
+        "AFFAIRES_ROOT": r"C:\Affaires",
         "PHOTO_REPORT_JOB_SUPPORTED": True,
+        "_ANNOTATION_JOB_DETAILS_CACHE": {},
+        "_ANNOTATION_FILE_PROFILE_CACHE": {},
     }
 
     def load_json(path, default):
@@ -84,6 +109,7 @@ def _load_annotation_functions():
     ns.update(
         {
             "load_json": load_json,
+            "traceback": traceback,
             "_path_accessible_quick": lambda path: (Path(path).exists(), ""),
             "_test_path_with_timeout": lambda path: (Path(path).exists(), ""),
             "_unc_host": lambda path: "",
@@ -92,7 +118,12 @@ def _load_annotation_functions():
             "_csv_schema_ok": csv_schema_ok,
             "_job_failure_details": lambda job_id: {},
             "get_pcfixe_jobs_queued_dir": lambda: ns["_queue_dir"],
+            "_assert_annotation_pcfixe_resources_ready": lambda *args, **kwargs: {},
+            "preflight_pcfixe_target_dir": lambda *args, **kwargs: {},
             "_annotation_canonical_paths": lambda affaire, captation: ns["_paths"],
+            "_annotation_tcp_port_open": lambda host, port: (True, "ok"),
+            "_annotation_pcfixe_job_hosts": lambda: ["10.0.1.10", "192.168.0.120", "192.168.0.155"],
+            "_pcfixe_vpn_active": lambda: True,
         }
     )
     exec(compile(module, str(APP_PATH), "exec"), ns)
@@ -131,7 +162,8 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
             "pcfixe_photos_batch": self.base / "pc" / "photos_batch.csv",
         }
         self.ns["_paths"] = self.paths
-        self.ns["_annotation_jobs_roots"] = lambda: ([{"root": str(self.jobs), "label": "test", "source": "pcfixe"}], [])
+        self.original_annotation_jobs_roots = self.ns["_annotation_jobs_roots"]
+        self.ns["_annotation_jobs_roots"] = lambda *args, **kwargs: ([{"root": str(self.jobs), "label": "test", "source": "pcfixe"}], [])
 
     def tearDown(self):
         shutil.rmtree(self.base, ignore_errors=True)
@@ -177,7 +209,23 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
         return path
 
     def _details(self):
-        return self.ns["_annotation_job_details"]("2025-J47", "cap", paths=self.paths, include_diagnostics=True)
+        return self.ns["_annotation_job_details"](
+            "2025-J47",
+            "cap",
+            paths=self.paths,
+            include_diagnostics=True,
+            force_refresh=True,
+        )
+
+    def _details_level(self, detail_level):
+        return self.ns["_annotation_job_details"](
+            "2025-J47",
+            "cap",
+            paths=self.paths,
+            include_diagnostics=True,
+            detail_level=detail_level,
+            force_refresh=True,
+        )
 
     def _latest(self):
         details, _ = self._details()
@@ -281,6 +329,54 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
         self.assertTrue(preview["job"]["batch_nas_publish_succeeded"])
         self.assertTrue(preview["job"]["batch_output_verified"])
 
+    def test_no_batch_preview_is_unavailable_without_valueerror(self):
+        preview = self.ns["_photo_report_job_preview"](
+            id_affaire="2025-J47",
+            id_captation="cap",
+            infos_pcfixe=self.infos,
+            paths=self.paths,
+            audit=self._audit(),
+            latest_batch={},
+            mode="provisoire",
+            only_retenue=False,
+            dry_run=True,
+        )
+        self.assertFalse(preview["available"])
+        self.assertEqual(preview["reason_code"], "NO_COMPLETED_BATCH")
+        self.assertIsNone(preview["job"])
+
+    def test_report_ui_state_without_batch_disables_word(self):
+        state = self.ns["_annotation_report_ui_state"](
+            job_details={"initial": {"status": "absent", "job_id": ""}},
+            report_preflight={"latest_batch": {}, "reasons": [], "warnings": []},
+            report_mode="provisoire",
+            gtp_present=True,
+        )
+        self.assertFalse(state["available"])
+        self.assertTrue(state["disable_word"])
+        self.assertEqual(state["status_code"], "NO_COMPLETED_BATCH")
+
+    def test_batch_action_state_allows_initial_when_absent_and_blocks_when_queued(self):
+        absent = self.ns["_annotation_batch_action_state"]({}, "initial")
+        queued = self.ns["_annotation_batch_action_state"]({"initial": {"status": "queued", "job_id": "job123"}}, "initial")
+        self.assertTrue(absent["can_submit"])
+        self.assertEqual(absent["status_code"], "ABSENT")
+        self.assertFalse(queued["can_submit"])
+        self.assertEqual(queued["status_code"], "QUEUED")
+
+    def test_batch_submit_writes_single_json(self):
+        result = self.ns["submit_annotation_photos_batch_job"](
+            id_affaire="2025-J47",
+            id_captation="cap",
+            infos_pcfixe=self.infos,
+            action_key="initial",
+            dry_run=False,
+        )
+        queued_files = sorted(self.ns["_queue_dir"].glob("*.json"))
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(len(queued_files), 1)
+        self.assertEqual(queued_files[0].name, f"{result['job_id']}.json")
+
     def test_failed_or_running_newer_blocks_explicitly(self):
         done_path = self._write_job(self._manifest(job_id="annotation_2025-J47_cap_vlm_20260724_120000_done"))
         running_path = self._write_job(
@@ -305,10 +401,46 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
         self._write_job({"job_id": job_id, "type": "annotation_photos_batch", "status": "done", "affaire": "2025-J47", "captation": "cap", "options": list(ACTION_OPTIONS)}, folder="done")
         self._write_job(self._manifest(job_id=job_id), as_log=True)
         self._write_job(self._manifest(job_id=job_id), folder="done")
-        details, _ = self._details()
+        details, _ = self._details_level("detailed")
         completed = [d for d in details.values() if d.get("status") == "completed" and d.get("job_id") == job_id]
         self.assertEqual(len(completed), 1)
         self.assertEqual(completed[0]["manifest_path"], str(self.jobs / "logs" / f"{job_id}.manifest.json"))
+
+    def test_light_render_does_not_scan_logs(self):
+        job_id = "annotation_2025-J47_cap_vlm_20260724_120000_light"
+        self._write_job(self._manifest(job_id=job_id), folder="done")
+        _, diagnostics = self._details_level("light")
+        perf_blocks = diagnostics.get("perf_blocks", [])
+        self.assertFalse(any(block.get("block") == "scan logs" for block in perf_blocks))
+
+    def test_vpn_root_stops_after_first_accessible_host(self):
+        call_order = []
+
+        def fake_timeout(path):
+            raw = str(path)
+            call_order.append(raw)
+            if raw.startswith(r"\\10.0.1.10\Affaires\_jobs"):
+                return True, ""
+            if raw.startswith(r"\\192.168.0.120\Affaires\_jobs") or raw.startswith(r"\\192.168.0.155\Affaires\_jobs"):
+                raise AssertionError("les alias LAN ne doivent pas être testés quand la racine VPN répond")
+            return False, "blocked"
+
+        self.ns["_test_path_with_timeout"] = fake_timeout
+        self.ns["_unc_host"] = lambda path: "10.0.1.10" if str(path).startswith("\\\\10.0.1.10\\") else ("192.168.0.120" if str(path).startswith("\\\\192.168.0.120\\") else ("192.168.0.155" if str(path).startswith("\\\\192.168.0.155\\") else ""))
+        roots, probes = self.original_annotation_jobs_roots(detail_level="light")
+        self.assertEqual(len(roots), 1)
+        self.assertTrue(str(roots[0]["root"]).startswith(r"\\10.0.1.10\Affaires\_jobs"))
+        self.assertTrue(any(raw.startswith(r"\\10.0.1.10\Affaires\_jobs") for raw in call_order))
+        self.assertFalse(any(raw.startswith(r"\\192.168.0.120\Affaires\_jobs") for raw in call_order))
+        self.assertFalse(any(raw.startswith(r"\\192.168.0.155\Affaires\_jobs") for raw in call_order))
+        self.assertEqual(len(probes), 1)
+
+    def test_filename_filter_limits_irrelevant_json_reads(self):
+        irrelevant = self.jobs / "done" / "annotation_2024-Z99_other_20260724_120000_noise.json"
+        irrelevant.write_text(json.dumps(self._manifest(job_id="annotation_2024-Z99_other_20260724_120000_noise", affaire="2024-Z99", captation="other")), encoding="utf-8")
+        self._write_job(self._manifest(job_id="annotation_2025-J47_cap_vlm_20260724_120000_match"), folder="done")
+        _, diagnostics = self._details_level("light")
+        self.assertEqual(diagnostics["timings"]["json_files_seen"], 1)
 
 
 if __name__ == "__main__":
