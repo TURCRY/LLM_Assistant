@@ -1,4 +1,4 @@
-﻿# app_v1_1.py - Version nettoyée, modulaire et fonctionnelle
+# app_v1_1.py - Version nettoyée, modulaire et fonctionnelle
 from __future__ import annotations
 
 import socket
@@ -6396,9 +6396,14 @@ PHOTO_BATCH_ACTIONS = {
     },
 }
 
+PHOTO_BATCH_PUBLISH_RETRY_KEY = "publish_retry"
+PHOTO_BATCH_PUBLISH_RETRY_LABEL = "reprise publication NAS"
 PHOTO_REPORT_JOB_SUPPORTED = True
 ANNOTATION_RESOURCE_MTIME_TOLERANCE_SECONDS = 5.0
 ANNOTATION_JOBS_SMB_TCP_TIMEOUT_SECONDS = float(os.getenv("ANNOTATION_JOBS_SMB_TCP_TIMEOUT_SECONDS", "0.75"))
+ANNOTATION_LOCAL_PATH_TIMEOUT_SECONDS = float(os.getenv("ANNOTATION_LOCAL_PATH_TIMEOUT_SECONDS", "0.20"))
+ANNOTATION_UNC_RESOURCE_TIMEOUT_SECONDS = float(os.getenv("ANNOTATION_UNC_RESOURCE_TIMEOUT_SECONDS", "3.0"))
+ANNOTATION_UNC_RESOURCE_RETRY_TIMEOUT_SECONDS = float(os.getenv("ANNOTATION_UNC_RESOURCE_RETRY_TIMEOUT_SECONDS", "0.75"))
 ANNOTATION_JOBS_FOLDERS = ("done", "failed", "running", "queued", "work")
 
 def _safe_job_token(value: str) -> str:
@@ -6600,6 +6605,123 @@ def _infos_declared_path(infos: dict, key: str, fallback: Path | None = None) ->
     raw = infos.get(key) or pcfixe.get(key) or ""
     return _valid_file_path(raw) or _valid_file_path(fallback)
 
+def _annotation_localize_pcfixe_job_path(
+    path_value: object,
+    *,
+    field_name: str,
+    fallback: Path | None = None,
+    require_file: bool = False,
+) -> Path:
+    candidate = _valid_file_path(path_value) or _valid_file_path(fallback)
+    if candidate is None:
+        raise ValueError(f"Chemin introuvable pour {field_name}.")
+    raw = str(candidate).strip().strip('"')
+    normalized = raw.replace("/", "\\")
+    local_path: Path | None = None
+    allowed_roots = [
+        str(PCFIXE_AFFAIRES_ROOT),
+        str(get_pcfixe_affaires_root()),
+        str(NAS_AFFAIRES_ROOT),
+    ]
+    for root in allowed_roots:
+        root_norm = str(root).replace("/", "\\").rstrip("\\")
+        if normalized.casefold() == root_norm.casefold():
+            local_path = PCFIXE_AFFAIRES_ROOT
+            break
+        prefix = root_norm + "\\"
+        if normalized.casefold().startswith(prefix.casefold()):
+            rel = normalized[len(root_norm):].lstrip("\\")
+            local_path = PCFIXE_AFFAIRES_ROOT / Path(rel)
+            break
+    if local_path is None:
+        posix = raw.replace("\\", "/")
+        volume_root = "/volume1/Affaires"
+        if posix == volume_root or posix.startswith(volume_root + "/"):
+            rel = posix[len(volume_root):].lstrip("/")
+            local_path = PCFIXE_AFFAIRES_ROOT / Path(rel.replace("/", "\\"))
+    if local_path is None:
+        raise ValueError(
+            f"Chemin hors racines autorisées pour {field_name}: {raw}"
+        )
+    if require_file and not local_path.is_file():
+        raise FileNotFoundError(
+            f"Fichier local PC fixe introuvable pour {field_name}: {local_path}"
+        )
+    return local_path
+
+def _annotation_prepare_batch_runtime_infos(
+    *,
+    id_affaire: str,
+    id_captation: str,
+    job_id: str,
+    paths: dict[str, Path] | None = None,
+) -> tuple[Path, Path, dict]:
+    paths = paths or _annotation_canonical_paths(id_affaire, id_captation)
+    source_infos_path = _annotation_existing_infos_path(paths)
+    source_infos = load_json(str(source_infos_path), {})
+    if not isinstance(source_infos, dict):
+        raise ValueError(f"infos_projet.json invalide : {source_infos_path}")
+    runtime_infos = json.loads(json.dumps(source_infos))
+    pcfixe = runtime_infos.get("pcfixe") if isinstance(runtime_infos.get("pcfixe"), dict) else {}
+    runtime_infos["pcfixe"] = pcfixe
+    runtime_photos = _annotation_localize_pcfixe_job_path(
+        pcfixe.get("fichier_photos") or runtime_infos.get("fichier_photos"),
+        field_name="fichier_photos",
+        fallback=paths["pcfixe_photos"],
+        require_file=True,
+    )
+    runtime_batch = _annotation_localize_pcfixe_job_path(
+        pcfixe.get("fichier_photos_batch") or runtime_infos.get("fichier_photos_batch"),
+        field_name="fichier_photos_batch",
+        fallback=paths["pcfixe_photos_batch"],
+        require_file=True,
+    )
+    runtime_infos["fichier_photos"] = str(runtime_photos)
+    runtime_infos["fichier_photos_batch"] = str(runtime_batch)
+    pcfixe["fichier_photos"] = str(runtime_photos)
+    pcfixe["fichier_photos_batch"] = str(runtime_batch)
+    pcfixe["root_affaires"] = str(PCFIXE_AFFAIRES_ROOT)
+    runtime_dir_local = paths["pcfixe_trans_dir"] / "_runtime_jobs"
+    runtime_dir_unc = paths["pcfixe_unc_trans_dir"] / "_runtime_jobs"
+    runtime_name = f"infos_projet_runtime_{job_id}.json"
+    return runtime_dir_local / runtime_name, runtime_dir_unc / runtime_name, runtime_infos
+
+def _annotation_resolve_batch_submission_notice(
+    notice: dict | None,
+    job_details: dict[str, dict],
+    *,
+    id_affaire: str,
+    id_captation: str,
+) -> dict | None:
+    if not isinstance(notice, dict):
+        return None
+    if notice.get("id_affaire") != id_affaire or notice.get("id_captation") != id_captation:
+        return None
+    action_key = str(notice.get("action_key") or "")
+    expected_job_id = str(notice.get("job_id") or "")
+    actual_detail = None
+    if expected_job_id:
+        for detail in (job_details or {}).values():
+            if str(detail.get("job_id") or "") == expected_job_id:
+                actual_detail = detail
+                break
+    if actual_detail is None and action_key and isinstance(job_details, dict):
+        candidate = job_details.get(action_key, {})
+        if isinstance(candidate, dict) and candidate.get("job_id"):
+            actual_detail = candidate
+    if actual_detail is None:
+        current_status = str(((job_details or {}).get(action_key, {}) or {}).get("status") or "")
+        if current_status in {"failed", "completed", "absent"} and str(notice.get("status") or "") in {"queued", "running"}:
+            return None
+        return notice
+    merged = dict(notice)
+    merged["status"] = str(actual_detail.get("status") or merged.get("status") or "")
+    merged["job_id"] = str(actual_detail.get("job_id") or merged.get("job_id") or "")
+    merged["job_path"] = str(actual_detail.get("job_path") or merged.get("job_path") or "")
+    merged["exit_code"] = str(actual_detail.get("exit_code") or "")
+    merged["stderr_excerpt"] = str(actual_detail.get("stderr_excerpt") or "")
+    return merged
+
 def _annotation_resource_paths(infos_path: Path, infos: dict) -> dict[str, Path | None]:
     base = infos_path.parent
     photos_path = _infos_declared_path(infos, "fichier_photos")
@@ -6795,6 +6917,10 @@ def _annotation_job_details(
     def _bool_value(value: object) -> bool:
         return str(value).strip().lower() in {"1", "true", "yes", "oui", "ok"}
 
+    def _is_valid_no_op(job: dict, result: dict) -> bool:
+        reason = str(job.get("no_op_reason") or result.get("no_op_reason") or "").strip().upper()
+        return _bool_value(job.get("no_op", result.get("no_op"))) and reason == "NO_WEAK_ROWS"
+
     def _is_false_or_empty(value: object) -> bool:
         return value in (None, "") or str(value).strip().lower() in {"0", "false", "no", "non"}
 
@@ -6831,7 +6957,7 @@ def _annotation_job_details(
 
     def _iter_job_json_files(root: Path) -> list[tuple[str, Path]]:
         out: list[tuple[str, Path]] = []
-        scan_folders = ("queued", "running", "done") if detail_level != "detailed" else ("queued", "running", "done", "failed")
+        scan_folders = ("queued", "running", "done", "failed")
         candidate_limit = ANNOTATION_JOB_SCAN_LIMIT_LIGHT if detail_level != "detailed" else ANNOTATION_JOB_SCAN_LIMIT_DETAILED
         base_terms = [id_affaire.casefold(), id_captation.casefold()]
         for folder in scan_folders:
@@ -6882,6 +7008,30 @@ def _annotation_job_details(
             "photos_batch_sha256": "",
         }
         for key in PHOTO_BATCH_ACTIONS
+    }
+    details[PHOTO_BATCH_PUBLISH_RETRY_KEY] = {
+        "status": "absent",
+        "job_id": "",
+        "job_path": "",
+        "log_path": "",
+        "report_path": "",
+        "total_photos": "",
+        "annotated_photos": "",
+        "remaining_photos": "",
+        "weak_photos": "",
+        "exit_code": "",
+        "stderr_excerpt": "",
+        "manifest_path": "",
+        "stdout_path": "",
+        "stderr_path": "",
+        "command_path": "",
+        "sort_stamp": "",
+        "sort_mtime": "0",
+        "completed_at": "",
+        "photos_csv": "",
+        "photos_csv_sha256": "",
+        "photos_batch_csv": "",
+        "photos_batch_sha256": "",
     }
     cache_key = (id_affaire, id_captation, detail_level, "diag" if include_diagnostics else "plain", "vpn" if _pcfixe_vpn_active() else "lan")
     _annotation_cache_prune(_ANNOTATION_JOB_DETAILS_CACHE, ANNOTATION_JOBS_DIAGNOSTIC_TTL_SECONDS)
@@ -6962,7 +7112,8 @@ def _annotation_job_details(
                             job_file = manifest_path
                             folder = "logs" if folder == "done" else folder
                             break
-                if job.get("type") != "annotation_photos_batch":
+                job_type = str(job.get("type") or "")
+                if job_type not in {"annotation_photos_batch", "annotation_photos_batch_publish_retry"}:
                     continue
                 job_id = str(job.get("job_id") or raw.get("job_id") or job_file.stem)
                 affaire = str(job.get("affaire") or job.get("id_affaire") or "")
@@ -6974,11 +7125,12 @@ def _annotation_job_details(
                 if _is_dry_run(job, result, options):
                     diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": "job dry-run"})
                     continue
-                action_key = ""
-                for candidate_key, spec in PHOTO_BATCH_ACTIONS.items():
-                    if options == spec["options"]:
-                        action_key = candidate_key
-                        break
+                action_key = PHOTO_BATCH_PUBLISH_RETRY_KEY if job_type == "annotation_photos_batch_publish_retry" else ""
+                if not action_key:
+                    for candidate_key, spec in PHOTO_BATCH_ACTIONS.items():
+                        if options == spec["options"]:
+                            action_key = candidate_key
+                            break
                 if not action_key:
                     diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": "options batch inconnues"})
                     continue
@@ -6993,6 +7145,24 @@ def _annotation_job_details(
                 nas_publish_succeeded_raw = job.get("nas_publish_succeeded", result.get("nas_publish_succeeded"))
                 nas_publish_succeeded = _bool_value(nas_publish_succeeded_raw)
                 nas_publish_error = str(job.get("nas_publish_error") or result.get("nas_publish_error") or "").strip()
+                publish_pending = _bool_value(job.get("publish_pending", result.get("publish_pending")))
+                local_done = _bool_value(job.get("local_done", result.get("local_done")))
+                publish_error_code = str(job.get("publish_error_code") or result.get("publish_error_code") or "").strip()
+                source_manifest = str(job.get("source_manifest") or result.get("source_manifest") or "").strip()
+                no_op_valid = action_key == "weak_rerun" and _is_valid_no_op(job, result)
+                no_op_reason = str(job.get("no_op_reason") or result.get("no_op_reason") or "").strip()
+                local_done_publish_pending = (
+                    job_type == "annotation_photos_batch"
+                    and publish_pending
+                    and local_done
+                    and publish_error_code == "NAS_PUBLISH_FAILED"
+                    and not nas_publish_succeeded
+                )
+                publish_retry_success = (
+                    job_type == "annotation_photos_batch_publish_retry"
+                    and not publish_pending
+                    and nas_publish_succeeded
+                )
                 is_modern = any(
                     value not in (None, "")
                     for value in (
@@ -7000,6 +7170,11 @@ def _annotation_job_details(
                         output_verified_local_raw,
                         nas_publish_attempted_raw,
                         nas_publish_succeeded_raw,
+                        job.get("publish_pending", result.get("publish_pending")),
+                        job.get("local_done", result.get("local_done")),
+                        job.get("publish_error_code", result.get("publish_error_code")),
+                        job.get("no_op", result.get("no_op")),
+                        job.get("no_op_reason", result.get("no_op_reason")),
                         job.get("photos_batch_csv_nas_sha256", result.get("photos_batch_csv_nas_sha256")),
                     )
                 )
@@ -7014,7 +7189,13 @@ def _annotation_job_details(
                 photos_batch_nas_hash = str(_value(result, "photos_batch_csv_nas_sha256", "photos_batch_nas_sha256") or _value(job, "photos_batch_csv_nas_sha256", "photos_batch_nas_sha256"))
                 photos_batch_hash = photos_batch_nas_hash or str(_value(result, "photos_batch_csv_sha256", "photos_batch_sha256", "expected_photos_batch_csv_sha256") or _value(job, "photos_batch_csv_sha256", "photos_batch_sha256", "expected_photos_batch_csv_sha256"))
                 if state == "completed":
-                    if is_modern:
+                    if no_op_valid and str(exit_code).strip() not in {"", "0"}:
+                        diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": f"no-op NO_WEAK_ROWS avec exit_code={exit_code}"})
+                        continue
+                    if publish_retry_success and not source_manifest:
+                        diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": "publish_retry sans source_manifest"})
+                        continue
+                    if is_modern and not (no_op_valid or local_done_publish_pending or publish_retry_success):
                         if not output_verified:
                             diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": "sortie batch non vérifiée : output_verified=false"})
                             continue
@@ -7064,8 +7245,7 @@ def _annotation_job_details(
                         diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": f"legacy exit_code={exit_code}"})
                         continue
                     if not photos_batch_used:
-                        diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": "job terminé mais photos_batch.csv absent du manifest"})
-                        continue
+                        photos_batch_used = str((paths or {}).get("nas_photos_batch") or "")
                     if expected_batch_path and not _same_affaires_file(photos_batch_used, expected_batch_path):
                         diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": "photos_batch.csv produit différent du chemin NAS attendu"})
                         continue
@@ -7132,9 +7312,27 @@ def _annotation_job_details(
                     "nas_publish_attempted": "true" if nas_publish_attempted else ("false" if is_modern else ""),
                     "nas_publish_succeeded": "true" if nas_publish_succeeded else ("false" if is_modern else ""),
                     "nas_publish_error": nas_publish_error,
+                    "publish_pending": "true" if publish_pending else "false" if is_modern else "",
+                    "local_done": "true" if local_done else "false" if is_modern else "",
+                    "publish_error_code": publish_error_code,
+                    "source_manifest": source_manifest,
+                    "no_op": "true" if no_op_valid else "",
+                    "no_op_reason": no_op_reason,
                     "batch_manifest_kind": "modern" if is_modern else "legacy",
                     "batch_nas_publish_succeeded": "true" if nas_publish_succeeded else ("false" if is_modern else ""),
-                    "verification_note": "Batch moderne vérifié et publié sur le NAS" if is_modern else "Batch historique — sortie vérifiée a posteriori, preuve de publication NAS incomplète.",
+                    "verification_note": (
+                        "Batch no-op valide : aucune ligne WEAK à retraiter"
+                        if no_op_valid
+                        else (
+                            "Batch local validé, publication NAS en attente"
+                            if local_done_publish_pending
+                            else (
+                                "Publication NAS reprise avec succès"
+                                if publish_retry_success
+                                else ("Batch moderne vérifié et publié sur le NAS" if is_modern else "Batch historique — sortie vérifiée a posteriori, preuve de publication NAS incomplète.")
+                            )
+                        )
+                    ),
                     "action_key": action_key,
                     "_dedupe_rank": (
                         source_rank.get(str(root_row.get("source") or ""), 9),
@@ -7197,6 +7395,29 @@ def _annotation_job_details(
         )
         if current >= previous:
             details[action_key] = clean_detail
+    if paths and not _annotation_latest_completed_batch(details)[1]:
+        stamp_detail, stamp_reasons = _annotation_verified_batch_from_stamp(
+            id_affaire=id_affaire,
+            id_captation=id_captation,
+            paths=paths,
+            existing_details=details,
+        )
+        if stamp_detail:
+            details["initial"] = stamp_detail
+            diagnostics["recognized"].append({
+                "job_id": stamp_detail.get("job_id", ""),
+                "status": "completed",
+                "source": "verified_stamp",
+                "path": stamp_detail.get("photos_batch_stamp_path", ""),
+                "photos_batch_csv": stamp_detail.get("photos_batch_csv", ""),
+            })
+        else:
+            for reason in stamp_reasons:
+                diagnostics["ignored"].append({
+                    "job_id": "",
+                    "path": str((paths.get("nas_photos_batch") if paths else Path()) or ""),
+                    "reason": reason,
+                })
     latest_key, latest = _annotation_latest_completed_batch(details)
     diagnostics["selected_job_id"] = latest.get("job_id", "")
     diagnostics["selected_source"] = latest.get("registry_source", "")
@@ -7234,9 +7455,19 @@ def _annotation_laptop_mirror_photos_dir(id_affaire: str, id_captation: str) -> 
 def _path_accessible_quick(path: Path) -> tuple[bool, str]:
     raw = str(path)
     if raw.startswith("\\\\"):
-        return _test_path_with_timeout(path)
+        ok, detail = _test_path_with_timeout(path, timeout_seconds=ANNOTATION_UNC_RESOURCE_TIMEOUT_SECONDS)
+        if ok:
+            return True, ""
+        if str(detail or "").lower().startswith("timeout") and ANNOTATION_UNC_RESOURCE_RETRY_TIMEOUT_SECONDS > 0:
+            retry_ok, retry_detail = _test_path_with_timeout(path, timeout_seconds=ANNOTATION_UNC_RESOURCE_RETRY_TIMEOUT_SECONDS)
+            if retry_ok:
+                return True, ""
+            return False, retry_detail or detail or "timeout UNC"
+        return False, detail or "fichier absent ou inaccessible"
     try:
-        return path.exists(), ""
+        return path.exists(), "" if path.exists() else "fichier absent"
+    except PermissionError as exc:
+        return False, f"accès refusé: {exc}"
     except OSError as exc:
         return False, str(exc)
 
@@ -7268,17 +7499,48 @@ def _backup_existing_file(path: Path, label: str) -> str:
     return str(backup)
 
 
-def _csv_schema_ok(path: Path, required_columns: tuple[str, ...] = ("photo_rel_native", "nom_fichier_image")) -> tuple[bool, str]:
+PHOTOS_CSV_REPORT_KEY_COLUMNS = ("photo_rel_native", "nom_fichier_image")
+PHOTOS_BATCH_REQUIRED_COLUMNS = ("photo_rel_native", "batch_status", "batch_id", "batch_ts")
+
+
+def _csv_kind_from_path(path: Path | None) -> str:
+    name = (Path(path).name if path is not None else "").casefold()
+    if name == "photos_batch.csv":
+        return "photos_batch"
+    if name == "photos.csv":
+        return "photos"
+    return "csv"
+
+
+def _read_semicolon_csv(path: Path) -> tuple[list[str], list[dict[str, str]]]:
+    with path.open("r", encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f, delimiter=";")
+        rows = list(reader)
+        return list(reader.fieldnames or []), rows
+
+
+def _csv_schema_ok(
+    path: Path,
+    required_columns: tuple[str, ...] | None = None,
+    *,
+    csv_kind: str | None = None,
+) -> tuple[bool, str]:
     try:
-        with path.open("r", encoding="utf-8-sig", newline="") as f:
-            sample = f.read(4096)
-            f.seek(0)
-            delimiter = ";" if ";" in sample else ","
-            reader = csv.DictReader(f, delimiter=delimiter)
-            fields = set(reader.fieldnames or [])
+        fieldnames, _ = _read_semicolon_csv(path)
+        fields = set(fieldnames)
     except Exception as exc:
         return False, str(exc)
+    if required_columns is None:
+        kind = csv_kind or _csv_kind_from_path(path)
+        if kind == "photos_batch":
+            required_columns = PHOTOS_BATCH_REQUIRED_COLUMNS
+        elif kind == "photos":
+            required_columns = ()
+        else:
+            required_columns = ("photo_rel_native",)
     missing = [col for col in required_columns if col not in fields]
+    if (csv_kind or _csv_kind_from_path(path)) == "photos" and not any(col in fields for col in PHOTOS_CSV_REPORT_KEY_COLUMNS):
+        missing.append("photo_rel_native ou nom_fichier_image")
     if missing:
         return False, "colonnes manquantes : " + ", ".join(missing)
     return True, ""
@@ -7286,13 +7548,265 @@ def _csv_schema_ok(path: Path, required_columns: tuple[str, ...] = ("photo_rel_n
 
 def _csv_row_count(path: Path) -> str:
     try:
-        with path.open("r", encoding="utf-8-sig", newline="") as f:
-            return str(max(0, sum(1 for _ in f) - 1))
+        _, rows = _read_semicolon_csv(path)
+        return str(len(rows))
     except Exception:
         return ""
 
 
-def _annotation_file_profile(path: Path | None, *, csv_expected: bool = False) -> dict[str, str]:
+def _csv_duplicate_values(rows: list[dict[str, str]], key: str) -> list[str]:
+    seen: set[str] = set()
+    duplicates: set[str] = set()
+    for row in rows:
+        value = str(row.get(key) or "").strip()
+        if not value:
+            continue
+        if value in seen:
+            duplicates.add(value)
+        seen.add(value)
+    return sorted(duplicates)
+
+
+def _csv_missing_key_rows(rows: list[dict[str, str]], key: str) -> int:
+    return sum(1 for row in rows if not str(row.get(key) or "").strip())
+
+
+def _photo_key_basename(value: str) -> str:
+    return Path(str(value or "").replace("\\", "/")).name.casefold()
+
+
+def _annotation_csv_join_audit(photos_path: Path | None, batch_path: Path | None) -> dict[str, object]:
+    result = {
+        "ok": True,
+        "reasons": [],
+        "warnings": [],
+        "photos_key": "",
+        "batch_key": "photo_rel_native",
+        "photos_rows": "",
+        "batch_rows": "",
+    }
+    photos_valid = _valid_file_path(photos_path)
+    batch_valid = _valid_file_path(batch_path)
+    if photos_valid is None or batch_valid is None or not photos_valid.is_file() or not batch_valid.is_file():
+        return result
+    try:
+        photos_fields, photos_rows = _read_semicolon_csv(photos_valid)
+        batch_fields, batch_rows = _read_semicolon_csv(batch_valid)
+    except Exception as exc:
+        result["ok"] = False
+        result["reasons"].append(f"lecture CSV impossible pour jointure Word : {exc}")
+        return result
+    photos_key = "photo_rel_native" if "photo_rel_native" in photos_fields else ("nom_fichier_image" if "nom_fichier_image" in photos_fields else "")
+    result["photos_key"] = photos_key
+    result["photos_rows"] = str(len(photos_rows))
+    result["batch_rows"] = str(len(batch_rows))
+    if not photos_key:
+        result["ok"] = False
+        result["reasons"].append("photos.csv sans clé de jointure photo_rel_native ou nom_fichier_image")
+        return result
+    if "photo_rel_native" not in batch_fields:
+        result["ok"] = False
+        result["reasons"].append("photos_batch.csv sans clé canonique photo_rel_native")
+        return result
+    photos_missing = _csv_missing_key_rows(photos_rows, photos_key)
+    batch_missing = _csv_missing_key_rows(batch_rows, "photo_rel_native")
+    if photos_missing:
+        result["ok"] = False
+        result["reasons"].append(f"photos.csv : {photos_missing} clé(s) photo absente(s)")
+    if batch_missing:
+        result["ok"] = False
+        result["reasons"].append(f"photos_batch.csv : {batch_missing} photo_rel_native absent(s)")
+    photos_dupes = _csv_duplicate_values(photos_rows, photos_key)
+    batch_dupes = _csv_duplicate_values(batch_rows, "photo_rel_native")
+    if photos_dupes:
+        result["ok"] = False
+        result["reasons"].append(f"photos.csv : clé(s) dupliquée(s) ({len(photos_dupes)})")
+    if batch_dupes:
+        result["ok"] = False
+        result["reasons"].append(f"photos_batch.csv : photo_rel_native dupliqué(s) ({len(batch_dupes)})")
+    if not result["ok"]:
+        return result
+    photos_values = {str(row.get(photos_key) or "").strip() for row in photos_rows}
+    batch_values = {str(row.get("photo_rel_native") or "").strip() for row in batch_rows}
+    if photos_key == "photo_rel_native":
+        missing_in_batch = photos_values - batch_values
+        extra_in_batch = batch_values - photos_values
+    else:
+        photos_values = {_photo_key_basename(value) for value in photos_values}
+        batch_values = {_photo_key_basename(value) for value in batch_values}
+        missing_in_batch = photos_values - batch_values
+        extra_in_batch = batch_values - photos_values
+        result["warnings"].append("photos.csv joint par basename car photo_rel_native est absent")
+    if missing_in_batch:
+        result["ok"] = False
+        result["reasons"].append(f"jointure Word : {len(missing_in_batch)} photo(s) photos.csv absente(s) du batch")
+    if extra_in_batch:
+        result["warnings"].append(f"jointure Word : {len(extra_in_batch)} photo(s) batch absente(s) de photos.csv")
+    return result
+
+
+def _annotation_parse_time_value(value: str) -> float:
+    raw = str(value or "").strip()
+    if not raw:
+        return 0.0
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.strptime(raw.replace("Z", "").split("+", 1)[0], fmt).timestamp()
+        except ValueError:
+            continue
+    return 0.0
+
+
+def _annotation_detail_sort_time(detail: dict) -> float:
+    try:
+        mtime = float(detail.get("sort_mtime", "0") or 0)
+    except (TypeError, ValueError):
+        mtime = 0.0
+    if mtime:
+        return mtime
+    return _annotation_parse_time_value(str(detail.get("completed_at") or detail.get("started_at") or ""))
+
+
+def _annotation_verified_batch_from_stamp(
+    *,
+    id_affaire: str,
+    id_captation: str,
+    paths: dict[str, Path],
+    existing_details: dict[str, dict] | None = None,
+) -> tuple[dict, list[str]]:
+    reasons: list[str] = []
+    photos_path = _valid_file_path(paths.get("nas_photos"))
+    batch_path = _valid_file_path(paths.get("nas_photos_batch"))
+    stamp_path = batch_path.with_name(batch_path.name + ".stamp") if batch_path is not None else None
+    if stamp_path is None:
+        return {}, ["stamp photos_batch.csv introuvable : chemin batch non résolu"]
+    if not stamp_path.is_file():
+        return {}, [f"stamp photos_batch.csv introuvable : {stamp_path}"]
+    try:
+        stamp = load_json(str(stamp_path), {})
+    except Exception as exc:
+        return {}, [f"stamp illisible : {exc}"]
+    if not isinstance(stamp, dict):
+        return {}, ["stamp invalide : JSON non objet"]
+    job_id = str(stamp.get("job_id") or "").strip()
+    if not job_id:
+        reasons.append("stamp invalide : job_id vide")
+    if str(stamp.get("affaire") or stamp.get("id_affaire") or "").strip() != id_affaire:
+        reasons.append("stamp invalide : affaire différente")
+    if str(stamp.get("captation") or stamp.get("id_captation") or "").strip() != id_captation:
+        reasons.append("stamp invalide : captation différente")
+    if photos_path is None or not photos_path.is_file():
+        reasons.append(f"photos.csv NAS introuvable pour stamp : {photos_path or ''}")
+    if batch_path is None or not batch_path.is_file():
+        reasons.append(f"photos_batch.csv NAS introuvable pour stamp : {batch_path or ''}")
+    if reasons:
+        return {}, reasons
+    expected_photos_hash = str(stamp.get("photos_csv_sha256_used") or stamp.get("photos_csv_sha256") or "").strip().lower()
+    expected_batch_hash = str(stamp.get("photos_batch_csv_sha256") or stamp.get("photos_batch_sha256") or "").strip().lower()
+    photos_hash = _sha256_file(photos_path).lower()
+    batch_hash = _sha256_file(batch_path).lower()
+    if not expected_photos_hash:
+        reasons.append("stamp invalide : photos_csv_sha256_used vide")
+    elif expected_photos_hash != photos_hash:
+        reasons.append("stamp invalide : hash photos.csv différent du NAS actuel")
+    if not expected_batch_hash:
+        reasons.append("stamp invalide : photos_batch_csv_sha256 vide")
+    elif expected_batch_hash != batch_hash:
+        reasons.append("stamp invalide : hash photos_batch.csv différent du NAS actuel")
+    photos_schema_ok, photos_schema_detail = _csv_schema_ok(photos_path, csv_kind="photos")
+    batch_schema_ok, batch_schema_detail = _csv_schema_ok(batch_path, csv_kind="photos_batch")
+    if not photos_schema_ok:
+        reasons.append(f"stamp invalide : schéma photos.csv incohérent: {photos_schema_detail}")
+    if not batch_schema_ok:
+        reasons.append(f"stamp invalide : schéma photos_batch.csv incohérent: {batch_schema_detail}")
+    join_audit = _annotation_csv_join_audit(photos_path, batch_path)
+    if not join_audit.get("ok", False):
+        reasons.extend(f"stamp invalide : {reason}" for reason in (join_audit.get("reasons") or []))
+    try:
+        _, batch_rows = _read_semicolon_csv(batch_path)
+    except Exception as exc:
+        batch_rows = []
+        reasons.append(f"stamp invalide : lecture photos_batch.csv impossible: {exc}")
+    stamp_batch_id = str(stamp.get("batch_id") or "").strip()
+    batch_ids = {str(row.get("batch_id") or "").strip() for row in batch_rows if str(row.get("batch_id") or "").strip()}
+    if not batch_rows:
+        reasons.append("stamp invalide : photos_batch.csv vide")
+    if not batch_ids:
+        reasons.append("stamp invalide : aucun batch_id renseigné dans photos_batch.csv")
+    elif stamp_batch_id and stamp_batch_id not in batch_ids:
+        reasons.append("stamp invalide : batch_id du stamp absent de photos_batch.csv")
+    try:
+        stamp_mtime = stamp_path.stat().st_mtime
+    except OSError:
+        stamp_mtime = 0.0
+    for detail in (existing_details or {}).values():
+        if not isinstance(detail, dict) or not detail.get("job_id"):
+            continue
+        detail_time = _annotation_detail_sort_time(detail)
+        if detail_time <= stamp_mtime + ANNOTATION_RESOURCE_MTIME_TOLERANCE_SECONDS:
+            continue
+        if detail.get("status") == "failed":
+            reasons.append(f"stamp contredit : manifest failed plus récent ({detail.get('job_id')})")
+        if str(detail.get("publish_pending") or "").strip().lower() == "true":
+            reasons.append(f"stamp contredit : publish_pending plus récent ({detail.get('job_id')})")
+    if reasons:
+        return {}, reasons
+    sort_stamp_match = re.search(r"_(\d{8}_\d{6})_", job_id)
+    sort_stamp = sort_stamp_match.group(1) if sort_stamp_match else datetime.fromtimestamp(stamp_mtime).strftime("%Y%m%d_%H%M%S")
+    completed_at = str(stamp.get("job_id_repaired_at") or stamp.get("last_batch_ts") or datetime.fromtimestamp(stamp_mtime).strftime("%Y-%m-%d %H:%M:%S"))
+    detail = {
+        "status": "completed",
+        "job_id": job_id,
+        "job_path": str(stamp_path),
+        "registry_root": str(stamp_path.parent),
+        "registry_source": "verified_stamp",
+        "registry_authority": "verified_stamp",
+        "log_path": "",
+        "report_path": str(stamp_path),
+        "total_photos": str(len(batch_rows)),
+        "annotated_photos": "",
+        "remaining_photos": "",
+        "weak_photos": "",
+        "exit_code": "0",
+        "stderr_excerpt": "",
+        "manifest_path": str(stamp_path),
+        "stdout_path": "",
+        "stderr_path": "",
+        "command_path": "",
+        "sort_stamp": sort_stamp,
+        "sort_mtime": str(stamp_mtime),
+        "started_at": "",
+        "completed_at": completed_at,
+        "photos_csv": str(photos_path),
+        "photos_csv_sha256": photos_hash,
+        "photos_batch_csv": str(batch_path),
+        "photos_batch_sha256": batch_hash,
+        "photos_batch_local_sha256": batch_hash,
+        "photos_batch_nas_sha256": batch_hash,
+        "photos_batch_csv_size": str(batch_path.stat().st_size),
+        "photos_batch_csv_rows": str(len(batch_rows)),
+        "photos_batch_stamp_path": str(stamp_path),
+        "output_verified": "true",
+        "output_verified_local": "true",
+        "nas_publish_attempted": "true",
+        "nas_publish_succeeded": "true",
+        "nas_publish_error": "",
+        "nas_publish_method": str(stamp.get("nas_publish_method") or "verified_stamp"),
+        "publish_pending": "false",
+        "local_done": "true",
+        "publish_error_code": "",
+        "source_manifest": "",
+        "no_op": "",
+        "no_op_reason": "",
+        "batch_manifest_kind": "verified_stamp",
+        "batch_nas_publish_succeeded": "true",
+        "verification_note": "Stamp batch vérifié : hashes, schémas et jointure NAS cohérents.",
+        "action_key": "initial",
+    }
+    return detail, []
+
+
+def _annotation_file_profile(path: Path | None, *, csv_expected: bool = False, csv_kind: str | None = None) -> dict[str, str]:
     valid_path = _valid_file_path(path)
     profile = {
         "chemin": str(valid_path or ""),
@@ -7316,7 +7830,8 @@ def _annotation_file_profile(path: Path | None, *, csv_expected: bool = False) -
             profile["erreur"] = "fichier absent"
             return profile
         st_info = valid_path.stat()
-        cache_key = (str(valid_path), int(st_info.st_size), float(st_info.st_mtime), bool(csv_expected))
+        profile_csv_kind = csv_kind or _csv_kind_from_path(valid_path)
+        cache_key = (str(valid_path), int(st_info.st_size), float(st_info.st_mtime), bool(csv_expected), profile_csv_kind)
         _annotation_cache_prune(_ANNOTATION_FILE_PROFILE_CACHE, ANNOTATION_FILE_PROFILE_TTL_SECONDS)
         cached = _ANNOTATION_FILE_PROFILE_CACHE.get(cache_key)
         if cached:
@@ -7330,7 +7845,7 @@ def _annotation_file_profile(path: Path | None, *, csv_expected: bool = False) -
         })
         if csv_expected:
             profile["lignes"] = _csv_row_count(valid_path)
-            ok, detail = _csv_schema_ok(valid_path)
+            ok, detail = _csv_schema_ok(valid_path, csv_kind=profile_csv_kind)
             profile["schéma"] = "cohérent" if ok else "incohérent"
             profile["erreur"] = detail
         _ANNOTATION_FILE_PROFILE_CACHE[cache_key] = {
@@ -7406,8 +7921,9 @@ def _annotation_resource_audit(
     resources: dict[str, dict] = {}
     rows: list[dict[str, str]] = []
     for filename, levels in source_paths.items():
+        csv_kind = _csv_kind_from_path(Path(filename))
         profiles = {
-            level: _annotation_file_profile(path, csv_expected=True)
+            level: _annotation_file_profile(path, csv_expected=True, csv_kind=csv_kind)
             for level, path in levels.items()
         }
         state = _annotation_compare_state(profiles)
@@ -7432,7 +7948,11 @@ def _annotation_resource_audit(
                 "cohérence": state,
                 "erreur": p.get("erreur", ""),
             })
-    return {"resources": resources, "rows": rows}
+    join_audit = _annotation_csv_join_audit(
+        (resources.get("photos.csv") or {}).get("paths", {}).get("nas"),
+        (resources.get("photos_batch.csv") or {}).get("paths", {}).get("nas"),
+    )
+    return {"resources": resources, "rows": rows, "join_audit": join_audit}
 
 
 def _annotation_latest_completed_batch(details: dict[str, dict]) -> tuple[str, dict]:
@@ -7446,30 +7966,47 @@ def _annotation_latest_completed_batch(details: dict[str, dict]) -> tuple[str, d
     return max(
         candidates,
         key=lambda item: (
-            1 if item[1].get("batch_manifest_kind") == "modern" else 0,
             item[1].get("sort_stamp", ""),
             float(item[1].get("sort_mtime", "0") or 0),
+            1 if item[1].get("batch_manifest_kind") == "modern" else 0,
         ),
     )
 
 
-def _annotation_has_newer_blocking_batch(details: dict[str, dict], latest_batch: dict) -> str:
+def _annotation_has_newer_blocking_batch(details: dict[str, dict], latest_batch: dict) -> tuple[str, dict]:
     if not latest_batch:
-        return ""
+        return "", {}
     latest_key = (
         latest_batch.get("sort_stamp", ""),
         float(latest_batch.get("sort_mtime", "0") or 0),
     )
     for detail in details.values():
-        if detail.get("status") not in {"failed", "running"}:
+        if detail.get("status") not in {"failed", "running", "queued"}:
             continue
         blocking_key = (
             detail.get("sort_stamp", ""),
             float(detail.get("sort_mtime", "0") or 0),
         )
         if blocking_key > latest_key:
-            return str(detail.get("status") or "")
-    return ""
+            return str(detail.get("status") or ""), detail
+    return "", {}
+
+
+def _annotation_latest_non_completed_batch(details: dict[str, dict]) -> tuple[str, dict]:
+    candidates = [
+        (key, detail)
+        for key, detail in (details or {}).items()
+        if detail.get("status") in {"queued", "running", "failed"} and detail.get("job_id")
+    ]
+    if not candidates:
+        return "", {}
+    return max(
+        candidates,
+        key=lambda item: (
+            item[1].get("sort_stamp", ""),
+            float(item[1].get("sort_mtime", "0") or 0),
+        ),
+    )
 
 
 def _annotation_report_preflight(
@@ -7478,12 +8015,29 @@ def _annotation_report_preflight(
     paths: dict[str, Path],
 ) -> dict:
     resources = audit.get("resources", {})
+    join_audit = audit.get("join_audit", {}) if isinstance(audit, dict) else {}
     photos = resources.get("photos.csv", {})
     batch = resources.get("photos_batch.csv", {})
     photos_profiles = photos.get("profiles", {})
     batch_profiles = batch.get("profiles", {})
     reasons: list[str] = []
     warnings: list[str] = []
+    latest_key, latest_batch = _annotation_latest_completed_batch(job_details)
+    latest_photos_hash_for_state = str(latest_batch.get("photos_csv_sha256") or "").strip()
+    latest_batch_hash_for_state = str(latest_batch.get("photos_batch_nas_sha256") or latest_batch.get("photos_batch_sha256") or "").strip()
+
+    def _divergence_is_covered_by_latest(resource_name: str, profile: dict[str, str]) -> bool:
+        if not latest_batch or profile.get("présent") != "oui" or profile.get("schéma") == "incohérent":
+            return False
+        current_hash = str(profile.get("sha256") or "").strip()
+        if not current_hash:
+            return False
+        if resource_name == "photos.csv":
+            return bool(latest_photos_hash_for_state and latest_photos_hash_for_state == current_hash)
+        if resource_name == "photos_batch.csv":
+            return bool(latest_batch_hash_for_state and latest_batch_hash_for_state == current_hash)
+        return False
+
     infos_profile = _annotation_file_profile(paths["nas_infos"])
     if infos_profile.get("présent") != "oui":
         reasons.append("infos_projet.json absent ou inaccessible sur la source canonique NAS")
@@ -7495,28 +8049,55 @@ def _annotation_report_preflight(
         reasons.append("schéma photos.csv NAS incohérent")
     if batch_profiles.get("nas", {}).get("schéma") == "incohérent":
         reasons.append("schéma photos_batch.csv NAS incohérent")
-    if photos.get("state") in {"divergence", "NAS indisponible", "fichier absent"}:
+    if photos.get("state") in {"divergence", "NAS indisponible", "fichier absent"} and not _divergence_is_covered_by_latest("photos.csv", photos_profiles.get("nas", {})):
         reasons.append(f"photos.csv : {photos.get('state')}")
-    if batch.get("state") in {"divergence", "NAS indisponible", "fichier absent"}:
+    if batch.get("state") in {"divergence", "NAS indisponible", "fichier absent"} and not _divergence_is_covered_by_latest("photos_batch.csv", batch_profiles.get("nas", {})):
         reasons.append(f"photos_batch.csv : {batch.get('state')}")
     if batch.get("state") in {"NAS plus ancien", "miroir plus ancien"}:
         warnings.append(f"photos_batch.csv : {batch.get('state')}")
+    if join_audit and not join_audit.get("ok", True):
+        reasons.extend(str(reason) for reason in (join_audit.get("reasons") or []))
+    if join_audit:
+        warnings.extend(str(warning) for warning in (join_audit.get("warnings") or []))
 
-    latest_key, latest_batch = _annotation_latest_completed_batch(job_details)
+    latest_is_no_op_weak = (
+        latest_batch.get("action_key") == "weak_rerun"
+        and str(latest_batch.get("no_op") or "").strip().lower() == "true"
+        and str(latest_batch.get("no_op_reason") or "").strip().upper() == "NO_WEAK_ROWS"
+    )
+    latest_publish_pending = str(latest_batch.get("publish_pending") or "").strip().lower() == "true"
+    latest_publish_retry_success = (
+        latest_batch.get("action_key") == PHOTO_BATCH_PUBLISH_RETRY_KEY
+        and str(latest_batch.get("publish_pending") or "").strip().lower() == "false"
+        and str(latest_batch.get("nas_publish_succeeded") or "").strip().lower() == "true"
+    )
     if not latest_batch:
         reasons.append("aucun dernier job batch réussi pour cette affaire/captation")
+        pending_key, pending_detail = _annotation_latest_non_completed_batch(job_details)
+        pending_status = str(pending_detail.get("status") or "")
+        pending_job_id = str(pending_detail.get("job_id") or "sans job_id")
+        if pending_status == "queued":
+            reasons.append(f"job batch en attente ({pending_job_id}) : attendre le traitement")
+        elif pending_status == "running":
+            reasons.append(f"job batch en cours ({pending_job_id}) : attendre la fin")
+        elif pending_status == "failed":
+            reasons.append(f"job batch échoué ({pending_job_id}) : relance possible")
     else:
-        blocking_state = _annotation_has_newer_blocking_batch(job_details, latest_batch)
+        blocking_state, blocking_detail = _annotation_has_newer_blocking_batch(job_details, latest_batch)
+        blocking_job_id = str(blocking_detail.get("job_id") or "sans job_id") if blocking_detail else "sans job_id"
         if blocking_state == "failed":
-            reasons.append("un job batch plus récent est en échec : ne pas utiliser un ancien photos_batch.csv")
+            reasons.append(f"job batch plus récent échoué ({blocking_job_id}) : relance possible")
         elif blocking_state == "running":
+            reasons.append(f"job batch plus récent en cours ({blocking_job_id}) : attendre la fin")
             reasons.append("un job batch plus récent est en cours : résultat actuel ambigu")
+        elif blocking_state == "queued":
+            reasons.append(f"job batch plus récent en attente ({blocking_job_id}) : attendre le démarrage ou l'échec")
     photos_mtime = float(photos_profiles.get("nas", {}).get("mtime") or 0)
     batch_csv_mtime = float(batch_profiles.get("nas", {}).get("mtime") or 0)
     batch_mtime = float(latest_batch.get("sort_mtime") or 0)
-    if latest_batch and photos_mtime and batch_mtime and photos_mtime > batch_mtime + ANNOTATION_RESOURCE_MTIME_TOLERANCE_SECONDS:
+    if latest_batch and not latest_publish_retry_success and photos_mtime and batch_mtime and photos_mtime > batch_mtime + ANNOTATION_RESOURCE_MTIME_TOLERANCE_SECONDS:
         reasons.append("batch à relancer : photos.csv NAS modifié après le dernier batch réussi")
-    if latest_batch and batch_csv_mtime and batch_mtime and batch_csv_mtime + ANNOTATION_RESOURCE_MTIME_TOLERANCE_SECONDS < batch_mtime:
+    if latest_batch and not (latest_is_no_op_weak or latest_publish_retry_success) and batch_csv_mtime and batch_mtime and batch_csv_mtime + ANNOTATION_RESOURCE_MTIME_TOLERANCE_SECONDS < batch_mtime:
         reasons.append("photos_batch.csv incohérent : fichier plus ancien que la fin du dernier batch réussi")
     if latest_batch and not batch_csv_mtime:
         reasons.append("photos_batch.csv produit introuvable pour le dernier batch réussi")
@@ -7532,21 +8113,25 @@ def _annotation_report_preflight(
     if latest_batch and latest_batch_nas_hash and current_batch_hash and latest_batch_nas_hash != current_batch_hash:
         reasons.append("batch à relancer : hash photos_batch.csv NAS différent du manifest")
     if latest_batch and latest_batch.get("batch_manifest_kind") == "modern":
-        if latest_batch.get("output_verified") != "true":
+        if latest_publish_pending:
+            reasons.append("batch local validé, publication NAS en attente : rapport Word bloqué tant que la source NAS est requise")
+        if latest_is_no_op_weak:
+            warnings.append("Aucune ligne WEAK à retraiter : reprise no-op valide.")
+        elif not latest_publish_retry_success and latest_batch.get("output_verified") != "true":
             reasons.append("batch moderne non vérifié : output_verified différent de true")
-        if latest_batch.get("output_verified_local") != "true":
+        if not (latest_is_no_op_weak or latest_publish_retry_success) and latest_batch.get("output_verified_local") != "true":
             reasons.append("sortie locale non vérifiée")
-        if latest_batch.get("nas_publish_attempted") != "true":
+        if not (latest_is_no_op_weak or latest_publish_retry_success or latest_publish_pending) and latest_batch.get("nas_publish_attempted") != "true":
             reasons.append("publication NAS non tentée")
-        if latest_batch.get("nas_publish_succeeded") != "true":
+        if not (latest_is_no_op_weak or latest_publish_pending) and latest_batch.get("nas_publish_succeeded") != "true":
             reasons.append("publication NAS échouée")
-        if latest_batch.get("nas_publish_error"):
+        if not (latest_is_no_op_weak or latest_publish_retry_success or latest_publish_pending) and latest_batch.get("nas_publish_error"):
             reasons.append("nas_publish_error non vide")
-        if not latest_photos_hash:
+        if not (latest_is_no_op_weak or latest_publish_retry_success) and not latest_photos_hash:
             reasons.append("batch moderne sans photos_csv_sha256_used")
-        if not latest_batch_hash:
+        if not (latest_is_no_op_weak or latest_publish_retry_success) and not latest_batch_hash:
             reasons.append("batch moderne sans photos_batch_csv_sha256")
-        if not latest_batch_nas_hash:
+        if not (latest_is_no_op_weak or latest_publish_retry_success or latest_publish_pending) and not latest_batch_nas_hash:
             reasons.append("batch moderne sans photos_batch_csv_nas_sha256")
     elif latest_batch and latest_batch.get("batch_manifest_kind") == "legacy":
         warnings.append("Batch historique — sortie vérifiée a posteriori, preuve de publication NAS incomplète.")
@@ -7688,17 +8273,22 @@ def submit_annotation_photos_batch_job(
 
     spec = PHOTO_BATCH_ACTIONS[action_key]
     infos = Path(str(infos_pcfixe).strip().strip('"'))
+    paths = _annotation_canonical_paths(id_affaire, id_captation)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     job_id = (
         f"annotation_{_safe_job_token(id_affaire)}_{_safe_job_token(id_captation)}_"
         f"{_safe_job_token(spec['profile'])}_{stamp}_{uuid.uuid4().hex[:8]}"
     )
+    runtime_infos_path = paths["pcfixe_trans_dir"] / "_runtime_jobs" / f"infos_projet_runtime_{job_id}.json"
     job = {
         "job_id": job_id,
         "type": "annotation_photos_batch",
         "affaire": id_affaire,
         "captation": id_captation,
-        "infos_projet": str(infos),
+        "infos_projet": str(runtime_infos_path),
+        "infos_projet_source": str(infos),
+        "fichier_photos": str(paths["pcfixe_photos"]),
+        "fichier_photos_batch": str(paths["pcfixe_photos_batch"]),
         "options": list(spec["options"]),
     }
     queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
@@ -7711,11 +8301,70 @@ def submit_annotation_photos_batch_job(
     if dry_run:
         return result
     _assert_annotation_pcfixe_resources_ready(id_affaire, id_captation)
+    runtime_infos_local, runtime_infos_unc, runtime_infos = _annotation_prepare_batch_runtime_infos(
+        id_affaire=id_affaire,
+        id_captation=id_captation,
+        job_id=job_id,
+        paths=paths,
+    )
+    _atomic_write_json(runtime_infos_unc, runtime_infos)
+    runtime_pcfixe = runtime_infos.get("pcfixe") if isinstance(runtime_infos.get("pcfixe"), dict) else {}
+    job["infos_projet"] = str(runtime_infos_local)
+    job["fichier_photos"] = str(runtime_pcfixe.get("fichier_photos") or runtime_infos.get("fichier_photos") or paths["pcfixe_photos"])
+    job["fichier_photos_batch"] = str(runtime_pcfixe.get("fichier_photos_batch") or runtime_infos.get("fichier_photos_batch") or paths["pcfixe_photos_batch"])
     preflight_pcfixe_target_dir(queued_path.parent)
     tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
     os.replace(tmp_path, queued_path)
     return result
+
+
+def submit_annotation_photos_batch_publish_retry_job(
+    *,
+    id_affaire: str,
+    id_captation: str,
+    source_manifest: str | Path,
+    dry_run: bool = True,
+) -> dict:
+    id_affaire = (id_affaire or "").strip()
+    id_captation = (id_captation or "").strip()
+    if not id_affaire or not id_captation:
+        raise ValueError("id_affaire/id_captation obligatoires.")
+    if any(char in id_affaire + id_captation for char in '\\/:*?"<>|'):
+        raise ValueError("id_affaire/id_captation invalides.")
+    source_manifest_path = Path(str(source_manifest or "").strip().strip('"'))
+    if not str(source_manifest_path):
+        raise ValueError("source_manifest obligatoire pour la reprise publication NAS.")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    job_id = (
+        f"annotation_publish_retry_{_safe_job_token(id_affaire)}_"
+        f"{_safe_job_token(id_captation)}_{stamp}_{uuid.uuid4().hex[:8]}"
+    )
+    job = {
+        "job_id": job_id,
+        "type": "annotation_photos_batch_publish_retry",
+        "affaire": id_affaire,
+        "captation": id_captation,
+        "id_affaire": id_affaire,
+        "id_captation": id_captation,
+        "source_manifest": str(source_manifest_path),
+    }
+    queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
+    result = {
+        "job_id": job_id,
+        "job_path": str(queued_path),
+        "status": "dry-run" if dry_run else "queued",
+        "job": job,
+    }
+    if dry_run:
+        return result
+    preflight_pcfixe_target_dir(queued_path.parent)
+    tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, queued_path)
+    return result
+
 
 def _patch_infos_llm_backend(infos_path: Path, backend: str) -> tuple[str, str]:
     backend = _normalize_cr_llm_backend(backend)
@@ -7813,21 +8462,28 @@ def _photo_report_job_preview(
             "command_preview": "",
         }
     if latest_batch.get("batch_manifest_kind") == "modern":
+        publish_retry_success = (
+            latest_batch.get("action_key") == PHOTO_BATCH_PUBLISH_RETRY_KEY
+            and latest_batch.get("publish_pending") == "false"
+            and latest_batch.get("nas_publish_succeeded") == "true"
+        )
+        if latest_batch.get("publish_pending") == "true":
+            raise ValueError("batch moderne refusé : publication NAS en attente.")
         manifest_photos_hash = str(latest_batch.get("photos_csv_sha256") or "").strip()
         manifest_batch_hash = str(latest_batch.get("photos_batch_nas_sha256") or latest_batch.get("photos_batch_sha256") or "").strip()
-        if latest_batch.get("output_verified") != "true":
+        if not publish_retry_success and latest_batch.get("output_verified") != "true":
             raise ValueError("batch moderne refusé : output_verified différent de true.")
-        if latest_batch.get("output_verified_local") != "true":
+        if not publish_retry_success and latest_batch.get("output_verified_local") != "true":
             raise ValueError("batch moderne refusé : sortie locale non vérifiée.")
-        if latest_batch.get("nas_publish_attempted") != "true":
+        if not publish_retry_success and latest_batch.get("nas_publish_attempted") != "true":
             raise ValueError("batch moderne refusé : publication NAS non tentée.")
         if latest_batch.get("nas_publish_succeeded") != "true":
             raise ValueError("batch moderne refusé : publication NAS échouée.")
-        if latest_batch.get("nas_publish_error"):
+        if not publish_retry_success and latest_batch.get("nas_publish_error"):
             raise ValueError("batch moderne refusé : nas_publish_error non vide.")
-        if manifest_photos_hash != expected_photos_hash:
+        if manifest_photos_hash and manifest_photos_hash != expected_photos_hash:
             raise ValueError("hash photos.csv NAS différent du manifest batch moderne retenu.")
-        if manifest_batch_hash != expected_batch_hash:
+        if manifest_batch_hash and manifest_batch_hash != expected_batch_hash:
             raise ValueError("hash photos_batch.csv NAS différent du manifest batch moderne retenu.")
     infos_job_path = paths["nas_infos"]
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -7902,7 +8558,6 @@ def _photo_report_job_preview(
 
 
 def _annotation_report_ui_state(
-    *,
     job_details: dict[str, dict],
     report_preflight: dict,
     report_mode: str,
@@ -7910,19 +8565,60 @@ def _annotation_report_ui_state(
 ) -> dict[str, object]:
     latest_batch = report_preflight.get("latest_batch", {}) if isinstance(report_preflight, dict) else {}
     initial_detail = (job_details or {}).get("initial", {}) if isinstance(job_details, dict) else {}
+    weak_rerun_detail = (job_details or {}).get("weak_rerun", {}) if isinstance(job_details, dict) else {}
+    publish_retry_detail = (job_details or {}).get(PHOTO_BATCH_PUBLISH_RETRY_KEY, {}) if isinstance(job_details, dict) else {}
     initial_status = str(initial_detail.get("status") or "absent")
     initial_job_id = str(initial_detail.get("job_id") or "")
+    weak_rerun_status = str(weak_rerun_detail.get("status") or "absent")
+    weak_rerun_job_id = str(weak_rerun_detail.get("job_id") or "")
+    publish_retry_status = str(publish_retry_detail.get("status") or "absent")
+    publish_retry_job_id = str(publish_retry_detail.get("job_id") or "")
     latest_kind = str(latest_batch.get("batch_manifest_kind") or "")
     reasons = list((report_preflight or {}).get("reasons") or [])
     warnings = list((report_preflight or {}).get("warnings") or [])
 
+    if publish_retry_status in {"queued", "running", "failed"}:
+        if publish_retry_status == "queued":
+            message = f"Reprise publication NAS en attente ({publish_retry_job_id or 'sans job_id'})."
+            code = "PUBLISH_RETRY_QUEUED"
+        elif publish_retry_status == "running":
+            message = f"Reprise publication NAS en cours ({publish_retry_job_id or 'sans job_id'})."
+            code = "PUBLISH_RETRY_RUNNING"
+        else:
+            message = f"Reprise publication NAS en échec ({publish_retry_job_id or 'sans job_id'}). Nouvelle tentative possible."
+            code = "PUBLISH_RETRY_FAILED"
+        return {
+            "available": False,
+            "disable_word": True,
+            "status_code": code,
+            "message": message,
+            "latest_batch": latest_batch,
+            "reasons": reasons,
+            "warnings": warnings,
+        }
+
     if latest_batch.get("job_id"):
-        if latest_kind == "modern" and not reasons:
+        if latest_batch.get("publish_pending") == "true":
+            return {
+                "available": False,
+                "disable_word": True,
+                "status_code": "BATCH_LOCAL_DONE_PUBLISH_PENDING",
+                "message": "Batch local validé, publication NAS en attente. Retenter la publication NAS avant le rapport Word.",
+                "latest_batch": latest_batch,
+                "reasons": reasons,
+                "warnings": warnings,
+            }
+        if latest_kind in {"modern", "verified_stamp"} and not reasons:
+            done_message = (
+                "Rapport Word disponible : stamp batch vérifié."
+                if latest_kind == "verified_stamp"
+                else "Rapport Word disponible : batch moderne terminé et vérifié."
+            )
             return {
                 "available": True,
                 "disable_word": False,
-                "status_code": "MODERN_DONE_VERIFIED",
-                "message": "Rapport Word disponible : batch moderne terminé et vérifié.",
+                "status_code": "VERIFIED_STAMP" if latest_kind == "verified_stamp" else "MODERN_DONE_VERIFIED",
+                "message": done_message,
                 "latest_batch": latest_batch,
                 "reasons": reasons,
                 "warnings": warnings,
@@ -7947,7 +8643,16 @@ def _annotation_report_ui_state(
             "warnings": warnings,
         }
 
-    if initial_status == "queued":
+    if weak_rerun_status == "queued":
+        message = f"Reprise WEAK en attente ({weak_rerun_job_id or 'sans job_id'})."
+        code = "WEAK_RERUN_QUEUED"
+    elif weak_rerun_status == "running":
+        message = f"Reprise WEAK en cours ({weak_rerun_job_id or 'sans job_id'})."
+        code = "WEAK_RERUN_RUNNING"
+    elif weak_rerun_status == "failed":
+        message = f"Reprise WEAK en échec ({weak_rerun_job_id or 'sans job_id'}). Relance possible."
+        code = "WEAK_RERUN_FAILED"
+    elif initial_status == "queued":
         message = f"Traitement initial en attente ({initial_job_id or 'sans job_id'})."
         code = "BATCH_QUEUED"
     elif initial_status == "running":
@@ -11945,6 +12650,11 @@ elif page == "Annotation photos / Rapport Word":
                 "chemin": ann_job_details["weak_rerun"].get("job_path", ""),
             },
             {
+                "élément": PHOTO_BATCH_PUBLISH_RETRY_LABEL,
+                "état": ann_job_statuses.get(PHOTO_BATCH_PUBLISH_RETRY_KEY, "absent"),
+                "chemin": ann_job_details.get(PHOTO_BATCH_PUBLISH_RETRY_KEY, {}).get("job_path", ""),
+            },
+            {
                 "élément": "rapport Word",
                 "état": ann_report_status,
                 "chemin": str(ann_report_files[0]) if ann_report_files else str(ann_paths["pcfixe_report_unc_dir"]),
@@ -12072,12 +12782,35 @@ elif page == "Annotation photos / Rapport Word":
             for action_key, detail in ann_job_details.items()
             if action_key in PHOTO_BATCH_ACTIONS
         ]
+        publish_retry_detail = ann_job_details.get(PHOTO_BATCH_PUBLISH_RETRY_KEY, {})
+        if publish_retry_detail:
+            job_follow_rows.append(
+                {
+                    "action": PHOTO_BATCH_PUBLISH_RETRY_LABEL,
+                    "statut": publish_retry_detail.get("status", "absent"),
+                    "job_id": publish_retry_detail.get("job_id", ""),
+                    "total": "",
+                    "annoté": "",
+                    "restant": "",
+                    "weak": "",
+                    "date de fin": publish_retry_detail.get("completed_at", ""),
+                    "photos.csv utilisé": publish_retry_detail.get("photos_csv") or "",
+                    "hash photos.csv": publish_retry_detail.get("photos_csv_sha256") or "",
+                    "photos_batch.csv produit": publish_retry_detail.get("photos_batch_csv") or "",
+                    "hash photos_batch.csv": publish_retry_detail.get("photos_batch_sha256") or "",
+                    "output_verified": publish_retry_detail.get("output_verified") or "",
+                    "type manifest": publish_retry_detail.get("batch_manifest_kind") or "",
+                    "source manifest": publish_retry_detail.get("source_manifest") or publish_retry_detail.get("registry_source") or "",
+                    "note": publish_retry_detail.get("verification_note") or "",
+                    "log / rapport": publish_retry_detail.get("report_path") or publish_retry_detail.get("log_path") or "",
+                }
+            )
         st.markdown("#### Suivi des jobs batch")
         st.dataframe(job_follow_rows, width="stretch", hide_index=True)
         if ann_latest_batch:
             st.caption(
                 f"Dernier job batch réussi retenu : {ann_latest_batch.get('job_id')} "
-                f"({PHOTO_BATCH_ACTIONS.get(ann_latest_batch_key, {}).get('status_label', ann_latest_batch_key)})"
+                f"({PHOTO_BATCH_ACTIONS.get(ann_latest_batch_key, {}).get('status_label', PHOTO_BATCH_PUBLISH_RETRY_LABEL if ann_latest_batch_key == PHOTO_BATCH_PUBLISH_RETRY_KEY else ann_latest_batch_key)})"
             )
         else:
             st.warning("Aucun dernier job batch réussi correspondant aux ressources actuellement sélectionnées.")
@@ -12187,16 +12920,65 @@ elif page == "Annotation photos / Rapport Word":
                 st.error(f"Mise à jour impossible : {e}")
 
         st.markdown("#### Actions de traitement")
-        pending_batch_notice = st.session_state.get("ann_photos_last_batch_submission")
-        if isinstance(pending_batch_notice, dict) and pending_batch_notice.get("id_affaire") == ann_id_affaire and pending_batch_notice.get("id_captation") == ann_id_captation:
-            st.info(
+        pending_batch_notice = _annotation_resolve_batch_submission_notice(
+            st.session_state.get("ann_photos_last_batch_submission"),
+            ann_job_details,
+            id_affaire=ann_id_affaire,
+            id_captation=ann_id_captation,
+        )
+        if pending_batch_notice is None:
+            st.session_state.pop("ann_photos_last_batch_submission", None)
+        else:
+            st.session_state["ann_photos_last_batch_submission"] = pending_batch_notice
+            pending_message = (
                 "Dernière soumission batch : "
                 f"{pending_batch_notice.get('action_label', '')} "
                 f"({pending_batch_notice.get('job_id', '')}) — "
                 f"{pending_batch_notice.get('status', '')}"
             )
+            pending_status = str(pending_batch_notice.get("status") or "")
+            if pending_status == "failed":
+                st.error(pending_message)
+                stderr_excerpt = str(pending_batch_notice.get("stderr_excerpt") or "").strip()
+                if stderr_excerpt:
+                    st.caption(stderr_excerpt[:400])
+            elif pending_status == "completed":
+                st.success(pending_message)
+            else:
+                st.info(pending_message)
             if pending_batch_notice.get("job_path"):
                 st.caption(f"JSON déposé : {pending_batch_notice.get('job_path')}")
+        publish_pending_batch = ann_report_preflight.get("latest_batch", {}) if isinstance(ann_report_preflight, dict) else {}
+        publish_retry_state = _annotation_batch_action_state(ann_job_details, PHOTO_BATCH_PUBLISH_RETRY_KEY)
+        if publish_pending_batch.get("publish_pending") == "true":
+            st.warning("Batch local validé, publication NAS en attente.")
+            st.caption(f"Manifest source : {publish_pending_batch.get('manifest_path') or '(non disponible)'}")
+            if st.button(
+                "Retenter la publication NAS",
+                key=f"ann_photos_publish_retry_{ann_diag_scope}",
+                disabled=not bool(publish_retry_state.get("can_submit")),
+            ):
+                try:
+                    result = submit_annotation_photos_batch_publish_retry_job(
+                        id_affaire=ann_id_affaire,
+                        id_captation=ann_id_captation,
+                        source_manifest=publish_pending_batch.get("manifest_path", ""),
+                        dry_run=False,
+                    )
+                    _annotation_clear_runtime_caches(id_affaire=ann_id_affaire, id_captation=ann_id_captation)
+                    st.session_state["ann_photos_last_batch_submission"] = {
+                        "id_affaire": ann_id_affaire,
+                        "id_captation": ann_id_captation,
+                        "action_key": PHOTO_BATCH_PUBLISH_RETRY_KEY,
+                        "action_label": "Retenter la publication NAS",
+                        "job_id": result["job_id"],
+                        "job_path": result["job_path"],
+                        "status": result["status"],
+                    }
+                    st.success("Job de reprise publication NAS déposé.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Reprise publication NAS impossible : {e}")
         with st.form(key=f"ann_photos_batch_form_{ann_diag_scope}"):
             ann_job_preview_only = st.checkbox(
                 "Prévisualiser le JSON sans déposer le job",
@@ -12227,6 +13009,7 @@ elif page == "Annotation photos / Rapport Word":
                         dry_run=ann_job_preview_only,
                     )
                     spec = PHOTO_BATCH_ACTIONS[submitted_action_key]
+                    _annotation_clear_runtime_caches(id_affaire=ann_id_affaire, id_captation=ann_id_captation)
                     st.session_state["ann_photos_last_batch_submission"] = {
                         "id_affaire": ann_id_affaire,
                         "id_captation": ann_id_captation,
@@ -12304,13 +13087,18 @@ elif page == "Annotation photos / Rapport Word":
         st.caption(f"Traitement initial retenu : {initial_job_id or '(aucun)'} — {initial_status}")
         st.caption(f"Analyse weak retenue : {weak_analysis_job_id or '(aucun)'} — {weak_analysis_status}")
         st.caption(f"Reprise WEAK retenue : {weak_rerun_job_id or '(aucun)'} — {weak_rerun_status}")
+        publish_retry_status = ann_job_statuses.get(PHOTO_BATCH_PUBLISH_RETRY_KEY, "absent")
+        publish_retry_job_id = ann_job_details.get(PHOTO_BATCH_PUBLISH_RETRY_KEY, {}).get("job_id", "")
+        st.caption(f"Reprise publication NAS retenue : {publish_retry_job_id or '(aucune)'} — {publish_retry_status}")
         report_block_reasons: list[str] = []
-        if initial_status in {"queued", "running", "failed", "absent"}:
+        if not ann_report_preflight.get("latest_batch") and initial_status in {"queued", "running", "failed", "absent"}:
             report_block_reasons.append(f"traitement initial {initial_status} ({initial_job_id or 'sans job_id'})")
-        if weak_rerun_status in {"queued", "running"}:
+        if not report_ui_state.get("available") and weak_rerun_status in {"queued", "running"}:
             report_block_reasons.append(f"reprise WEAK {weak_rerun_status} ({weak_rerun_job_id or 'sans job_id'})")
-        elif report_mode == "valide" and weak_rerun_status == "failed":
+        elif not report_ui_state.get("available") and report_mode == "valide" and weak_rerun_status == "failed":
             report_block_reasons.append(f"reprise WEAK failed ({weak_rerun_job_id or 'sans job_id'})")
+        if publish_retry_status in {"queued", "running", "failed"}:
+            report_block_reasons.append(f"reprise publication NAS {publish_retry_status} ({publish_retry_job_id or 'sans job_id'})")
         if report_mode == "valide" and gtp_row.get("présent") != "oui":
             missing_report_resources.append("fichier *GTP*.csv")
         if missing_report_resources:
