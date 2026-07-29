@@ -5974,10 +5974,14 @@ def submit_asr_v2_job(
     proper_names_path: str | Path | None,
     model: str,
     diarize: bool,
+    purpose: str | None = None,
+    audio_input: str | Path | None = None,
     debrief_csv: str | Path | None = None,
     nas_root: str | Path | None = None,
     audio_target_dir_pcfixe: str | Path | None = None,
     audio_target_dir_unc: str | Path | None = None,
+    output_dir_pcfixe: str | Path | None = None,
+    output_dir_unc: str | Path | None = None,
     dry_run: bool = False,
 ) -> dict:
     """Prépare et dépose atomiquement un job ASR schema_version=2."""
@@ -6017,6 +6021,8 @@ def submit_asr_v2_job(
         pcfixe_unc_root
         / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation
     )
+    pc_output_dir = Path(output_dir_pcfixe) if output_dir_pcfixe else pc_trans_dir
+    unc_output_dir = Path(output_dir_unc) if output_dir_unc else unc_trans_dir
 
     pc_audio_prepared = pc_audio_dir / audio_source.name
     pc_infos = pc_trans_dir / "infos_projet.json"
@@ -6024,7 +6030,12 @@ def submit_asr_v2_job(
     pc_proper_names = pc_trans_dir / proper_source.name if proper_source and proper_source.is_file() else None
 
     debrief_source = Path(debrief_csv).resolve() if debrief_csv else None
-    pc_debrief = pc_trans_dir / debrief_source.name if debrief_source and debrief_source.is_file() else None
+    pc_debrief = pc_output_dir / debrief_source.name if debrief_source and debrief_source.is_file() else None
+    purpose_value = str(purpose or "").strip()
+    if (output_dir_pcfixe or output_dir_unc) and purpose_value != "debrief":
+        raise ValueError("output_dir dédié réservé aux jobs ASR debrief.")
+    if purpose_value == "debrief":
+        pc_debrief = pc_output_dir / f"{audio_source.stem}(wav).csv"
 
     infos_for_pcfixe = json.loads(json.dumps(infos))
     infos_for_pcfixe["id_affaire"] = id_affaire
@@ -6049,14 +6060,17 @@ def submit_asr_v2_job(
         "job_id": job_id,
         "type": "asr_voxtral",
         "infos_projet": str(pc_infos),
-        "audio_input": str(pc_audio_prepared),
+        "audio_input": str(audio_input or pc_audio_prepared),
         "audio_prepared": str(pc_audio_prepared),
+        "output_dir": str(pc_output_dir),
         "proper_names_file": str(pc_proper_names) if pc_proper_names else "",
         "boost_file": str(PCFIXE_BOOST_FILE),
         "debrief_csv": str(pc_debrief) if pc_debrief else "",
         "model": str(model or "Voxtral_Mini_3B_Transformers"),
         "diarize": bool(diarize),
     }
+    if purpose_value:
+        job["purpose"] = purpose_value
 
     queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
     result = {
@@ -6070,6 +6084,7 @@ def submit_asr_v2_job(
 
     audio_preflight = preflight_pcfixe_target_dir(unc_audio_dir)
     trans_preflight = preflight_pcfixe_target_dir(unc_trans_dir)
+    output_preflight = preflight_pcfixe_target_dir(unc_output_dir)
     shutil.copy2(audio_source, unc_audio_dir / audio_source.name)
     (unc_trans_dir / "infos_projet.json").write_text(
         json.dumps(infos_for_pcfixe, ensure_ascii=False, indent=2),
@@ -6077,7 +6092,7 @@ def submit_asr_v2_job(
     )
     if pc_proper_names:
         shutil.copy2(proper_source, unc_trans_dir / proper_source.name)
-    if pc_debrief:
+    if pc_debrief and debrief_source:
         shutil.copy2(debrief_source, unc_trans_dir / debrief_source.name)
 
     preflight_pcfixe_target_dir(queued_path.parent)
@@ -6087,6 +6102,7 @@ def submit_asr_v2_job(
     result["pcfixe_preflight"] = {
         "audio": audio_preflight,
         "transcriptions": trans_preflight,
+        "output": output_preflight,
     }
     return result
 
@@ -6099,6 +6115,39 @@ def _compte_rendu_nas_infos_path(id_affaire: str, id_captation: str) -> str:
         f"/volume1/Affaires/{id_affaire}/AF_Expert_ASR/"
         f"transcriptions/{id_captation}/infos_projet.json"
     )
+
+def _compte_rendu_nas_out_dir(id_affaire: str, id_captation: str) -> str:
+    return (
+        f"/volume1/Affaires/{id_affaire}/BE_Traitement_captations/"
+        f"{id_captation}/compte_rendu_LLM/out"
+    )
+
+def _nas_affaires_path_to_volume1(path_value: str | Path) -> str:
+    raw = str(path_value or "").strip().strip('"')
+    if not raw:
+        return ""
+    normalized = raw.replace("/", "\\")
+    nas_root = str(NAS_AFFAIRES_ROOT).rstrip("\\/").replace("/", "\\")
+    if normalized.casefold().startswith(nas_root.casefold()):
+        rel = normalized[len(nas_root):].lstrip("\\/")
+        return "/volume1/Affaires" + ("/" + rel.replace("\\", "/") if rel else "")
+    if raw.replace("\\", "/").startswith("/volume1/Affaires"):
+        return raw.replace("\\", "/")
+    return raw
+
+def _volume1_affaires_path_to_unc(path_value: str | Path) -> Path:
+    raw = str(path_value or "").strip().strip('"')
+    normalized = raw.replace("\\", "/")
+    if normalized == "/volume1/Affaires":
+        return NAS_AFFAIRES_ROOT
+    if normalized.startswith("/volume1/Affaires/"):
+        rel = normalized[len("/volume1/Affaires/"):]
+        return NAS_AFFAIRES_ROOT / Path(*[part for part in rel.split("/") if part])
+    return Path(raw)
+
+def _is_volume1_affaires_path(path_value: str) -> bool:
+    normalized = str(path_value or "").replace("\\", "/")
+    return normalized == "/volume1/Affaires" or normalized.startswith("/volume1/Affaires/")
 
 def _compte_rendu_nas_command(job: dict) -> str:
     args = [
@@ -6130,6 +6179,344 @@ def _compte_rendu_nas_command(job: dict) -> str:
             + rendered
         )
     )
+
+AUDIT_REUNION_QUALITY_ARTIFACTS = (
+    "global.json",
+    "global_by_sujet.json",
+    "global_final.json",
+    "global_meeting.json",
+    "debrief.json",
+)
+
+AUDIT_REUNION_QUALITY_REPORTS = (
+    "audit_reunion_quality.md",
+    "audit_reunion_quality.json",
+)
+
+def discover_compte_rendu_run_dirs(out_dir: Path) -> list[Path]:
+    if not out_dir.is_dir():
+        return []
+    runs = [p for p in out_dir.glob("job_*") if p.is_dir()]
+    def _run_sort_key(path: Path) -> tuple[int, str, float]:
+        match = re.match(r"^job_(\d{8})_(\d{6})(?:_|$)", path.name)
+        if match:
+            return (1, "".join(match.groups()), 0.0)
+        try:
+            mtime = path.stat().st_mtime if path.exists() else 0.0
+        except Exception:
+            mtime = 0.0
+        return (0, "", mtime)
+    runs.sort(key=_run_sort_key, reverse=True)
+    if not runs and any((out_dir / name).is_file() for name in AUDIT_REUNION_QUALITY_ARTIFACTS):
+        runs = [out_dir]
+    return runs
+
+def audit_reunion_quality_artifacts(job_dir: Path) -> list[dict]:
+    rows = []
+    for name in AUDIT_REUNION_QUALITY_ARTIFACTS:
+        path = job_dir / name
+        rows.append({
+            "artefact": name,
+            "présent": "oui" if path.is_file() else "non",
+            "taille": path.stat().st_size if path.is_file() else "",
+            "modifié": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") if path.is_file() else "",
+            "chemin": str(path),
+        })
+    return rows
+
+def audit_reunion_quality_report_candidates(job_dir: Path) -> list[dict]:
+    rows = []
+    for name in AUDIT_REUNION_QUALITY_REPORTS:
+        path = job_dir / name
+        rows.append({
+            "rapport": name,
+            "présent": "oui" if path.is_file() else "non",
+            "taille": path.stat().st_size if path.is_file() else "",
+            "modifié": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") if path.is_file() else "",
+            "chemin": str(path),
+        })
+    return rows
+
+def _audit_quality_read_text(path_value: str | Path, limit: int = 12000) -> str:
+    path = Path(str(path_value or ""))
+    if not path.is_file():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8-sig", errors="replace")
+    except Exception:
+        return ""
+    if limit and len(text) > limit:
+        return text[-limit:]
+    return text
+
+def _audit_quality_read_json(path_value: str | Path) -> dict:
+    path = Path(str(path_value or ""))
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def _audit_quality_find_log(logs_dir: Path, safe_job_id: str, suffixes: tuple[str, ...]) -> Path | None:
+    if not safe_job_id or not logs_dir.is_dir():
+        return None
+    for suffix in suffixes:
+        exact = logs_dir / f"{safe_job_id}{suffix}"
+        if exact.is_file():
+            return exact
+        matches = sorted(
+            logs_dir.glob(f"*{safe_job_id}*{suffix}"),
+            key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+            reverse=True,
+        )
+        if matches:
+            return matches[0]
+    return None
+
+def _audit_quality_manifest_value(manifest: dict, *keys: str) -> str:
+    for source in (
+        manifest,
+        manifest.get("job") if isinstance(manifest.get("job"), dict) else {},
+        manifest.get("result") if isinstance(manifest.get("result"), dict) else {},
+        manifest.get("timestamps") if isinstance(manifest.get("timestamps"), dict) else {},
+    ):
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if value not in (None, ""):
+                return str(value)
+    return ""
+
+def find_audit_reunion_quality_job_status(job_id: str) -> dict:
+    safe_job_id = _safe_job_token(job_id)
+    result = {
+        "job_id": job_id,
+        "status": "introuvable",
+        "job_path": "",
+        "job": {},
+        "jobs_root": "",
+        "submitted_at": "",
+        "started_at": "",
+        "finished_at": "",
+        "exit_code": "",
+        "error": "",
+        "command_path": "",
+        "stdout_path": "",
+        "stderr_path": "",
+        "manifest_path": "",
+        "job_dir": "",
+        "job_dir_unc": "",
+    }
+    if not safe_job_id:
+        result["error"] = "job_id vide ou invalide"
+        return result
+
+    try:
+        jobs_root = get_pcfixe_jobs_root()
+    except Exception as exc:
+        result["error"] = f"racine _jobs inaccessible : {exc}"
+        return result
+    result["jobs_root"] = str(jobs_root)
+
+    for status in ("queued", "running", "done", "failed"):
+        status_dir = jobs_root / status
+        if not status_dir.is_dir():
+            continue
+        candidates = [status_dir / f"{safe_job_id}.json"]
+        try:
+            candidates.extend(sorted(
+                status_dir.glob(f"{safe_job_id}*.json"),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+                reverse=True,
+            ))
+        except Exception:
+            pass
+        job_path = next((p for p in candidates if p.is_file()), None)
+        if job_path is None:
+            continue
+        job_data = _audit_quality_read_json(job_path)
+        nested_job = job_data.get("job") if isinstance(job_data.get("job"), dict) else {}
+        merged_job = {}
+        merged_job.update(job_data if isinstance(job_data, dict) else {})
+        merged_job.update(nested_job)
+        if str(merged_job.get("type") or "") and str(merged_job.get("type") or "") != "audit_reunion_quality":
+            continue
+        result.update({
+            "status": status,
+            "job_path": str(job_path),
+            "job": merged_job,
+            "job_id": str(merged_job.get("job_id") or job_data.get("job_id") or job_path.stem),
+        })
+        try:
+            result["submitted_at"] = datetime.fromtimestamp(job_path.stat().st_mtime).isoformat(timespec="seconds")
+        except Exception:
+            result["submitted_at"] = ""
+        for key in ("submitted_at", "created_at", "queued_at", "created"):
+            if merged_job.get(key):
+                result["submitted_at"] = str(merged_job[key])
+                break
+        if not result["submitted_at"]:
+            stamp_match = re.search(r"_(\d{8})_(\d{6})_", result["job_id"])
+            if stamp_match:
+                try:
+                    result["submitted_at"] = datetime.strptime(
+                        "".join(stamp_match.groups()),
+                        "%Y%m%d%H%M%S",
+                    ).isoformat(timespec="seconds")
+                except ValueError:
+                    pass
+        result["job_dir"] = str(merged_job.get("job_dir") or "")
+        if result["job_dir"]:
+            result["job_dir_unc"] = str(_volume1_affaires_path_to_unc(result["job_dir"]))
+        break
+
+    logs_dir = jobs_root / "logs"
+    manifest_path = _audit_quality_find_log(logs_dir, safe_job_id, (".manifest.json", "manifest.json"))
+    stdout_path = _audit_quality_find_log(logs_dir, safe_job_id, (".stdout.log", "stdout.log"))
+    stderr_path = _audit_quality_find_log(logs_dir, safe_job_id, (".stderr.log", "stderr.log"))
+    command_path = _audit_quality_find_log(logs_dir, safe_job_id, (".command.txt", "command.txt"))
+    exitcode_path = _audit_quality_find_log(logs_dir, safe_job_id, (".exitcode.txt", "exitcode.txt"))
+    result.update({
+        "manifest_path": str(manifest_path or ""),
+        "stdout_path": str(stdout_path or ""),
+        "stderr_path": str(stderr_path or ""),
+        "command_path": str(command_path or ""),
+    })
+    manifest = _audit_quality_read_json(manifest_path) if manifest_path else {}
+    if manifest:
+        result["started_at"] = _audit_quality_manifest_value(manifest, "started_at", "start_time", "started", "debut")
+        result["finished_at"] = _audit_quality_manifest_value(manifest, "finished_at", "ended_at", "end_time", "completed_at", "fin")
+        result["exit_code"] = _audit_quality_manifest_value(manifest, "exit_code", "returncode", "return_code")
+        result["error"] = _audit_quality_manifest_value(manifest, "error", "stderr", "message", "exception")
+    if exitcode_path and not result["exit_code"]:
+        result["exit_code"] = _audit_quality_read_text(exitcode_path, 200).strip()
+    if stderr_path and not result["error"]:
+        stderr_excerpt = _audit_quality_read_text(stderr_path, 2000).strip()
+        result["error"] = stderr_excerpt.splitlines()[-1] if stderr_excerpt else ""
+    return result
+
+def load_audit_reunion_quality_done_result(job_status: dict) -> dict:
+    job_dir = Path(str(job_status.get("job_dir_unc") or job_status.get("job_dir") or ""))
+    json_path = job_dir / "audit_reunion_quality.json"
+    md_path = job_dir / "audit_reunion_quality.md"
+    return {
+        "job_dir": str(job_dir),
+        "json_path": str(json_path),
+        "md_path": str(md_path),
+        "json_present": json_path.is_file(),
+        "md_present": md_path.is_file(),
+        "json": _audit_quality_read_json(json_path),
+        "markdown": _audit_quality_read_text(md_path, 50000),
+    }
+
+def _audit_quality_pick(data: dict, *paths: tuple[str, ...]) -> object:
+    for path in paths:
+        current: object = data
+        for key in path:
+            if not isinstance(current, dict) or key not in current:
+                current = None
+                break
+            current = current[key]
+        if current not in (None, ""):
+            return current
+    return None
+
+def _audit_quality_as_list(value: object) -> list:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, dict):
+        return [value]
+    return [value]
+
+def audit_reunion_quality_summary_rows(data: dict) -> list[dict]:
+    checks = [
+        ("Artefacts manquants", (("artefacts_manquants",), ("missing_artifacts",), ("checks", "artefacts_manquants"))),
+        ("Sujets avec interventions mais synthèse \"Aucun élément\"", (("sujets_interventions_sans_synthese",), ("subjects_with_interventions_empty_summary",), ("checks", "sujets_interventions_sans_synthese"))),
+        ("Compacts Pass2E vides malgré interventions", (("compacts_pass2e_vides",), ("empty_pass2e_compacts",), ("checks", "compacts_pass2e_vides"))),
+        ("État du débrief", (("debrief",), ("etat_debrief",), ("debrief_state",), ("checks", "debrief"))),
+        ("Alias résiduels", (("alias_residuels",), ("residual_aliases",), ("checks", "alias_residuels"))),
+        ("Sujets proposés pour re-run", (("sujets_rerun",), ("sujets_proposes_rerun",), ("rerun_subjects",), ("checks", "sujets_rerun"))),
+    ]
+    rows = []
+    for label, paths in checks:
+        value = _audit_quality_pick(data, *paths)
+        items = _audit_quality_as_list(value)
+        if isinstance(value, dict) and not items:
+            items = [value]
+        count = len(items)
+        if isinstance(value, str):
+            preview = value
+            count = 1 if value.strip() else 0
+        elif not items:
+            preview = "Aucun élément"
+        else:
+            rendered = []
+            for item in items[:8]:
+                if isinstance(item, dict):
+                    rendered.append(", ".join(f"{k}={v}" for k, v in list(item.items())[:4]))
+                else:
+                    rendered.append(str(item))
+            preview = "\n".join(rendered)
+        rows.append({"contrôle": label, "nombre": count, "synthèse": preview})
+    return rows
+
+def submit_audit_reunion_quality_job(
+    *,
+    job_dir: str | Path,
+    infos_path: str | Path,
+    id_affaire: str,
+    id_captation: str,
+    dry_run: bool = False,
+) -> dict:
+    id_affaire = (id_affaire or "").strip()
+    id_captation = (id_captation or "").strip()
+    if not id_affaire or not id_captation:
+        raise ValueError("id_affaire/id_captation obligatoires.")
+    if any(char in id_affaire + id_captation for char in '\\/:*?"<>|'):
+        raise ValueError("id_affaire/id_captation invalides.")
+
+    job_dir_nas = _nas_affaires_path_to_volume1(job_dir)
+    infos_nas = _compte_rendu_nas_infos_path(id_affaire, id_captation)
+    if not job_dir_nas:
+        raise ValueError("job_dir obligatoire.")
+    if not infos_nas:
+        raise ValueError("infos_projet obligatoire.")
+    if not _is_volume1_affaires_path(job_dir_nas):
+        raise ValueError(f"job_dir doit être un chemin NAS /volume1/Affaires : {job_dir_nas}")
+    if not _is_volume1_affaires_path(infos_nas):
+        raise ValueError(f"infos_projet doit être un chemin NAS /volume1/Affaires : {infos_nas}")
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    job_id = f"audit_cr_{id_affaire}_{id_captation}_{stamp}_{uuid.uuid4().hex[:8]}"
+    job = {
+        "job_id": job_id,
+        "type": "audit_reunion_quality",
+        "job_dir": job_dir_nas,
+        "infos_projet": infos_nas,
+        "id_affaire": id_affaire,
+        "id_captation": id_captation,
+    }
+
+    queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
+    result = {
+        "job_id": job_id,
+        "job_path": str(queued_path),
+        "status": "dry-run" if dry_run else "queued",
+        "job": job,
+    }
+    if dry_run:
+        return result
+
+    preflight_pcfixe_target_dir(queued_path.parent)
+    tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, queued_path)
+    return result
 
 CR_LLM_BACKENDS = {"openai", "local"}
 CR_LLM_ROUTING_KEYS = (
@@ -8742,20 +9129,34 @@ def build_debrief_audio_block(
         raise ValueError("Le debrief audio doit être un fichier WAV.")
 
     existing = existing_debrief if isinstance(existing_debrief, dict) else {}
-    pcfixe_dir = (
+    pcfixe_audio_dir = (
+        Path(pcfixe_local_root_for_server(project_config, affaire_id))
+        / "AE_Expert_captations"
+        / id_captation
+        / "debrief"
+    )
+    nas_audio_dir = (
+        Path(effective_nas_affaire_root(project_config, affaire_id))
+        / "AE_Expert_captations"
+        / id_captation
+        / "debrief"
+    )
+    pcfixe_output_dir = (
         Path(pcfixe_local_root_for_server(project_config, affaire_id))
         / "AF_Expert_ASR"
         / "transcriptions"
         / id_captation
         / "debrief"
     )
-    nas_dir = (
+    nas_output_dir = (
         Path(effective_nas_affaire_root(project_config, affaire_id))
         / "AF_Expert_ASR"
         / "transcriptions"
         / id_captation
         / "debrief"
     )
+    prepared_name = src.name if src.name.lower().endswith("_mono16_16000hz.wav") else f"{src.stem}_mono16_16000Hz.wav"
+    debrief_csv_name = f"{Path(prepared_name).stem}(wav).csv"
 
     source_changed = str(existing.get("source_laptop") or "") != str(src)
     proper_names_value = str(proper_names_file or "").strip()
@@ -8764,9 +9165,12 @@ def build_debrief_audio_block(
         "enabled": True,
         "type": "audio",
         "source_laptop": str(src),
-        "pcfixe_wav": str(pcfixe_dir / src.name),
-        "nas_wav": str(nas_dir / src.name),
-        "csv": "" if source_changed else str(existing.get("csv") or ""),
+        "pcfixe_wav": str(pcfixe_audio_dir / prepared_name),
+        "nas_wav": str(nas_audio_dir / prepared_name),
+        "output_dir": str(nas_output_dir),
+        "pcfixe_output_dir": str(pcfixe_output_dir),
+        "csv": str(nas_output_dir / debrief_csv_name),
+        "pcfixe_csv": str(pcfixe_output_dir / debrief_csv_name),
         "transcribed": False if source_changed else bool(existing.get("transcribed") or False),
         "proper_names_file": proper_names_value,
         "proper_names_source": proper_source_value,
@@ -8784,16 +9188,64 @@ def update_infos_projet_debrief(
     if not isinstance(infos, dict):
         raise ValueError(f"infos_projet.json invalide : {path}")
     infos["debrief"] = debrief_block
+    if debrief_block.get("csv"):
+        infos["fichier_debrief"] = str(debrief_block.get("csv") or "")
+    pcfixe = infos.get("pcfixe")
+    if not isinstance(pcfixe, dict):
+        pcfixe = {}
+    if debrief_block.get("pcfixe_csv"):
+        pcfixe["fichier_debrief"] = str(debrief_block.get("pcfixe_csv") or "")
+    infos["pcfixe"] = pcfixe
     save_json(str(path), infos)
     return infos
 
 DEBRIEF_CSV_KEYWORDS = ("debrief", "debref", "amendement", "correction", "complément", "complement")
+DEBRIEF_ASR_TEXT_COLUMNS = ("text", "texte", "transcript", "transcription")
+
+def _is_debrief_global_csv(path: Path) -> bool:
+    name = path.name.casefold()
+    return name == "debrief_global.csv" or (name.startswith("debrief_global_") and name.endswith(".csv"))
+
+def _load_debrief_global_manifests(directory: str | Path | None) -> list[dict]:
+    root = Path(str(directory or "").strip().strip('"')) if directory else None
+    if not root or not root.exists() or not root.is_dir():
+        return []
+    manifest_paths = [root / "debrief_global.manifest.json"]
+    manifest_paths.extend(sorted(
+        root.glob("debrief_global_*.manifest.json"),
+        key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+        reverse=True,
+    ))
+    manifests = []
+    seen: set[Path] = set()
+    for manifest_path in manifest_paths:
+        if manifest_path in seen or not manifest_path.is_file():
+            continue
+        seen.add(manifest_path)
+        data = load_json(str(manifest_path), {})
+        if isinstance(data, dict):
+            data["_manifest_path"] = str(manifest_path)
+            manifests.append(data)
+    return manifests
+
+def _debrief_manifest_source_names(manifests: list[dict]) -> set[str]:
+    names: set[str] = set()
+    for manifest in manifests:
+        for item in manifest.get("sources") or []:
+            if not isinstance(item, dict):
+                continue
+            for key in ("filename", "name", "path"):
+                value = str(item.get(key) or "").strip()
+                if value:
+                    names.add(Path(value).name.casefold())
+    return names
 
 def _is_debrief_csv_excluded(path: Path, main_transcription: str | Path | None = None) -> bool:
     name = path.name.casefold()
     main_name = Path(str(main_transcription)).name.casefold() if main_transcription else ""
     return (
         name.endswith("(photo).csv")
+        or _is_debrief_global_csv(path)
         or name in {"photos.csv", "photos_batch.csv", "sujets.csv"}
         or (bool(main_name) and name == main_name)
         or name in {"manifest.csv", "segments.csv", "speakers.csv"}
@@ -8821,6 +9273,22 @@ def _debrief_wav_match_score(csv_path: Path, wav_path: str | Path | None) -> int
         return 40
     return 0
 
+def _debrief_csv_asr_text_info(path: Path) -> tuple[bool, str, int]:
+    try:
+        header, rows, _ = _read_csv_rows_with_dialect(path)
+    except Exception:
+        return False, "", 0
+    header_lookup = {str(col).strip().casefold(): col for col in header}
+    text_col = ""
+    for candidate in DEBRIEF_ASR_TEXT_COLUMNS:
+        if candidate in header_lookup:
+            text_col = header_lookup[candidate]
+            break
+    if not text_col:
+        return False, "", len(rows)
+    usable = any(str(row.get(text_col) or "").strip() for row in rows)
+    return usable, text_col, len(rows)
+
 def list_debrief_csv_candidates(
     directory: str | Path | None,
     wav_path: str | Path | None = None,
@@ -8830,10 +9298,29 @@ def list_debrief_csv_candidates(
     root = Path(str(directory or "").strip().strip('"')) if directory else None
     if not root or not root.exists() or not root.is_dir():
         return []
+    manifests = _load_debrief_global_manifests(root)
+    manifest_source_names = _debrief_manifest_source_names(manifests)
     rows = []
     for csv_path in sorted(root.glob("*.csv"), key=lambda p: p.name.casefold()):
-        excluded = _is_debrief_csv_excluded(csv_path, main_transcription)
+        name = csv_path.name.casefold()
+        is_global = _is_debrief_global_csv(csv_path)
+        has_debrief_name = any(keyword in name for keyword in DEBRIEF_CSV_KEYWORDS)
+        has_wav_suffix = name.endswith("(wav).csv")
+        has_photo_suffix = "(photo)" in name
+        manifest_referenced = name in manifest_source_names
+        has_text_column, text_column, row_count = _debrief_csv_asr_text_info(csv_path)
+        excluded = (
+            _is_debrief_csv_excluded(csv_path, main_transcription)
+            or not has_text_column
+            or not (has_debrief_name or has_wav_suffix or manifest_referenced)
+        )
         score = _debrief_wav_match_score(csv_path, wav_path) + _debrief_csv_keyword_score(csv_path)
+        if has_wav_suffix:
+            score += 60
+        if manifest_referenced:
+            score += 40
+        if has_text_column:
+            score += 20
         try:
             mtime = csv_path.stat().st_mtime
         except Exception:
@@ -8844,8 +9331,34 @@ def list_debrief_csv_candidates(
             "excluded": excluded,
             "score": score,
             "mtime": mtime,
+            "row_count": row_count,
+            "text_column": text_column,
+            "has_debrief_name": has_debrief_name,
+            "has_wav_suffix": has_wav_suffix,
+            "has_photo_suffix": has_photo_suffix,
+            "has_text_column": has_text_column,
+            "manifest_referenced": manifest_referenced,
+            "is_global": is_global,
         })
     return sorted(rows, key=lambda r: (r["excluded"], -int(r["score"]), float(r["mtime"]), r["name"].casefold()))
+
+def debrief_global_manifest_rows(directory: str | Path | None) -> list[dict]:
+    rows = []
+    for manifest in _load_debrief_global_manifests(directory):
+        for item in manifest.get("sources") or []:
+            if not isinstance(item, dict):
+                continue
+            rows.append({
+                "manifest": manifest.get("_manifest_path", ""),
+                "date génération": manifest.get("generated_at", ""),
+                "CSV global": manifest.get("output_path") or manifest.get("output", ""),
+                "total lignes": manifest.get("total_rows", ""),
+                "source": item.get("filename") or Path(str(item.get("path") or "")).name,
+                "ordre": item.get("order", ""),
+                "lignes": item.get("rows", ""),
+                "SHA-256": item.get("sha256", ""),
+            })
+    return rows
 
 def _sha256_file(path: Path) -> str:
     h = hashlib.sha256()
@@ -8964,7 +9477,7 @@ def update_infos_projet_debrief_csv(
 
     csv_name = csv_selected.name
     nas_csv = Path(str(nas_trans_dir).strip().strip('"')) / csv_name if nas_trans_dir else csv_selected
-    pcfixe_csv = PCFIXE_AFFAIRES_ROOT / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation / csv_name
+    pcfixe_csv = PCFIXE_AFFAIRES_ROOT / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation / "debrief" / csv_name
 
     debrief = infos.get("debrief")
     if not isinstance(debrief, dict):
@@ -9008,7 +9521,7 @@ def update_infos_projet_debrief_global_csv(
 
     global_name = global_path.name
     nas_csv = Path(str(nas_trans_dir).strip().strip('"')) / global_name
-    pcfixe_csv = PCFIXE_AFFAIRES_ROOT / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation / global_name
+    pcfixe_csv = PCFIXE_AFFAIRES_ROOT / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation / "debrief" / global_name
 
     debrief = infos.get("debrief")
     if not isinstance(debrief, dict):
@@ -9057,10 +9570,12 @@ def resolve_debrief_resource(infos: dict, id_affaire: str | None = None) -> dict
     if not isinstance(pcfixe, dict):
         pcfixe = {}
     values = [
-        pcfixe.get("fichier_debrief"),
-        infos.get("fichier_debrief") if isinstance(infos, dict) else "",
         debrief.get("global_csv"),
         debrief.get("csv"),
+        debrief.get("pcfixe_global_csv"),
+        debrief.get("pcfixe_csv"),
+        pcfixe.get("fichier_debrief"),
+        infos.get("fichier_debrief") if isinstance(infos, dict) else "",
     ]
     for value in values:
         raw = str(value or "").strip()
@@ -11313,10 +11828,12 @@ elif page == "Voxtral (ASR / CR)":
     )
     default_debrief_infos_path = asr_ctx.get("infos_path_effective", "") if asr_ctx else ""
     debrief_trans_dir = Path(default_debrief_infos_path).parent if default_debrief_infos_path else None
-    default_debrief_dir = ""
-    if debrief_trans_dir:
-        canonical_debrief_dir = debrief_trans_dir / "debrief"
-        default_debrief_dir = str(canonical_debrief_dir if canonical_debrief_dir.exists() else debrief_trans_dir)
+    canonical_debrief_audio_dir = (
+        AFFAIRES_ROOT / affaire_id / "AE_Expert_captations" / selected_captation / "debrief"
+        if affaire_id and selected_captation != "(aucune)"
+        else Path("")
+    )
+    canonical_debrief_csv_dir = (debrief_trans_dir / "debrief") if debrief_trans_dir else Path("")
 
     st.text_input(
         "Dossier canonique transcription",
@@ -11343,7 +11860,8 @@ elif page == "Voxtral (ASR / CR)":
 
     debrief_dir_path = st.text_input(
         "Dossier debrief contenant les WAV",
-        value=default_debrief_dir,
+        value=str(canonical_debrief_audio_dir),
+        disabled=True,
         key="voxtral_debrief_dir_path",
         help="Choisir le dossier debrief de la captation ; les *.wav présents seront listés ci-dessous.",
     )
@@ -11426,7 +11944,7 @@ elif page == "Voxtral (ASR / CR)":
         )
 
     st.markdown("#### CSV de debrief transcrit")
-    debrief_csv_scan_dir = Path(asr_ctx.get("trans_dir_nas") or str(debrief_trans_dir or "")) if asr_ctx else (debrief_trans_dir or Path(""))
+    debrief_csv_scan_dir = canonical_debrief_csv_dir
     st.text_input(
         "Dossier canonique détecté",
         value=str(debrief_csv_scan_dir),
@@ -11499,7 +12017,7 @@ elif page == "Voxtral (ASR / CR)":
                 csv_path=selected_debrief_csv_path,
                 id_affaire=affaire_id,
                 id_captation=selected_captation,
-                nas_trans_dir=asr_ctx.get("trans_dir_nas") if asr_ctx else str(debrief_csv_scan_dir),
+                nas_trans_dir=canonical_debrief_csv_dir,
             )
             st.success("CSV de debrief enregistré dans infos_projet.json.")
             st.json({
@@ -11528,6 +12046,23 @@ elif page == "Voxtral (ASR / CR)":
             st.warning(f"Bloc debrief non calculable : {e}")
     else:
         st.caption("Aucun debrief audio sélectionné : l’ASR principal reste disponible.")
+
+    protected_fichier_transcription = ""
+    protected_pcfixe_fichier_transcription = ""
+    if isinstance(debrief_infos, dict):
+        protected_fichier_transcription = str(debrief_infos.get("fichier_transcription") or "")
+        protected_pcfixe_fichier_transcription = str((debrief_infos.get("pcfixe", {}) or {}).get("fichier_transcription") or "")
+    if proposed_debrief_block:
+        st.caption("Prévisualisation du job ASR debrief")
+        st.json({
+            "purpose": "debrief",
+            "audio_input": proposed_debrief_block.get("pcfixe_wav", ""),
+            "audio_prepared": proposed_debrief_block.get("pcfixe_wav", ""),
+            "output_dir": proposed_debrief_block.get("pcfixe_output_dir", ""),
+            "debrief_csv": proposed_debrief_block.get("pcfixe_csv", ""),
+            "fichier_transcription protégé": protected_fichier_transcription,
+            "pcfixe.fichier_transcription protégé": protected_pcfixe_fichier_transcription,
+        })
 
     def prepare_selected_debrief_audio() -> str:
         source = Path(debrief_wav_path.strip().strip('"'))
@@ -11642,14 +12177,21 @@ elif page == "Voxtral (ASR / CR)":
             st.error("Sélectionner un WAV de debrief valide.")
             return
         try:
-            updated_infos = update_infos_projet_debrief(
-                debrief_infos_path,
-                proposed_debrief_block,
-            )
             prepared_debrief_audio = prepare_selected_debrief_audio()
             pc_debrief_audio_dir = Path(proposed_debrief_block["pcfixe_wav"]).parent
             unc_debrief_audio_dir = (
                 pcfixe_server_path_to_unc(project_config, affaire_id, str(pc_debrief_audio_dir))
+                or str(
+                    get_pcfixe_affaires_root()
+                    / affaire_id
+                    / "AE_Expert_captations"
+                    / selected_captation
+                    / "debrief"
+                )
+            )
+            pc_debrief_output_dir = Path(proposed_debrief_block["pcfixe_output_dir"])
+            unc_debrief_output_dir = (
+                pcfixe_server_path_to_unc(project_config, affaire_id, str(pc_debrief_output_dir))
                 or str(
                     get_pcfixe_affaires_root()
                     / affaire_id
@@ -11659,6 +12201,23 @@ elif page == "Voxtral (ASR / CR)":
                     / "debrief"
                 )
             )
+            expected_debrief_csv = pc_debrief_output_dir / f"{Path(prepared_debrief_audio).stem}(wav).csv"
+            guarded_main_csvs = {
+                str(protected_fichier_transcription).strip().casefold(),
+                str(protected_pcfixe_fichier_transcription).strip().casefold(),
+            }
+            if str(expected_debrief_csv).strip().casefold() in guarded_main_csvs:
+                raise ValueError("Refus : debrief_csv pointe vers le CSV principal protégé.")
+            if expected_debrief_csv.parent.name.casefold() != "debrief":
+                raise ValueError("Refus : debrief_csv doit être dans le sous-dossier debrief.")
+            if not str(pc_debrief_output_dir).replace("/", "\\").casefold().endswith(
+                f"af_expert_asr\\transcriptions\\{selected_captation}\\debrief".casefold()
+            ):
+                raise ValueError("Refus : output_dir debrief hors dossier canonique.")
+            updated_infos = update_infos_projet_debrief(
+                debrief_infos_path,
+                proposed_debrief_block,
+            )
             st.session_state["voxtral_prepared_debrief_audio_path"] = prepared_debrief_audio
             job_result = submit_asr_v2_job(
                 infos_path=debrief_infos_path,
@@ -11666,10 +12225,14 @@ elif page == "Voxtral (ASR / CR)":
                 proper_names_path=(updated_infos.get("debrief", {}) or {}).get("proper_names_file") or None,
                 model=asr_model_key,
                 diarize=False,
-                debrief_csv=(updated_infos.get("debrief", {}) or {}).get("csv") or None,
+                purpose="debrief",
+                audio_input=proposed_debrief_block.get("pcfixe_wav", ""),
+                debrief_csv=str(expected_debrief_csv),
                 nas_root=(project_config.get("roots") or {}).get("nas") or None,
                 audio_target_dir_pcfixe=pc_debrief_audio_dir,
                 audio_target_dir_unc=unc_debrief_audio_dir,
+                output_dir_pcfixe=pc_debrief_output_dir,
+                output_dir_unc=unc_debrief_output_dir,
                 dry_run=asr_job_dry_run,
             )
             st.session_state["voxtral_last_debrief_asr_job"] = job_result
@@ -11902,31 +12465,41 @@ elif page == "Voxtral (ASR / CR)":
             cr_pcfixe = cr_infos.get("pcfixe", {}) if isinstance(cr_infos.get("pcfixe"), dict) else {}
             cr_trans_dir = Path(cr_infos_path).parent if cr_infos_path else (cr_trans_dir_nas or Path(""))
             cr_pcfixe_trans_dir = PCFIXE_AFFAIRES_ROOT / cr_affaire_id / "AF_Expert_ASR" / "transcriptions" / cr_id_captation
-            cr_queue_root, cr_queue_probes = resolve_pcfixe_affaires_share(require_jobs_queue=True)
             st.markdown("#### Queue PC fixe")
-            st.text_input(
-                "Racine PC fixe retenue",
-                value=str(cr_queue_root),
-                disabled=True,
-                key="cr_job_pcfixe_root_resolved",
-            )
-            st.dataframe(
-                [
-                    {
-                        "adresse testée": row.get("root", ""),
-                        "testé": "oui" if row.get("tested") else "non",
-                        "racine": "oui" if row.get("root_accessible") else "non",
-                        "_jobs\\queued": "oui" if row.get("queue_ready") else "non",
-                        "résultat": row.get("status", ""),
-                        "détail": row.get("detail", ""),
-                    }
-                    for row in cr_queue_probes
-                ],
-                width="stretch",
-                hide_index=True,
-            )
-            if cr_queue_probes and str(cr_queue_root) != str(Path(PCFIXE_AFFAIRES_SHARE_CANDIDATES[0])):
-                st.caption(f"Fallback utilisé : {cr_queue_root}")
+            cr_queue_root = None
+            cr_queue_probes = []
+            cr_spooler_available = False
+            try:
+                cr_queue_root, cr_queue_probes = resolve_pcfixe_affaires_share(require_jobs_queue=True)
+                cr_spooler_available = True
+            except FileNotFoundError as exc:
+                st.error(f"Accès au spooler PC fixe indisponible : {exc}")
+                if st.button("Réessayer l’accès au spooler", key="cr_retry_spooler_access"):
+                    st.rerun()
+            if cr_queue_root is not None:
+                st.text_input(
+                    "Racine PC fixe retenue",
+                    value=str(cr_queue_root),
+                    disabled=True,
+                    key="cr_job_pcfixe_root_resolved",
+                )
+                st.dataframe(
+                    [
+                        {
+                            "adresse testée": row.get("root", ""),
+                            "testé": "oui" if row.get("tested") else "non",
+                            "racine": "oui" if row.get("root_accessible") else "non",
+                            "_jobs\\queued": "oui" if row.get("queue_ready") else "non",
+                            "résultat": row.get("status", ""),
+                            "détail": row.get("detail", ""),
+                        }
+                        for row in cr_queue_probes
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+                if cr_queue_probes and str(cr_queue_root) != str(Path(PCFIXE_AFFAIRES_SHARE_CANDIDATES[0])):
+                    st.caption(f"Fallback utilisé : {cr_queue_root}")
 
             declared_csv = cr_pcfixe.get("fichier_transcription") or cr_infos.get("fichier_transcription") or ""
             csv_name = Path(declared_csv).name if declared_csv else ""
@@ -11948,7 +12521,7 @@ elif page == "Voxtral (ASR / CR)":
             debrief_sources_count = int(debrief_resource.get("sources_count") or 0)
 
             st.markdown("#### Debriefs CSV à intégrer")
-            debrief_csv_default_dir = cr_trans_dir_nas or cr_trans_dir
+            debrief_csv_default_dir = (cr_trans_dir_nas or cr_trans_dir) / "debrief"
             st.text_input(
                 "Dossier canonique proposé",
                 value=str(debrief_csv_default_dir or ""),
@@ -11958,6 +12531,7 @@ elif page == "Voxtral (ASR / CR)":
             debrief_csv_custom_dir = st.text_input(
                 "Dossier contenant les CSV de debrief",
                 value=str(debrief_csv_default_dir or ""),
+                disabled=True,
                 key="cr_debrief_csv_dir",
                 help="Le dossier par défaut est AF_Expert_ASR/transcriptions/<id_captation>/ ; il peut être remplacé par un dossier laptop ou réseau.",
             ).strip().strip('"')
@@ -11973,6 +12547,12 @@ elif page == "Voxtral (ASR / CR)":
                 None,
                 main_transcription=declared_csv,
             )
+            legacy_debrief_csv_candidates = list_debrief_csv_candidates(
+                cr_trans_dir,
+                None,
+                main_transcription=declared_csv,
+            ) if cr_trans_dir and Path(cr_trans_dir) != debrief_csv_scan_dir else []
+            debrief_manifest_rows = debrief_global_manifest_rows(debrief_csv_scan_dir)
             visible_debrief_csv_candidates = [
                 item for item in debrief_csv_candidates
                 if debrief_csv_advanced or not item["excluded"]
@@ -11984,6 +12564,10 @@ elif page == "Voxtral (ASR / CR)":
                             "nom": item["name"],
                             "détecté": "oui" if not item["excluded"] else "non",
                             "priorité": int(item["score"]),
+                            "lignes": item.get("row_count", ""),
+                            "colonne texte": item.get("text_column", ""),
+                            "source manifeste": "oui" if item.get("manifest_referenced") else "non",
+                            "sortie consolidée": "oui" if item.get("is_global") else "non",
                             "modifié": datetime.fromtimestamp(float(item["mtime"])).isoformat(timespec="seconds")
                             if item["mtime"] else "",
                             "chemin": str(item["path"]),
@@ -11995,6 +12579,28 @@ elif page == "Voxtral (ASR / CR)":
                 )
             else:
                 st.caption("Aucun CSV détecté dans ce dossier.")
+            if legacy_debrief_csv_candidates:
+                st.warning("CSV debrief détectés dans l'ancien emplacement racine des transcriptions : lecture rétrocompatible uniquement, aucune écriture n'y sera faite.")
+                st.dataframe(
+                    [
+                        {
+                            "nom": item["name"],
+                            "détecté": "oui" if not item["excluded"] else "non",
+                            "ancien emplacement": "oui",
+                            "chemin": str(item["path"]),
+                        }
+                        for item in legacy_debrief_csv_candidates
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+            if debrief_manifest_rows:
+                st.markdown("Manifestes debrief global")
+                st.dataframe(
+                    debrief_manifest_rows,
+                    width="stretch",
+                    hide_index=True,
+                )
 
             debrief_csv_options: list[str] = []
             debrief_csv_lookup: dict[str, Path] = {}
@@ -12112,6 +12718,16 @@ elif page == "Voxtral (ASR / CR)":
                 try:
                     if not can_build_debrief_global:
                         raise ValueError("Sélectionner une affaire, une captation et un infos_projet.json avant génération.")
+                    outside_debrief_sources = [
+                        str(path)
+                        for path in ordered_debrief_csv_paths
+                        if Path(path).parent.resolve() != Path(canonical_global_dir).resolve()
+                    ]
+                    if outside_debrief_sources:
+                        raise ValueError(
+                            "Les CSV sources du debrief doivent être dans le sous-dossier canonique debrief : "
+                            + ", ".join(outside_debrief_sources)
+                        )
                     manifest = build_debrief_global_csv(
                         sources=ordered_debrief_csv_paths,
                         output_csv=effective_global_output_path,
@@ -12148,7 +12764,7 @@ elif page == "Voxtral (ASR / CR)":
                 "contexte_general.json": cr_trans_dir / "contexte_general.json",
                 "Sujets.xlsx": cr_trans_dir / "Sujets.xlsx",
                 "Participants.xlsx": cr_trans_dir / "Participants.xlsx",
-                "CSV debrief global": Path(debrief_resource.get("path") or ""),
+                "CSV debrief global": debrief_csv_default_dir / "debrief_global.csv",
                 "manifest ASR": cr_trans_dir / "manifest.json",
             }
             context_ok = (
@@ -12213,11 +12829,13 @@ elif page == "Voxtral (ASR / CR)":
                     pc["fichier_participants"] = str(cr_pcfixe_trans_dir / target.name)
                 elif resource_name == "CSV debrief global":
                     data["fichier_debrief"] = str(target)
-                    pc["fichier_debrief"] = str(cr_pcfixe_trans_dir / target.name)
+                    pc["fichier_debrief"] = str(cr_pcfixe_trans_dir / "debrief" / target.name)
                     data.setdefault("debrief", {})
                     if isinstance(data["debrief"], dict):
                         data["debrief"]["csv"] = str(target)
-                        data["debrief"]["pcfixe_csv"] = str(cr_pcfixe_trans_dir / target.name)
+                        data["debrief"]["global_csv"] = str(target)
+                        data["debrief"]["pcfixe_csv"] = str(cr_pcfixe_trans_dir / "debrief" / target.name)
+                        data["debrief"]["pcfixe_global_csv"] = str(cr_pcfixe_trans_dir / "debrief" / target.name)
                         data["debrief"]["transcribed"] = True
                 save_json(str(infos_file), data)
 
@@ -12351,7 +12969,13 @@ elif page == "Voxtral (ASR / CR)":
             with col_opts[4]:
                 cr_dry_run = st.checkbox("dry-run", value=True, key="cr_job_dry_run")
 
-            if st.button("📨 Soumettre le compte-rendu au spooler", key="cr_job_submit"):
+            if not cr_spooler_available:
+                st.warning("Soumission compte-rendu désactivée : accès SMB au spooler indisponible.")
+            if st.button(
+                "📨 Soumettre le compte-rendu au spooler",
+                key="cr_job_submit",
+                disabled=not cr_spooler_available,
+            ):
                 if cr_id_captation == "(aucune)":
                     st.error("Sélectionner une captation.")
                 elif missing_required:
@@ -12387,6 +13011,193 @@ elif page == "Voxtral (ASR / CR)":
                             st.success("Job compte_rendu déposé. Streamlit n’attend pas la fin du traitement.")
                     except Exception as e:
                         st.error(f"Soumission du job compte_rendu impossible : {e}")
+
+            st.markdown("#### Audit qualité du compte-rendu")
+            st.caption("L’UI prépare uniquement un job spooler ; l’audit sera exécuté côté serveur lorsque audit_reunion_quality.py sera disponible.")
+            audit_out_dir = (
+                Path(cr_nas_root) / "BE_Traitement_captations" / cr_id_captation / "compte_rendu_LLM" / "out"
+                if cr_nas_root and cr_id_captation != "(aucune)"
+                else None
+            )
+            st.text_input(
+                "Dossier out détecté",
+                value=str(audit_out_dir or ""),
+                disabled=True,
+                key=f"cr_audit_out_dir_{cr_affaire_id}_{cr_id_captation}",
+            )
+            audit_run_dirs = discover_compte_rendu_run_dirs(audit_out_dir) if audit_out_dir is not None else []
+            audit_run_options = [str(path) for path in audit_run_dirs]
+            latest_audit_run = audit_run_options[0] if audit_run_options else ""
+            audit_select_key = f"cr_audit_run_select_{cr_affaire_id}_{cr_id_captation}"
+            audit_manual_key = f"cr_audit_run_manual_{cr_affaire_id}_{cr_id_captation}"
+            audit_manual_dirty_key = f"{audit_manual_key}_dirty"
+            audit_manual_last_key = f"{audit_manual_key}_last_seen"
+            if latest_audit_run:
+                st.caption(f"Run le plus récent détecté : {Path(latest_audit_run).name}")
+            previous_manual_value = str(st.session_state.get(audit_manual_key, "") or "")
+            previous_seen_value = str(st.session_state.get(audit_manual_last_key, "") or "")
+            if (
+                previous_manual_value
+                and previous_seen_value
+                and previous_manual_value != previous_seen_value
+            ):
+                st.session_state[audit_manual_dirty_key] = True
+            if latest_audit_run and not st.session_state.get(audit_manual_dirty_key, False):
+                if st.session_state.get(audit_select_key) != latest_audit_run and audit_select_key in st.session_state:
+                    del st.session_state[audit_select_key]
+                st.session_state[audit_manual_key] = latest_audit_run
+                st.session_state[audit_manual_last_key] = latest_audit_run
+            if audit_run_options:
+                select_index = audit_run_options.index(st.session_state[audit_select_key]) if st.session_state.get(audit_select_key) in audit_run_options else 0
+                audit_selected_run = st.selectbox(
+                    "Run à auditer",
+                    audit_run_options,
+                    index=select_index,
+                    key=audit_select_key,
+                    help="Le premier run proposé est le plus récent détecté dans compte_rendu_LLM/out/job_*.",
+                )
+            else:
+                audit_selected_run = ""
+                st.info("Aucun dossier job_* détecté dans le dossier out.")
+            if st.button(
+                "Utiliser le run sélectionné",
+                key=f"cr_audit_use_selected_run_{cr_affaire_id}_{cr_id_captation}",
+                disabled=not bool(audit_selected_run),
+            ):
+                st.session_state[audit_manual_key] = audit_selected_run
+                st.session_state[audit_manual_last_key] = audit_selected_run
+                st.session_state[audit_manual_dirty_key] = False
+                st.rerun()
+            if audit_manual_key not in st.session_state:
+                st.session_state[audit_manual_key] = audit_selected_run
+                st.session_state[audit_manual_last_key] = audit_selected_run
+            audit_manual_run = st.text_input(
+                "Autre run à auditer",
+                key=audit_manual_key,
+            ).strip().strip('"')
+            if audit_manual_run != str(st.session_state.get(audit_manual_last_key, "") or ""):
+                st.session_state[audit_manual_dirty_key] = True
+            audit_job_dir = Path(audit_manual_run) if audit_manual_run else None
+
+            if audit_job_dir is not None:
+                st.markdown("Artefacts détectés")
+                st.dataframe(
+                    audit_reunion_quality_artifacts(audit_job_dir),
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.markdown("Rapports attendus après exécution")
+                st.dataframe(
+                    audit_reunion_quality_report_candidates(audit_job_dir),
+                    width="stretch",
+                    hide_index=True,
+                )
+            audit_dry_run = st.checkbox(
+                "Prévisualiser le JSON sans déposer le job d’audit",
+                value=False,
+                key="cr_audit_dry_run",
+            )
+            if not cr_spooler_available:
+                st.warning("Soumission audit désactivée : accès SMB au spooler indisponible.")
+            if st.button("Analyser", key="cr_audit_submit", disabled=not cr_spooler_available):
+                try:
+                    if cr_id_captation == "(aucune)":
+                        raise ValueError("Sélectionner une captation.")
+                    if audit_job_dir is None or not audit_job_dir.is_dir():
+                        raise FileNotFoundError(f"Dossier de run introuvable : {audit_job_dir}")
+                    if not cr_infos_path or not Path(cr_infos_path).is_file():
+                        raise FileNotFoundError(f"infos_projet.json introuvable : {cr_infos_path}")
+                    audit_result = submit_audit_reunion_quality_job(
+                        job_dir=audit_job_dir,
+                        infos_path=cr_infos_path,
+                        id_affaire=cr_affaire_id,
+                        id_captation=cr_id_captation,
+                        dry_run=audit_dry_run,
+                    )
+                    st.write("job_id :", audit_result["job_id"])
+                    st.write("chemin JSON :", audit_result["job_path"])
+                    st.write("statut initial :", audit_result["status"])
+                    st.json(audit_result["job"])
+                    if not audit_dry_run:
+                        st.success("Job audit_reunion_quality déposé. Streamlit n’exécute pas l’audit.")
+                        st.session_state["cr_audit_follow_job_id"] = audit_result["job_id"]
+                except Exception as e:
+                    st.error(f"Soumission du job d’audit impossible : {e}")
+
+            st.markdown("##### Suivi du job audit_reunion_quality")
+            if "cr_audit_follow_job_id" not in st.session_state:
+                st.session_state["cr_audit_follow_job_id"] = "audit_cr_2025-J47_accedit-2025-11-13_20260728_140327_f93390ff"
+            audit_follow_job_id = st.text_input(
+                "job_id audit à suivre",
+                key="cr_audit_follow_job_id",
+            ).strip()
+            audit_status_key = f"cr_audit_status::{audit_follow_job_id}"
+            if st.button(
+                "Actualiser le statut",
+                key="cr_audit_refresh_status",
+                disabled=not bool(audit_follow_job_id),
+                help="Lecture ciblée du job_id dans queued/running/done/failed et des logs associés.",
+            ):
+                st.session_state[audit_status_key] = find_audit_reunion_quality_job_status(audit_follow_job_id)
+
+            audit_status = st.session_state.get(audit_status_key)
+            if audit_status:
+                st.table([
+                    {"champ": "job_id", "valeur": audit_status.get("job_id", "")},
+                    {"champ": "statut", "valeur": audit_status.get("status", "")},
+                    {"champ": "date de dépôt", "valeur": audit_status.get("submitted_at", "")},
+                    {"champ": "date de début", "valeur": audit_status.get("started_at", "")},
+                    {"champ": "date de fin", "valeur": audit_status.get("finished_at", "")},
+                    {"champ": "exit code", "valeur": audit_status.get("exit_code", "")},
+                    {"champ": "erreur synthétique", "valeur": audit_status.get("error", "")},
+                    {"champ": "command.txt", "valeur": audit_status.get("command_path", "")},
+                    {"champ": "stdout.log", "valeur": audit_status.get("stdout_path", "")},
+                    {"champ": "stderr.log", "valeur": audit_status.get("stderr_path", "")},
+                    {"champ": "manifest.json", "valeur": audit_status.get("manifest_path", "")},
+                ])
+                if audit_status.get("status") in {"queued", "running"}:
+                    st.info("Job audit_reunion_quality en attente ou en cours côté spooler.")
+                elif audit_status.get("status") == "failed":
+                    st.error("Job audit_reunion_quality en échec côté spooler.")
+                elif audit_status.get("status") == "introuvable":
+                    st.warning("Job audit_reunion_quality introuvable dans queued/running/done/failed.")
+
+                audit_done_result = {}
+                if audit_status.get("status") == "done":
+                    audit_done_result = load_audit_reunion_quality_done_result(audit_status)
+                    report_rows = audit_reunion_quality_report_candidates(Path(audit_done_result.get("job_dir") or ""))
+                    st.markdown("Rapports produits")
+                    st.dataframe(report_rows, width="stretch", hide_index=True)
+                    audit_json_data = audit_done_result.get("json") if isinstance(audit_done_result.get("json"), dict) else {}
+                    if audit_done_result.get("json_present") and audit_json_data:
+                        st.markdown("Synthèse de l’audit")
+                        st.dataframe(audit_reunion_quality_summary_rows(audit_json_data), width="stretch", hide_index=True)
+                    elif audit_done_result.get("json_present"):
+                        st.warning("audit_reunion_quality.json est présent mais n’a pas pu être chargé comme objet JSON.")
+                    else:
+                        st.warning("audit_reunion_quality.json absent dans le dossier de run.")
+
+                with st.expander("Détails audit : rapport Markdown, JSON brut et logs", expanded=False):
+                    if audit_done_result.get("markdown"):
+                        st.markdown("###### Rapport Markdown")
+                        st.markdown(audit_done_result["markdown"])
+                    elif audit_status.get("status") == "done":
+                        st.caption("Rapport Markdown absent ou illisible.")
+
+                    if audit_done_result.get("json_present"):
+                        st.markdown("###### JSON brut")
+                        audit_json_data = audit_done_result.get("json") if isinstance(audit_done_result.get("json"), dict) else {}
+                        if audit_json_data:
+                            st.json(audit_json_data)
+                        else:
+                            st.code(_audit_quality_read_text(audit_done_result.get("json_path", ""), 50000), language="json")
+
+                    stdout_text = _audit_quality_read_text(audit_status.get("stdout_path", ""), 30000)
+                    stderr_text = _audit_quality_read_text(audit_status.get("stderr_path", ""), 30000)
+                    st.markdown("###### stdout.log")
+                    st.code(stdout_text or "(stdout.log absent ou vide)", language="text")
+                    st.markdown("###### stderr.log")
+                    st.code(stderr_text or "(stderr.log absent ou vide)", language="text")
 
             if st.button("📨 Soumettre l’ASR au spooler avant génération du CR", key="cr_submit_asr_before_cr"):
                 submit_current_asr_job()
