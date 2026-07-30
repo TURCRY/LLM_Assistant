@@ -6554,7 +6554,7 @@ CR_LLM_DEFAULT_ROUTING = {
     "model_pass1": "annoter_segments_remote",
     "model_pass2": "annoter_segments_remote",
     "model_report": "report_remote",
-    "model_pass2e": "annoter_segments_remote_alt",
+    "model_pass2e": "pass2e_remote",
     "model_pass3": "annoter_segments_remote_alt",
     "model_pass3e": "pass3e_remote",
     "model_pass3a": "pass3a_remote",
@@ -6609,6 +6609,11 @@ def _cr_existing_routing(data: dict) -> dict:
         value = existing.get(key)
         if value is not None and str(value).strip():
             routing[key] = str(value).strip()
+    if (
+        str(existing.get("profil_llm") or "").strip() == "standard_openai"
+        and routing.get("model_pass2e") == "annoter_segments_remote_alt"
+    ):
+        routing["model_pass2e"] = CR_LLM_DEFAULT_ROUTING["model_pass2e"]
     return routing
 
 def _validate_cr_llm_routing(routing: dict) -> None:
