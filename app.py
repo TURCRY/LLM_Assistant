@@ -6767,26 +6767,227 @@ def submit_compte_rendu_job(
     result["patched_infos"] = patched_infos
     return result
 
+PHOTO_BATCH_RESET_VALUES = ("none", "reset_vlm", "reset_llm", "reset_vlm_plus")
+PHOTO_BATCH_RERUN_WEAK_BACKENDS = ("same", "local", "remote")
+PHOTO_BATCH_PUBLIC_OPTIONS = {
+    "--dry-run",
+    "--limit",
+    "--night",
+    "--vlm-strict",
+    "--reset-vlm",
+    "--reset-llm",
+    "--reset-vlm-plus",
+    "--only-new-dictee",
+    "--rerun-weak",
+    "--rerun-weak-backend",
+}
+PHOTO_BATCH_BOOLEAN_OPTIONS = PHOTO_BATCH_PUBLIC_OPTIONS - {"--limit", "--rerun-weak-backend"}
+
+
+def build_annotation_photos_batch_options(
+    *,
+    profile: str = "custom",
+    dry_run_batch: bool = False,
+    limit: int = 0,
+    night: bool = False,
+    vlm_strict: bool = False,
+    only_new_dictee: bool = False,
+    rerun_weak: bool = False,
+    rerun_weak_backend: str = "same",
+    reset: str = "none",
+) -> list[str]:
+    profile = str(profile or "custom").strip()
+    try:
+        limit = int(limit or 0)
+    except Exception:
+        raise ValueError("La limite doit être un entier positif ou nul.")
+    if limit < 0:
+        raise ValueError("La limite ne peut pas être négative.")
+
+    reset = str(reset or "none").strip()
+    if reset not in PHOTO_BATCH_RESET_VALUES:
+        raise ValueError("Reset batch invalide.")
+
+    rerun_weak_backend = str(rerun_weak_backend or "same").strip().lower()
+    if rerun_weak_backend not in PHOTO_BATCH_RERUN_WEAK_BACKENDS:
+        raise ValueError("Backend weak invalide : utiliser same, local ou remote.")
+    if not rerun_weak and rerun_weak_backend != "same":
+        raise ValueError("Le backend weak ne peut être forcé que si la relance weak est active.")
+
+    options: list[str] = []
+    if reset == "reset_vlm":
+        options.extend(["--reset-vlm", "1"])
+    elif reset == "reset_llm":
+        options.extend(["--reset-llm", "1"])
+    elif reset == "reset_vlm_plus":
+        options.extend(["--reset-vlm-plus", "1"])
+    if vlm_strict:
+        options.extend(["--vlm-strict", "1"])
+    if night:
+        options.extend(["--night", "1"])
+    if only_new_dictee:
+        options.extend(["--only-new-dictee", "1"])
+    if rerun_weak:
+        options.extend(["--rerun-weak", "1"])
+        if rerun_weak_backend != "same":
+            options.extend(["--rerun-weak-backend", rerun_weak_backend])
+    if dry_run_batch:
+        options.extend(["--dry-run", "1"])
+    if limit > 0:
+        options.extend(["--limit", str(limit)])
+
+    validate_annotation_photos_batch_options(options)
+    return options
+
+
 PHOTO_BATCH_ACTIONS = {
+    "run_standard": {
+        "label": "Run standard",
+        "status_label": "run standard",
+        "profile": "run_standard",
+        "defaults": {},
+    },
     "initial": {
-        "label": "Lancer le traitement initial",
+        "label": "Traitement initial strict",
         "status_label": "traitement initial",
         "profile": "vlm_strict",
-        "options": ["--reset-vlm", "1", "--vlm-strict", "1"],
+        "defaults": {"reset": "reset_vlm", "vlm_strict": True},
+    },
+    "only_new_dictee": {
+        "label": "Nouvelles dictées uniquement",
+        "status_label": "nouvelles dictées",
+        "profile": "only_new_dictee",
+        "defaults": {"only_new_dictee": True},
     },
     "weak_dry_run": {
-        "label": "Analyser les annotations restantes — dry-run batch",
+        "label": "Analyse des weak en dry-run",
         "status_label": "analyse dry-run batch",
         "profile": "rerun_weak_dry_run",
-        "options": ["--rerun-weak", "1", "--dry-run", "1"],
+        "defaults": {"rerun_weak": True, "dry_run_batch": True},
     },
     "weak_rerun": {
-        "label": "Relancer les weak",
+        "label": "Relance des weak",
         "status_label": "reprise weak",
         "profile": "rerun_weak",
-        "options": ["--rerun-weak", "1"],
+        "defaults": {"rerun_weak": True},
+    },
+    "reset_llm": {
+        "label": "Reprise LLM seule",
+        "status_label": "reprise LLM",
+        "profile": "reset_llm",
+        "defaults": {"reset": "reset_llm"},
+    },
+    "reset_vlm": {
+        "label": "Reprise VLM",
+        "status_label": "reprise VLM",
+        "profile": "reset_vlm",
+        "defaults": {"reset": "reset_vlm"},
+    },
+    "reset_vlm_plus": {
+        "label": "Reset VLM large",
+        "status_label": "reset VLM large",
+        "profile": "reset_vlm_plus",
+        "defaults": {"reset": "reset_vlm_plus"},
+    },
+    "custom": {
+        "label": "Personnalisé",
+        "status_label": "personnalisé",
+        "profile": "custom",
+        "defaults": {},
     },
 }
+for _photo_batch_key, _photo_batch_spec in PHOTO_BATCH_ACTIONS.items():
+    _photo_batch_defaults = dict(_photo_batch_spec.get("defaults") or {})
+    _photo_batch_spec["options"] = build_annotation_photos_batch_options(
+        profile=str(_photo_batch_spec.get("profile") or _photo_batch_key),
+        **_photo_batch_defaults,
+    )
+
+
+def _annotation_batch_profile_defaults(profile_key: str) -> dict:
+    spec = PHOTO_BATCH_ACTIONS.get(profile_key) or PHOTO_BATCH_ACTIONS["custom"]
+    defaults = {
+        "dry_run_batch": False,
+        "limit": 0,
+        "night": False,
+        "vlm_strict": False,
+        "only_new_dictee": False,
+        "rerun_weak": False,
+        "rerun_weak_backend": "same",
+        "reset": "none",
+    }
+    defaults.update(dict(spec.get("defaults") or {}))
+    return defaults
+
+
+def validate_annotation_photos_batch_options(options: list[str]) -> None:
+    if not isinstance(options, list):
+        raise ValueError("Les options batch doivent être une liste.")
+    if len(options) % 2:
+        raise ValueError("Liste options batch incomplète.")
+    seen: dict[str, str] = {}
+    reset_count = 0
+    rerun_weak_enabled = False
+    weak_backend = "same"
+    for i in range(0, len(options), 2):
+        name = str(options[i])
+        value = str(options[i + 1])
+        if name not in PHOTO_BATCH_PUBLIC_OPTIONS:
+            raise ValueError(f"Option batch hors contrat public : {name}")
+        if name in seen:
+            raise ValueError(f"Option batch dupliquée : {name}")
+        seen[name] = value
+        if name == "--rerun-weak-backend":
+            if value not in PHOTO_BATCH_RERUN_WEAK_BACKENDS:
+                raise ValueError(f"Backend weak invalide : {value}")
+            weak_backend = value
+            continue
+        if name in PHOTO_BATCH_BOOLEAN_OPTIONS:
+            if value not in {"0", "1"}:
+                raise ValueError(f"Valeur booléenne attendue pour {name} : 0 ou 1.")
+            numeric_value = int(value)
+        elif name == "--limit":
+            if not re.fullmatch(r"\d+", value):
+                raise ValueError(f"Valeur numérique attendue pour {name}.")
+            numeric_value = int(value)
+        else:
+            raise ValueError(f"Valeur numérique attendue pour {name}.")
+        if name == "--limit" and numeric_value < 0:
+            raise ValueError("La limite ne peut pas être négative.")
+        if name == "--rerun-weak" and numeric_value == 1:
+            rerun_weak_enabled = True
+        if name in {"--reset-vlm", "--reset-llm", "--reset-vlm-plus"} and numeric_value:
+            reset_count += 1
+    if reset_count > 1:
+        raise ValueError("Utiliser un seul reset parmi --reset-vlm, --reset-llm et --reset-vlm-plus.")
+    if weak_backend != "same" and not rerun_weak_enabled:
+        raise ValueError("--rerun-weak-backend est interdit sans --rerun-weak 1.")
+
+
+def _annotation_batch_options_are_public(options: list[str]) -> tuple[bool, str]:
+    try:
+        validate_annotation_photos_batch_options(options)
+    except ValueError as exc:
+        return False, str(exc)
+    return True, ""
+
+
+def _annotation_batch_profile_for_job(job: dict, options: list[str]) -> str:
+    profile = str((job or {}).get("profile") or "").strip()
+    if profile in PHOTO_BATCH_ACTIONS:
+        return profile
+    for candidate_key, spec in PHOTO_BATCH_ACTIONS.items():
+        if profile and profile == str(spec.get("profile") or ""):
+            return candidate_key
+    for candidate_key, spec in PHOTO_BATCH_ACTIONS.items():
+        if options == list(spec.get("options") or []):
+            return candidate_key
+    ok, _ = _annotation_batch_options_are_public(options)
+    return "custom" if ok else ""
+
+
+def _annotation_batch_has_option(options: list[str], option_name: str) -> bool:
+    return any(str(options[i]) == option_name for i in range(0, len(options), 2))
 
 PHOTO_BATCH_PUBLISH_RETRY_KEY = "publish_retry"
 PHOTO_BATCH_PUBLISH_RETRY_LABEL = "reprise publication NAS"
@@ -7260,12 +7461,6 @@ def _annotation_job_details(
                 merged.update(data)
         return merged
 
-    def _is_dry_run(job: dict, result: dict, options: list[str]) -> bool:
-        if job.get("dry_run") is True or result.get("dry_run") is True:
-            return True
-        lowered = [str(x).strip().lower() for x in options]
-        return "--dry-run" in lowered
-
     def _value(data: dict, *keys: str) -> str:
         for key in keys:
             value = data.get(key)
@@ -7398,6 +7593,8 @@ def _annotation_job_details(
             "photos_csv_sha256": "",
             "photos_batch_csv": "",
             "photos_batch_sha256": "",
+            "profile": "",
+            "options": [],
         }
         for key in PHOTO_BATCH_ACTIONS
     }
@@ -7424,6 +7621,8 @@ def _annotation_job_details(
         "photos_csv_sha256": "",
         "photos_batch_csv": "",
         "photos_batch_sha256": "",
+        "profile": "",
+        "options": [],
     }
     cache_key = (id_affaire, id_captation, detail_level, "diag" if include_diagnostics else "plain", "vpn" if _pcfixe_vpn_active() else "lan")
     _annotation_cache_prune(_ANNOTATION_JOB_DETAILS_CACHE, ANNOTATION_JOBS_DIAGNOSTIC_TTL_SECONDS)
@@ -7514,17 +7713,15 @@ def _annotation_job_details(
                     diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": "affaire/captation différente"})
                     continue
                 options = [str(x) for x in (job.get("options") or [])]
-                if _is_dry_run(job, result, options):
-                    diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": "job dry-run"})
+                if job.get("dry_run") is True or result.get("dry_run") is True:
+                    diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": "job dry-run marqué dry_run=true"})
                     continue
                 action_key = PHOTO_BATCH_PUBLISH_RETRY_KEY if job_type == "annotation_photos_batch_publish_retry" else ""
                 if not action_key:
-                    for candidate_key, spec in PHOTO_BATCH_ACTIONS.items():
-                        if options == spec["options"]:
-                            action_key = candidate_key
-                            break
+                    action_key = _annotation_batch_profile_for_job(job, options)
                 if not action_key:
-                    diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": "options batch inconnues"})
+                    ok, reason = _annotation_batch_options_are_public(options)
+                    diagnostics["ignored"].append({"job_id": job_id, "path": str(job_file), "reason": reason or "options batch inconnues"})
                     continue
                 state = _normal_status(_value(job, "status"), folder)
                 exit_code = _value(result, "exit_code", "returncode", "return_code") or _value(job, "exit_code", "returncode", "return_code")
@@ -7541,7 +7738,7 @@ def _annotation_job_details(
                 local_done = _bool_value(job.get("local_done", result.get("local_done")))
                 publish_error_code = str(job.get("publish_error_code") or result.get("publish_error_code") or "").strip()
                 source_manifest = str(job.get("source_manifest") or result.get("source_manifest") or "").strip()
-                no_op_valid = action_key == "weak_rerun" and _is_valid_no_op(job, result)
+                no_op_valid = _annotation_batch_has_option(options, "--rerun-weak") and _is_valid_no_op(job, result)
                 no_op_reason = str(job.get("no_op_reason") or result.get("no_op_reason") or "").strip()
                 local_done_publish_pending = (
                     job_type == "annotation_photos_batch"
@@ -7711,6 +7908,8 @@ def _annotation_job_details(
                     "no_op": "true" if no_op_valid else "",
                     "no_op_reason": no_op_reason,
                     "batch_manifest_kind": "modern" if is_modern else "legacy",
+                    "profile": str(job.get("profile") or PHOTO_BATCH_ACTIONS.get(action_key, {}).get("profile") or action_key),
+                    "options": list(options),
                     "batch_nas_publish_succeeded": "true" if nas_publish_succeeded else ("false" if is_modern else ""),
                     "verification_note": (
                         "Batch no-op valide : aucune ligne WEAK à retraiter"
@@ -8651,8 +8850,10 @@ def submit_annotation_photos_batch_job(
     id_affaire: str,
     id_captation: str,
     infos_pcfixe: str | Path,
-    action_key: str,
+    action_key: str = "",
     dry_run: bool = True,
+    profile: str | None = None,
+    options: list[str] | None = None,
 ) -> dict:
     id_affaire = (id_affaire or "").strip()
     id_captation = (id_captation or "").strip()
@@ -8660,16 +8861,24 @@ def submit_annotation_photos_batch_job(
         raise ValueError("id_affaire/id_captation obligatoires.")
     if any(char in id_affaire + id_captation for char in '\\/:*?"<>|'):
         raise ValueError("id_affaire/id_captation invalides.")
-    if action_key not in PHOTO_BATCH_ACTIONS:
-        raise ValueError(f"Action batch inconnue : {action_key}")
+    if options is None:
+        if action_key not in PHOTO_BATCH_ACTIONS:
+            raise ValueError(f"Action batch inconnue : {action_key}")
+        spec = PHOTO_BATCH_ACTIONS[action_key]
+        profile_key = str(profile or spec.get("profile") or action_key)
+        options = list(spec["options"])
+    else:
+        profile_key = str(profile or action_key or "custom").strip() or "custom"
+        spec = PHOTO_BATCH_ACTIONS.get(action_key) or PHOTO_BATCH_ACTIONS.get(profile_key) or PHOTO_BATCH_ACTIONS["custom"]
+        options = [str(item) for item in options]
+        validate_annotation_photos_batch_options(options)
 
-    spec = PHOTO_BATCH_ACTIONS[action_key]
     infos = Path(str(infos_pcfixe).strip().strip('"'))
     paths = _annotation_canonical_paths(id_affaire, id_captation)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     job_id = (
         f"annotation_{_safe_job_token(id_affaire)}_{_safe_job_token(id_captation)}_"
-        f"{_safe_job_token(spec['profile'])}_{stamp}_{uuid.uuid4().hex[:8]}"
+        f"{_safe_job_token(profile_key)}_{stamp}_{uuid.uuid4().hex[:8]}"
     )
     runtime_infos_path = paths["pcfixe_trans_dir"] / "_runtime_jobs" / f"infos_projet_runtime_{job_id}.json"
     job = {
@@ -8681,7 +8890,8 @@ def submit_annotation_photos_batch_job(
         "infos_projet_source": str(infos),
         "fichier_photos": str(paths["pcfixe_photos"]),
         "fichier_photos_batch": str(paths["pcfixe_photos_batch"]),
-        "options": list(spec["options"]),
+        "profile": profile_key,
+        "options": list(options),
     }
     queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
     result = {
@@ -13449,22 +13659,16 @@ elif page == "Annotation photos / Rapport Word":
                     "chemin": str(valid_path or ""),
                 }
             )
+        status_rows.extend(
+            {
+                "élément": spec["status_label"],
+                "état": ann_job_statuses.get(action_key, "absent"),
+                "chemin": ann_job_details.get(action_key, {}).get("job_path", ""),
+            }
+            for action_key, spec in PHOTO_BATCH_ACTIONS.items()
+            if action_key != "custom"
+        )
         status_rows.extend([
-            {
-                "élément": PHOTO_BATCH_ACTIONS["initial"]["status_label"],
-                "état": ann_job_statuses["initial"],
-                "chemin": ann_job_details["initial"].get("job_path", ""),
-            },
-            {
-                "élément": PHOTO_BATCH_ACTIONS["weak_dry_run"]["status_label"],
-                "état": ann_job_statuses["weak_dry_run"],
-                "chemin": ann_job_details["weak_dry_run"].get("job_path", ""),
-            },
-            {
-                "élément": PHOTO_BATCH_ACTIONS["weak_rerun"]["status_label"],
-                "état": ann_job_statuses["weak_rerun"],
-                "chemin": ann_job_details["weak_rerun"].get("job_path", ""),
-            },
             {
                 "élément": PHOTO_BATCH_PUBLISH_RETRY_LABEL,
                 "état": ann_job_statuses.get(PHOTO_BATCH_PUBLISH_RETRY_KEY, "absent"),
@@ -13580,6 +13784,8 @@ elif page == "Annotation photos / Rapport Word":
                 "action": PHOTO_BATCH_ACTIONS[action_key]["status_label"],
                 "statut": detail.get("status", "absent"),
                 "job_id": detail.get("job_id", ""),
+                "profil": detail.get("profile") or PHOTO_BATCH_ACTIONS[action_key].get("profile") or action_key,
+                "options": " ".join(str(x) for x in (detail.get("options") or [])),
                 "total": detail.get("total_photos", ""),
                 "annoté": detail.get("annotated_photos", ""),
                 "restant": detail.get("remaining_photos", ""),
@@ -13605,6 +13811,8 @@ elif page == "Annotation photos / Rapport Word":
                     "action": PHOTO_BATCH_PUBLISH_RETRY_LABEL,
                     "statut": publish_retry_detail.get("status", "absent"),
                     "job_id": publish_retry_detail.get("job_id", ""),
+                    "profil": publish_retry_detail.get("profile") or PHOTO_BATCH_PUBLISH_RETRY_KEY,
+                    "options": " ".join(str(x) for x in (publish_retry_detail.get("options") or [])),
                     "total": "",
                     "annoté": "",
                     "restant": "",
@@ -13795,41 +14003,123 @@ elif page == "Annotation photos / Rapport Word":
                     st.rerun()
                 except Exception as e:
                     st.error(f"Reprise publication NAS impossible : {e}")
-        with st.form(key=f"ann_photos_batch_form_{ann_diag_scope}"):
-            ann_job_preview_only = st.checkbox(
-                "Prévisualiser le JSON sans déposer le job",
-                value=True,
-                key="ann_photos_job_preview_only",
+        batch_profile_options = list(PHOTO_BATCH_ACTIONS.keys())
+        selected_batch_profile = st.selectbox(
+            "Type de lancement",
+            batch_profile_options,
+            format_func=lambda key: PHOTO_BATCH_ACTIONS[key]["label"],
+            key=f"ann_photos_batch_profile_{ann_diag_scope}",
+        )
+        batch_defaults = _annotation_batch_profile_defaults(selected_batch_profile)
+        action_state = _annotation_batch_action_state(ann_job_details, selected_batch_profile)
+        if ann_photos_resource_missing:
+            action_state = {
+                **action_state,
+                "can_submit": False,
+                "status_code": "MISSING_PHOTOS_CSV",
+                "message": "Aucun fichier photos.csv n’a été résolu pour cette captation.",
+            }
+        st.caption(str(action_state.get("message") or ""))
+        with st.form(key=f"ann_photos_batch_form_{ann_diag_scope}_{selected_batch_profile}"):
+            st.markdown("##### Paramètres transversaux")
+            col_batch_opts = st.columns(3)
+            with col_batch_opts[0]:
+                ann_batch_limit = st.number_input(
+                    "Limite",
+                    min_value=0,
+                    value=int(batch_defaults.get("limit") or 0),
+                    step=1,
+                    key=f"ann_photos_batch_limit_{ann_diag_scope}_{selected_batch_profile}",
+                )
+                ann_batch_vlm_strict = st.checkbox(
+                    "VLM strict",
+                    value=bool(batch_defaults.get("vlm_strict")),
+                    key=f"ann_photos_batch_vlm_strict_{ann_diag_scope}_{selected_batch_profile}",
+                )
+            with col_batch_opts[1]:
+                ann_batch_night = st.checkbox(
+                    "Mode nuit",
+                    value=bool(batch_defaults.get("night")),
+                    key=f"ann_photos_batch_night_{ann_diag_scope}_{selected_batch_profile}",
+                )
+                ann_batch_dry_run = st.checkbox(
+                    "Exécuter le batch en dry-run",
+                    value=bool(batch_defaults.get("dry_run_batch")),
+                    key=f"ann_photos_batch_real_dry_run_{ann_diag_scope}_{selected_batch_profile}",
+                )
+            with col_batch_opts[2]:
+                ann_batch_only_new_dictee = st.checkbox(
+                    "Nouvelles dictées uniquement",
+                    value=bool(batch_defaults.get("only_new_dictee")),
+                    key=f"ann_photos_batch_only_new_dictee_{ann_diag_scope}_{selected_batch_profile}",
+                )
+                ann_batch_rerun_weak = st.checkbox(
+                    "Relance weak",
+                    value=bool(batch_defaults.get("rerun_weak")),
+                    key=f"ann_photos_batch_rerun_weak_{ann_diag_scope}_{selected_batch_profile}",
+                )
+
+            ann_batch_weak_backend = st.selectbox(
+                "Backend weak",
+                list(PHOTO_BATCH_RERUN_WEAK_BACKENDS),
+                index=list(PHOTO_BATCH_RERUN_WEAK_BACKENDS).index(str(batch_defaults.get("rerun_weak_backend") or "same")),
+                disabled=not ann_batch_rerun_weak,
+                key=f"ann_photos_batch_weak_backend_{ann_diag_scope}_{selected_batch_profile}",
             )
-            submitted_action_key = ""
-            for action_key, spec in PHOTO_BATCH_ACTIONS.items():
-                action_state = _annotation_batch_action_state(ann_job_details, action_key)
-                if ann_photos_resource_missing:
-                    action_state = {
-                        **action_state,
-                        "can_submit": False,
-                        "status_code": "MISSING_PHOTOS_CSV",
-                        "message": "Aucun fichier photos.csv n’a été résolu pour cette captation.",
-                    }
-                st.markdown(f"#### {spec['label']}")
-                st.caption(str(action_state.get("message") or ""))
-                if st.form_submit_button(spec["label"], disabled=not bool(action_state.get("can_submit"))):
-                    submitted_action_key = action_key
-            if submitted_action_key:
+            if not ann_batch_rerun_weak:
+                ann_batch_weak_backend = "same"
+
+            reset_labels = {
+                "none": "Aucun",
+                "reset_vlm": "Reset VLM",
+                "reset_llm": "Reset LLM",
+                "reset_vlm_plus": "Reset VLM plus",
+            }
+            ann_batch_reset = st.radio(
+                "Reset exclusif",
+                list(PHOTO_BATCH_RESET_VALUES),
+                index=list(PHOTO_BATCH_RESET_VALUES).index(str(batch_defaults.get("reset") or "none")),
+                format_func=lambda value: reset_labels[value],
+                horizontal=True,
+                key=f"ann_photos_batch_reset_{ann_diag_scope}_{selected_batch_profile}",
+            )
+            ann_job_preview_only = st.checkbox(
+                "Afficher le JSON sans déposer le job",
+                value=True,
+                key=f"ann_photos_job_preview_only_{ann_diag_scope}_{selected_batch_profile}",
+            )
+            submit_batch_form = st.form_submit_button(
+                "Préparer le job batch",
+                disabled=not bool(action_state.get("can_submit")),
+            )
+            if submit_batch_form:
                 try:
+                    batch_options = build_annotation_photos_batch_options(
+                        profile=PHOTO_BATCH_ACTIONS[selected_batch_profile]["profile"],
+                        dry_run_batch=ann_batch_dry_run,
+                        limit=int(ann_batch_limit or 0),
+                        night=ann_batch_night,
+                        vlm_strict=ann_batch_vlm_strict,
+                        only_new_dictee=ann_batch_only_new_dictee,
+                        rerun_weak=ann_batch_rerun_weak,
+                        rerun_weak_backend=ann_batch_weak_backend,
+                        reset=ann_batch_reset,
+                    )
                     result = submit_annotation_photos_batch_job(
                         id_affaire=ann_id_affaire,
                         id_captation=ann_id_captation,
                         infos_pcfixe=ann_paths["pcfixe_infos"],
-                        action_key=submitted_action_key,
+                        action_key=selected_batch_profile,
+                        profile=PHOTO_BATCH_ACTIONS[selected_batch_profile]["profile"],
+                        options=batch_options,
                         dry_run=ann_job_preview_only,
                     )
-                    spec = PHOTO_BATCH_ACTIONS[submitted_action_key]
+                    spec = PHOTO_BATCH_ACTIONS[selected_batch_profile]
                     _annotation_clear_runtime_caches(id_affaire=ann_id_affaire, id_captation=ann_id_captation)
                     st.session_state["ann_photos_last_batch_submission"] = {
                         "id_affaire": ann_id_affaire,
                         "id_captation": ann_id_captation,
-                        "action_key": submitted_action_key,
+                        "action_key": selected_batch_profile,
                         "action_label": spec["label"],
                         "job_id": result["job_id"],
                         "job_path": result["job_path"],
@@ -13840,9 +14130,9 @@ elif page == "Annotation photos / Rapport Word":
                     st.write("statut initial :", result["status"])
                     st.json(result["job"])
                     if ann_job_preview_only:
-                        st.info("Aucun job déposé : prévisualisation UI uniquement.")
-                    elif submitted_action_key == "weak_dry_run":
-                        st.success("Job d’analyse déposé. Le batch analysera les CSV sans modifier les annotations.")
+                        st.info("Aucun job déposé : affichage JSON uniquement.")
+                    elif ann_batch_dry_run:
+                        st.success("Job dry-run batch déposé. Le batch analysera les CSV sans modifier les annotations.")
                     else:
                         st.success("Job annotation_photos_batch déposé. Streamlit n'attend pas la fin du traitement.")
                     st.rerun()

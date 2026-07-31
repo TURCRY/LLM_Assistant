@@ -18,6 +18,7 @@ from pathlib import Path
 APP_PATH = Path(__file__).resolve().parents[1] / "app.py"
 ACTION_OPTIONS = ["--reset-vlm", "1", "--vlm-strict", "1"]
 WEAK_RERUN_OPTIONS = ["--rerun-weak", "1"]
+WEAK_DRY_RUN_OPTIONS = ["--rerun-weak", "1", "--dry-run", "1"]
 
 
 def _load_annotation_functions():
@@ -41,6 +42,12 @@ def _load_annotation_functions():
         "_annotation_report_preflight",
         "_annotation_report_ui_state",
         "_annotation_batch_action_state",
+        "build_annotation_photos_batch_options",
+        "validate_annotation_photos_batch_options",
+        "_annotation_batch_profile_defaults",
+        "_annotation_batch_options_are_public",
+        "_annotation_batch_profile_for_job",
+        "_annotation_batch_has_option",
         "_path_accessible_quick",
         "_csv_kind_from_path",
         "_read_semicolon_csv",
@@ -73,18 +80,93 @@ def _load_annotation_functions():
         "uuid": uuid,
         "datetime": datetime,
         "PHOTO_BATCH_ACTIONS": {
+            "run_standard": {
+                "label": "standard",
+                "status_label": "standard",
+                "profile": "run_standard",
+                "defaults": {},
+                "options": [],
+            },
             "initial": {
                 "label": "initial",
                 "status_label": "initial",
                 "profile": "vlm_strict",
+                "defaults": {"reset": "reset_vlm", "vlm_strict": True},
                 "options": ACTION_OPTIONS,
+            },
+            "only_new_dictee": {
+                "label": "dictee",
+                "status_label": "dictee",
+                "profile": "only_new_dictee",
+                "defaults": {"only_new_dictee": True},
+                "options": ["--only-new-dictee", "1"],
+            },
+            "weak_dry_run": {
+                "label": "weak dry",
+                "status_label": "weak dry",
+                "profile": "rerun_weak_dry_run",
+                "defaults": {"rerun_weak": True, "dry_run_batch": True},
+                "options": WEAK_DRY_RUN_OPTIONS,
             },
             "weak_rerun": {
                 "label": "weak",
                 "status_label": "weak",
                 "profile": "rerun_weak",
+                "defaults": {"rerun_weak": True},
                 "options": WEAK_RERUN_OPTIONS,
             },
+            "reset_llm": {
+                "label": "llm",
+                "status_label": "llm",
+                "profile": "reset_llm",
+                "defaults": {"reset": "reset_llm"},
+                "options": ["--reset-llm", "1"],
+            },
+            "reset_vlm": {
+                "label": "vlm",
+                "status_label": "vlm",
+                "profile": "reset_vlm",
+                "defaults": {"reset": "reset_vlm"},
+                "options": ["--reset-vlm", "1"],
+            },
+            "reset_vlm_plus": {
+                "label": "vlm plus",
+                "status_label": "vlm plus",
+                "profile": "reset_vlm_plus",
+                "defaults": {"reset": "reset_vlm_plus"},
+                "options": ["--reset-vlm-plus", "1"],
+            },
+            "custom": {
+                "label": "custom",
+                "status_label": "custom",
+                "profile": "custom",
+                "defaults": {},
+                "options": [],
+            },
+        },
+        "PHOTO_BATCH_RESET_VALUES": ("none", "reset_vlm", "reset_llm", "reset_vlm_plus"),
+        "PHOTO_BATCH_RERUN_WEAK_BACKENDS": ("same", "local", "remote"),
+        "PHOTO_BATCH_PUBLIC_OPTIONS": {
+            "--dry-run",
+            "--limit",
+            "--night",
+            "--vlm-strict",
+            "--reset-vlm",
+            "--reset-llm",
+            "--reset-vlm-plus",
+            "--only-new-dictee",
+            "--rerun-weak",
+            "--rerun-weak-backend",
+        },
+        "PHOTO_BATCH_BOOLEAN_OPTIONS": {
+            "--dry-run",
+            "--night",
+            "--vlm-strict",
+            "--reset-vlm",
+            "--reset-llm",
+            "--reset-vlm-plus",
+            "--only-new-dictee",
+            "--rerun-weak",
         },
         "PHOTO_BATCH_PUBLISH_RETRY_KEY": "publish_retry",
         "PHOTO_BATCH_PUBLISH_RETRY_LABEL": "reprise publication NAS",
@@ -329,6 +411,260 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
             },
             "join_audit": self.ns["_annotation_csv_join_audit"](self.photos, self.batch),
         }
+
+    def test_batch_options_builder_profiles_and_flags(self):
+        build = self.ns["build_annotation_photos_batch_options"]
+        self.assertEqual(build(profile="run_standard"), [])
+        self.assertEqual(build(profile="vlm_strict", reset="reset_vlm", vlm_strict=True), ACTION_OPTIONS)
+        self.assertEqual(build(profile="rerun_weak_dry_run", rerun_weak=True, dry_run_batch=True), WEAK_DRY_RUN_OPTIONS)
+        self.assertEqual(build(profile="rerun_weak", rerun_weak=True), WEAK_RERUN_OPTIONS)
+        self.assertEqual(build(profile="only_new_dictee", only_new_dictee=True), ["--only-new-dictee", "1"])
+        self.assertEqual(build(profile="reset_llm", reset="reset_llm"), ["--reset-llm", "1"])
+        self.assertEqual(build(profile="reset_vlm", reset="reset_vlm"), ["--reset-vlm", "1"])
+        self.assertEqual(build(profile="reset_vlm_plus", reset="reset_vlm_plus"), ["--reset-vlm-plus", "1"])
+        self.assertEqual(build(profile="custom", limit=10), ["--limit", "10"])
+        self.assertEqual(build(profile="custom", night=True), ["--night", "1"])
+        self.assertEqual(build(profile="custom", vlm_strict=True), ["--vlm-strict", "1"])
+
+    def test_batch_options_builder_rerun_backend_rules(self):
+        build = self.ns["build_annotation_photos_batch_options"]
+        self.assertEqual(
+            build(profile="custom", rerun_weak=True, rerun_weak_backend="local"),
+            ["--rerun-weak", "1", "--rerun-weak-backend", "local"],
+        )
+        self.assertEqual(
+            build(profile="custom", rerun_weak=True, rerun_weak_backend="remote"),
+            ["--rerun-weak", "1", "--rerun-weak-backend", "remote"],
+        )
+        self.assertEqual(build(profile="custom", rerun_weak=True, rerun_weak_backend="same"), WEAK_RERUN_OPTIONS)
+        with self.assertRaises(ValueError):
+            build(profile="custom", rerun_weak_backend="remote")
+        with self.assertRaises(ValueError):
+            build(profile="custom", rerun_weak=True, rerun_weak_backend="openai")
+
+    def test_batch_options_builder_rejects_invalid_reset_and_limit(self):
+        build = self.ns["build_annotation_photos_batch_options"]
+        with self.assertRaises(ValueError):
+            build(profile="custom", reset="reset_vlm reset_llm")
+        with self.assertRaises(ValueError):
+            build(profile="custom", limit=-1)
+
+    def test_validate_batch_options_rejects_direct_invalid_options(self):
+        validate = self.ns["validate_annotation_photos_batch_options"]
+        invalid_cases = [
+            ["--reset-vlm", "1", "--reset-llm", "1"],
+            ["--reset-vlm", "1", "--reset-vlm-plus", "1"],
+            ["--rerun-weak-backend", "remote"],
+            ["--rerun-weak", "1", "--rerun-weak-backend", "openai"],
+            ["--job-id", "abc"],
+            ["--limit", "10", "--limit", "10"],
+            ["--limit"],
+            ["--limit", "-1"],
+        ]
+        for options in invalid_cases:
+            with self.subTest(options=options):
+                with self.assertRaises(ValueError):
+                    validate(options)
+
+    def test_validate_batch_options_rejects_non_canonical_boolean_values(self):
+        validate = self.ns["validate_annotation_photos_batch_options"]
+        invalid_cases = [
+            ["--dry-run", "2"],
+            ["--reset-vlm", "2"],
+            ["--vlm-strict", "-1"],
+            ["--rerun-weak", "true"],
+            ["--only-new-dictee", "01"],
+        ]
+        for options in invalid_cases:
+            with self.subTest(options=options):
+                with self.assertRaises(ValueError):
+                    validate(options)
+
+    def test_validate_batch_options_zero_values_do_not_activate_flags(self):
+        validate = self.ns["validate_annotation_photos_batch_options"]
+        invalid_cases = [
+            ["--rerun-weak", "0", "--rerun-weak-backend", "remote"],
+            ["--reset-vlm", "1", "--reset-llm", "1"],
+            ["--limit", "-1"],
+        ]
+        for options in invalid_cases:
+            with self.subTest(options=options):
+                with self.assertRaises(ValueError):
+                    validate(options)
+        valid_cases = [
+            ["--reset-vlm", "0", "--reset-llm", "1"],
+            ["--reset-vlm", "1", "--reset-llm", "0"],
+            ["--limit", "0"],
+            ["--limit", "10"],
+        ]
+        for options in valid_cases:
+            with self.subTest(options=options):
+                validate(options)
+
+    def test_submit_rejects_direct_invalid_options(self):
+        invalid_cases = [
+            ["--reset-vlm", "1", "--reset-llm", "1"],
+            ["--reset-vlm", "1", "--reset-vlm-plus", "1"],
+            ["--rerun-weak-backend", "remote"],
+            ["--rerun-weak", "1", "--rerun-weak-backend", "openai"],
+            ["--job-id", "abc"],
+            ["--limit", "10", "--limit", "10"],
+            ["--limit"],
+            ["--limit", "-1"],
+        ]
+        for options in invalid_cases:
+            with self.subTest(options=options):
+                with self.assertRaises(ValueError):
+                    self.ns["submit_annotation_photos_batch_job"](
+                        id_affaire="2025-J47",
+                        id_captation="cap",
+                        infos_pcfixe=self.infos,
+                        action_key="custom",
+                        profile="custom",
+                        options=options,
+                        dry_run=True,
+                    )
+
+    def test_submit_accepts_valid_options_with_more_than_four_pairs(self):
+        options = [
+            "--reset-vlm", "1",
+            "--vlm-strict", "1",
+            "--night", "1",
+            "--only-new-dictee", "1",
+            "--dry-run", "1",
+            "--limit", "10",
+        ]
+        result = self.ns["submit_annotation_photos_batch_job"](
+            id_affaire="2025-J47",
+            id_captation="cap",
+            infos_pcfixe=self.infos,
+            action_key="custom",
+            profile="custom",
+            options=options,
+            dry_run=True,
+        )
+        self.assertEqual(result["job"]["options"], options)
+
+    def test_batch_job_preview_is_distinct_from_batch_dry_run_option(self):
+        result = self.ns["submit_annotation_photos_batch_job"](
+            id_affaire="2025-J47",
+            id_captation="cap",
+            infos_pcfixe=self.infos,
+            action_key="weak_dry_run",
+            dry_run=True,
+        )
+        self.assertEqual(result["status"], "dry-run")
+        self.assertEqual(result["job"]["options"], WEAK_DRY_RUN_OPTIONS)
+        self.assertFalse(list(self.ns["_queue_dir"].glob("*.json")))
+
+    def test_real_dry_run_job_is_tracked_in_queued_running_done_and_failed(self):
+        for status, folder in (
+            ("queued", "queued"),
+            ("running", "running"),
+            ("done", "done"),
+            ("failed", "failed"),
+        ):
+            with self.subTest(status=status):
+                for child in self.jobs.rglob("*.json"):
+                    child.unlink()
+                job_id = f"annotation_2025-J47_cap_rerun_weak_dry_run_20260724_120000_{status}"
+                payload = (
+                    self._manifest(job_id=job_id, options=list(WEAK_DRY_RUN_OPTIONS))
+                    if status == "done"
+                    else {
+                        "job_id": job_id,
+                        "type": "annotation_photos_batch",
+                        "status": status,
+                        "affaire": "2025-J47",
+                        "captation": "cap",
+                        "profile": "rerun_weak_dry_run",
+                        "options": list(WEAK_DRY_RUN_OPTIONS),
+                    }
+                )
+                self._write_job(payload, folder=folder)
+                details, diagnostics = self._details_level("light")
+                expected_status = "completed" if status == "done" else status
+                self.assertEqual(details["weak_dry_run"]["status"], expected_status)
+                self.assertEqual(details["weak_dry_run"]["job_id"], job_id)
+                ignored_reasons = " | ".join(str(item.get("reason", "")) for item in diagnostics.get("ignored", []))
+                self.assertNotIn("job dry-run", ignored_reasons)
+
+    def test_real_dry_run_submission_notice_is_resolved_from_tracking(self):
+        job_id = "annotation_2025-J47_cap_rerun_weak_dry_run_20260724_120000_queued"
+        self._write_job(
+            {
+                "job_id": job_id,
+                "type": "annotation_photos_batch",
+                "status": "queued",
+                "affaire": "2025-J47",
+                "captation": "cap",
+                "profile": "rerun_weak_dry_run",
+                "options": list(WEAK_DRY_RUN_OPTIONS),
+            },
+            folder="queued",
+        )
+        details, _ = self._details_level("light")
+        notice = self.ns["_annotation_resolve_batch_submission_notice"](
+            {
+                "id_affaire": "2025-J47",
+                "id_captation": "cap",
+                "action_key": "weak_dry_run",
+                "action_label": "weak dry",
+                "job_id": job_id,
+                "job_path": "queued.json",
+                "status": "queued",
+            },
+            details,
+            id_affaire="2025-J47",
+            id_captation="cap",
+        )
+        self.assertEqual(notice["status"], "queued")
+        self.assertEqual(details["weak_dry_run"]["status"], "queued")
+        action_state = self.ns["_annotation_batch_action_state"](details, "weak_dry_run")
+        self.assertFalse(action_state["can_submit"])
+
+    def test_batch_job_json_with_profile_and_custom_options(self):
+        options = self.ns["build_annotation_photos_batch_options"](
+            profile="custom",
+            rerun_weak=True,
+            rerun_weak_backend="remote",
+            limit=10,
+        )
+        result = self.ns["submit_annotation_photos_batch_job"](
+            id_affaire="2025-J47",
+            id_captation="cap",
+            infos_pcfixe=self.infos,
+            action_key="custom",
+            profile="custom",
+            options=options,
+            dry_run=True,
+        )
+        self.assertEqual(result["job"]["profile"], "custom")
+        self.assertEqual(result["job"]["options"], ["--rerun-weak", "1", "--rerun-weak-backend", "remote", "--limit", "10"])
+
+    def test_batch_profile_for_job_keeps_legacy_jobs_without_profile(self):
+        profile = self.ns["_annotation_batch_profile_for_job"]({"type": "annotation_photos_batch"}, ACTION_OPTIONS)
+        self.assertEqual(profile, "initial")
+        initial_with_limit = self.ns["_annotation_batch_profile_for_job"](
+            {"type": "annotation_photos_batch", "profile": "vlm_strict"},
+            ["--reset-vlm", "1", "--vlm-strict", "1", "--limit", "10"],
+        )
+        self.assertEqual(initial_with_limit, "initial")
+        custom = self.ns["_annotation_batch_profile_for_job"](
+            {"type": "annotation_photos_batch"},
+            ["--rerun-weak", "1", "--rerun-weak-backend", "remote", "--limit", "10"],
+        )
+        self.assertEqual(custom, "custom")
+
+    def test_batch_job_details_tracks_custom_public_options(self):
+        job_id = "annotation_2025-J47_cap_custom_20260724_120000_a"
+        options = ["--rerun-weak", "1", "--rerun-weak-backend", "remote", "--limit", "10"]
+        self._write_job(self._manifest(job_id=job_id, profile="custom", options=options), folder="done")
+        details, diagnostics = self._details()
+        self.assertEqual(details["custom"]["job_id"], job_id)
+        self.assertEqual(details["custom"]["options"], options)
+        ignored_reasons = " | ".join(str(item.get("reason", "")) for item in diagnostics.get("ignored", []))
+        self.assertNotIn("options batch inconnues", ignored_reasons)
 
     def test_modern_full_manifest_accepted(self):
         self._write_job(self._manifest())
