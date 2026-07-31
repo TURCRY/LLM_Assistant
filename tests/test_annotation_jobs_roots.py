@@ -50,6 +50,7 @@ def _load_annotation_network_functions():
                 "options": ["--reset-vlm", "1", "--vlm-strict", "1"],
             }
         },
+        "PHOTO_BATCH_PUBLISH_RETRY_KEY": "publish_retry",
         "NAS_AFFAIRES_ROOT": Path(r"\\192.168.1.20\Affaires"),
         "AFFAIRES_ROOT": r"C:\Affaires",
         "PCFIXE_AFFAIRES_SHARE_CANDIDATES": [],

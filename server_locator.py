@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import socket
 import time
+import traceback
+from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
 
@@ -15,15 +17,32 @@ DEFAULT_FLASK_ENDPOINTS = (
     "http://10.0.1.10:5050",
 )
 
-_CACHE_TTL_SECONDS = float(os.getenv("FLASK_ENDPOINT_CACHE_TTL", "60"))
+_CACHE_TTL_SECONDS = float(os.getenv("FLASK_ENDPOINT_CACHE_TTL", "20"))
 _PING_CONNECT_TIMEOUT = float(os.getenv("FLASK_PING_CONNECT_TIMEOUT", "1.5"))
 _PING_READ_TIMEOUT = float(os.getenv("FLASK_PING_READ_TIMEOUT", "5"))
 _cached_url: str | None = None
 _cached_until = 0.0
+_last_probe_results: list[dict] = []
+_resolution_stats = {
+    "call_count": 0,
+    "cache_hits": 0,
+    "total_probe_ms": 0,
+    "last_started_at": 0.0,
+    "last_duration_ms": 0,
+    "last_source": "",
+    "last_selected_url": "",
+    "last_stack": [],
+    "last_probes": [],
+}
 
 
 def _log(message: str) -> None:
     print(f"[server_locator] {message}")
+
+
+def _short_stack(limit: int = 4) -> list[str]:
+    frames = traceback.extract_stack(limit=limit + 3)[:-2]
+    return [f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}" for frame in frames[-limit:]]
 
 
 def _normalize_url(url: str) -> str:
@@ -33,6 +52,41 @@ def _normalize_url(url: str) -> str:
     if "://" not in url:
         url = "http://" + url
     return url.rstrip("/")
+
+
+def get_flask_resolution_diagnostics() -> dict:
+    return {
+        "cached_url": _cached_url or "",
+        "cached_until_monotonic": _cached_until,
+        "cache_ttl_seconds": _CACHE_TTL_SECONDS,
+        "call_count": _resolution_stats["call_count"],
+        "cache_hits": _resolution_stats["cache_hits"],
+        "total_probe_ms": _resolution_stats["total_probe_ms"],
+        "last_started_at": _resolution_stats["last_started_at"],
+        "last_duration_ms": _resolution_stats["last_duration_ms"],
+        "last_source": _resolution_stats["last_source"],
+        "last_selected_url": _resolution_stats["last_selected_url"],
+        "last_stack": list(_resolution_stats["last_stack"]),
+        "last_probes": [dict(item) for item in _resolution_stats["last_probes"]],
+    }
+
+
+def reset_flask_resolution_diagnostics() -> None:
+    global _last_probe_results
+    _last_probe_results = []
+    _resolution_stats.update(
+        {
+            "call_count": 0,
+            "cache_hits": 0,
+            "total_probe_ms": 0,
+            "last_started_at": 0.0,
+            "last_duration_ms": 0,
+            "last_source": "",
+            "last_selected_url": "",
+            "last_stack": [],
+            "last_probes": [],
+        }
+    )
 
 
 def _is_loopback(url: str) -> bool:
@@ -226,16 +280,35 @@ def resolve_flask_base_url(
     extra_candidates: Iterable[str] | None = None,
     timeout: float | tuple[float, float] | None = None,
 ) -> str:
-    global _cached_url, _cached_until
+    global _cached_url, _cached_until, _last_probe_results
     now = time.monotonic()
+    started = time.monotonic()
+    _resolution_stats["call_count"] += 1
+    _resolution_stats["last_started_at"] = time.time()
+    _resolution_stats["last_stack"] = _short_stack()
     if not force_refresh and _cached_url and now < _cached_until:
+        _resolution_stats["cache_hits"] += 1
+        _resolution_stats["last_duration_ms"] = int((time.monotonic() - started) * 1000)
+        _resolution_stats["last_source"] = "cache"
+        _resolution_stats["last_selected_url"] = _cached_url
+        _resolution_stats["last_probes"] = [dict(item) for item in _last_probe_results]
+        _log(f"cache hit #{_resolution_stats['call_count']} -> {_cached_url}")
         return _cached_url
 
     candidates = _candidate_urls(extra_candidates)
+    probes: list[dict] = []
     for url in candidates:
-        if ping_endpoint(url, timeout=timeout):
+        probe = probe_flask_endpoint(url, timeout=timeout)
+        probes.append(probe)
+        _resolution_stats["total_probe_ms"] += int(probe.get("elapsed_ms") or 0)
+        if probe.get("ok"):
             _cached_url = url
             _cached_until = now + _CACHE_TTL_SECONDS
+            _last_probe_results = [dict(item) for item in probes]
+            _resolution_stats["last_duration_ms"] = int((time.monotonic() - started) * 1000)
+            _resolution_stats["last_source"] = "probe"
+            _resolution_stats["last_selected_url"] = url
+            _resolution_stats["last_probes"] = [dict(item) for item in probes]
             _log(f"selected Flask endpoint: {url}")
             return url
 
@@ -244,6 +317,11 @@ def resolve_flask_base_url(
         fallback = _normalize_url(DEFAULT_FLASK_ENDPOINTS[0])
     _cached_url = fallback
     _cached_until = now + min(_CACHE_TTL_SECONDS, 5)
+    _last_probe_results = [dict(item) for item in probes]
+    _resolution_stats["last_duration_ms"] = int((time.monotonic() - started) * 1000)
+    _resolution_stats["last_source"] = "fallback"
+    _resolution_stats["last_selected_url"] = fallback
+    _resolution_stats["last_probes"] = [dict(item) for item in probes]
     _log(f"aucun endpoint n'a repondu correctement a /ping; conservation du serveur configure/detecte: {fallback}")
     return fallback
 
