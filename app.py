@@ -9582,6 +9582,29 @@ def _sha256_file(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+def _atomic_write_debrief_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with tmp.open("wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+        if os.name != "nt":
+            directory_fd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+def _atomic_write_debrief_json(path: Path, data: dict) -> None:
+    payload = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    _atomic_write_debrief_bytes(path, payload)
+
 def _read_csv_rows_with_dialect(path: Path) -> tuple[list[str], list[dict], str]:
     raw = path.read_text(encoding="utf-8-sig")
     sample = raw[:4096]
@@ -9604,6 +9627,7 @@ def build_debrief_global_csv(
     id_affaire: str,
     id_captation: str,
     allow_overwrite: bool = False,
+    create_timestamped_archive: bool = False,
 ) -> dict:
     selected = [Path(str(p).strip().strip('"')) for p in sources if str(p).strip()]
     if not selected:
@@ -9612,10 +9636,8 @@ def build_debrief_global_csv(
     if missing:
         raise FileNotFoundError("CSV de debrief introuvable(s) : " + ", ".join(missing))
 
-    output = Path(str(output_csv).strip().strip('"'))
-    if output.exists() and not allow_overwrite:
-        mtime = datetime.fromtimestamp(output.stat().st_mtime).isoformat(timespec="seconds")
-        raise FileExistsError(f"{output.name} existe déjà ({mtime}). Confirmer l’écrasement ou choisir une version horodatée.")
+    requested_output = Path(str(output_csv).strip().strip('"'))
+    output = requested_output.parent / "debrief_global.csv"
 
     expected_header: list[str] | None = None
     all_rows: list[dict] = []
@@ -9643,14 +9665,47 @@ def build_debrief_global_csv(
     if expected_header is None:
         raise ValueError("Aucun en-tête CSV exploitable.")
 
-    output.parent.mkdir(parents=True, exist_ok=True)
-    tmp = output.with_suffix(output.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=expected_header, delimiter=";", extrasaction="ignore")
-        writer.writeheader()
-        for row in all_rows:
-            writer.writerow({key: row.get(key, "") for key in expected_header})
-    os.replace(tmp, output)
+    buffer = io.StringIO(newline="")
+    writer = csv.DictWriter(buffer, fieldnames=expected_header, delimiter=";", extrasaction="ignore")
+    writer.writeheader()
+    for row in all_rows:
+        writer.writerow({key: row.get(key, "") for key in expected_header})
+    payload = buffer.getvalue().encode("utf-8")
+
+    existed_before = output.is_file()
+    old_bytes = output.read_bytes() if existed_before else b""
+    old_sha256 = hashlib.sha256(old_bytes).hexdigest() if existed_before else ""
+    old_mtime_ns = output.stat().st_mtime_ns if existed_before else None
+    new_sha256 = hashlib.sha256(payload).hexdigest()
+    content_changed = not existed_before or old_bytes != payload
+    archive_path: Path | None = None
+
+    if existed_before and content_changed and not (allow_overwrite or create_timestamped_archive):
+        mtime = datetime.fromtimestamp(output.stat().st_mtime).isoformat(timespec="seconds")
+        raise FileExistsError(f"{output.name} existe déjà ({mtime}). Confirmer l’écrasement ou créer une archive horodatée.")
+
+    if content_changed:
+        if create_timestamped_archive and existed_before:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_path = output.with_name(f"debrief_global_{stamp}.csv")
+            suffix = 1
+            while archive_path.exists():
+                archive_path = output.with_name(f"debrief_global_{stamp}_{suffix:02d}.csv")
+                suffix += 1
+            _atomic_write_debrief_bytes(archive_path, payload)
+        _atomic_write_debrief_bytes(output, payload)
+        if old_mtime_ns is not None and output.stat().st_mtime_ns <= old_mtime_ns:
+            current_ns = max(time.time_ns(), old_mtime_ns + 1)
+            os.utime(output, ns=(current_ns, current_ns))
+
+    final_stat = output.stat()
+    final_sha256 = _sha256_file(output)
+    if final_sha256 != new_sha256:
+        raise OSError(f"SHA-256 inattendu après publication atomique de {output}")
+    if content_changed and old_sha256 and final_sha256 == old_sha256:
+        raise OSError(f"Le contenu de {output} devait changer mais son SHA-256 est inchangé.")
+    if content_changed and old_mtime_ns is not None and final_stat.st_mtime_ns <= old_mtime_ns:
+        raise OSError(f"Le mtime de {output} n’a pas été actualisé.")
 
     manifest = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -9658,15 +9713,28 @@ def build_debrief_global_csv(
         "id_captation": id_captation,
         "output": output.name,
         "output_path": str(output),
+        "archive_path": str(archive_path) if archive_path else "",
+        "content_changed": content_changed,
+        "status": "updated" if content_changed else "unchanged",
+        "message": "contenu mis à jour" if content_changed else "contenu inchangé",
+        "sha256_before": old_sha256,
+        "sha256_after": final_sha256,
+        "mtime_before_ns": old_mtime_ns,
+        "mtime_after_ns": final_stat.st_mtime_ns,
+        "size_before": len(old_bytes) if existed_before else 0,
+        "size_after": final_stat.st_size,
         "format": {"encoding": "utf-8", "delimiter": ";"},
         "source_delimiters": delimiters,
         "sources": manifest_sources,
         "total_rows": len(all_rows),
     }
     manifest_path = output.with_suffix(".manifest.json")
-    tmp_manifest = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
-    tmp_manifest.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp_manifest, manifest_path)
+    _atomic_write_debrief_json(manifest_path, manifest)
+    if archive_path:
+        archive_manifest = dict(manifest)
+        archive_manifest["output"] = archive_path.name
+        archive_manifest["output_path"] = str(archive_path)
+        _atomic_write_debrief_json(archive_path.with_suffix(".manifest.json"), archive_manifest)
     manifest["manifest_path"] = str(manifest_path)
     return manifest
 
@@ -9727,14 +9795,15 @@ def update_infos_projet_debrief_global_csv(
     if not path.is_file():
         raise FileNotFoundError(f"infos_projet.json introuvable : {path}")
     global_path = Path(str(global_csv).strip().strip('"'))
-    if not global_path.is_file():
-        raise FileNotFoundError(f"CSV global de debrief introuvable : {global_path}")
+    canonical_path = global_path.parent / "debrief_global.csv"
+    if not canonical_path.is_file():
+        raise FileNotFoundError(f"CSV global canonique de debrief introuvable : {canonical_path}")
 
     infos = load_json(str(path), {})
     if not isinstance(infos, dict):
         raise ValueError(f"infos_projet.json invalide : {path}")
 
-    global_name = global_path.name
+    global_name = "debrief_global.csv"
     nas_csv = Path(str(nas_trans_dir).strip().strip('"')) / global_name
     pcfixe_csv = PCFIXE_AFFAIRES_ROOT / id_affaire / "AF_Expert_ASR" / "transcriptions" / id_captation / "debrief" / global_name
 
@@ -12908,9 +12977,6 @@ elif page == "Voxtral (ASR / CR)":
                 key="cr_debrief_global_overwrite",
             )
             effective_global_output_path = global_output_path
-            if output_exists and write_timestamped_global and not overwrite_debrief_global:
-                stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                effective_global_output_path = canonical_global_dir / f"debrief_global_{stamp}.csv"
             st.text_input(
                 "Destination du CSV global",
                 value=str(effective_global_output_path),
@@ -12948,7 +13014,8 @@ elif page == "Voxtral (ASR / CR)":
                         output_csv=effective_global_output_path,
                         id_affaire=cr_affaire_id,
                         id_captation=cr_id_captation,
-                        allow_overwrite=overwrite_debrief_global,
+                        allow_overwrite=overwrite_debrief_global or write_timestamped_global,
+                        create_timestamped_archive=output_exists and write_timestamped_global,
                     )
                     cr_infos = update_infos_projet_debrief_global_csv(
                         cr_infos_path,
@@ -12962,12 +13029,19 @@ elif page == "Voxtral (ASR / CR)":
                     cr_debrief = cr_infos.get("debrief", {}) if isinstance(cr_infos.get("debrief"), dict) else {}
                     debrief_resource = resolve_debrief_resource(cr_infos, cr_affaire_id)
                     debrief_sources_count = int(debrief_resource.get("sources_count") or 0)
-                    st.success("CSV global de debrief construit et inscrit dans infos_projet.json.")
+                    if manifest.get("content_changed"):
+                        st.success("CSV global de debrief construit et inscrit dans infos_projet.json.")
+                    else:
+                        st.info("CSV global de debrief : contenu inchangé, fichier canonique non réécrit.")
                     st.json({
                         "global_csv": cr_debrief.get("global_csv", ""),
                         "pcfixe_global_csv": cr_debrief.get("pcfixe_global_csv", ""),
                         "sources": cr_debrief.get("csv_sources", []),
                         "manifest": manifest.get("manifest_path", ""),
+                        "archive": manifest.get("archive_path", ""),
+                        "sha256_before": manifest.get("sha256_before", ""),
+                        "sha256_after": manifest.get("sha256_after", ""),
+                        "status": manifest.get("status", ""),
                     })
                 except Exception as e:
                     st.error(f"Construction du CSV global impossible : {e}")
