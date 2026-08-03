@@ -6784,6 +6784,50 @@ PHOTO_BATCH_PUBLIC_OPTIONS = {
 PHOTO_BATCH_BOOLEAN_OPTIONS = PHOTO_BATCH_PUBLIC_OPTIONS - {"--limit", "--rerun-weak-backend"}
 
 
+def validate_annotation_photos_batch_options(options: list[str]) -> None:
+    if not isinstance(options, list):
+        raise ValueError("Les options batch doivent être une liste.")
+    if len(options) % 2:
+        raise ValueError("Liste options batch incomplète.")
+    seen: dict[str, str] = {}
+    reset_count = 0
+    rerun_weak_enabled = False
+    weak_backend = "same"
+    for i in range(0, len(options), 2):
+        name = str(options[i])
+        value = str(options[i + 1])
+        if name not in PHOTO_BATCH_PUBLIC_OPTIONS:
+            raise ValueError(f"Option batch hors contrat public : {name}")
+        if name in seen:
+            raise ValueError(f"Option batch dupliquée : {name}")
+        seen[name] = value
+        if name == "--rerun-weak-backend":
+            if value not in PHOTO_BATCH_RERUN_WEAK_BACKENDS:
+                raise ValueError(f"Backend weak invalide : {value}")
+            weak_backend = value
+            continue
+        if name in PHOTO_BATCH_BOOLEAN_OPTIONS:
+            if value not in {"0", "1"}:
+                raise ValueError(f"Valeur booléenne attendue pour {name} : 0 ou 1.")
+            numeric_value = int(value)
+        elif name == "--limit":
+            if not re.fullmatch(r"\d+", value):
+                raise ValueError(f"Valeur numérique attendue pour {name}.")
+            numeric_value = int(value)
+        else:
+            raise ValueError(f"Valeur numérique attendue pour {name}.")
+        if name == "--limit" and numeric_value < 0:
+            raise ValueError("La limite ne peut pas être négative.")
+        if name == "--rerun-weak" and numeric_value == 1:
+            rerun_weak_enabled = True
+        if name in {"--reset-vlm", "--reset-llm", "--reset-vlm-plus"} and numeric_value:
+            reset_count += 1
+    if reset_count > 1:
+        raise ValueError("Utiliser un seul reset parmi --reset-vlm, --reset-llm et --reset-vlm-plus.")
+    if weak_backend != "same" and not rerun_weak_enabled:
+        raise ValueError("--rerun-weak-backend est interdit sans --rerun-weak 1.")
+
+
 def build_annotation_photos_batch_options(
     *,
     profile: str = "custom",
@@ -6918,50 +6962,6 @@ def _annotation_batch_profile_defaults(profile_key: str) -> dict:
     }
     defaults.update(dict(spec.get("defaults") or {}))
     return defaults
-
-
-def validate_annotation_photos_batch_options(options: list[str]) -> None:
-    if not isinstance(options, list):
-        raise ValueError("Les options batch doivent être une liste.")
-    if len(options) % 2:
-        raise ValueError("Liste options batch incomplète.")
-    seen: dict[str, str] = {}
-    reset_count = 0
-    rerun_weak_enabled = False
-    weak_backend = "same"
-    for i in range(0, len(options), 2):
-        name = str(options[i])
-        value = str(options[i + 1])
-        if name not in PHOTO_BATCH_PUBLIC_OPTIONS:
-            raise ValueError(f"Option batch hors contrat public : {name}")
-        if name in seen:
-            raise ValueError(f"Option batch dupliquée : {name}")
-        seen[name] = value
-        if name == "--rerun-weak-backend":
-            if value not in PHOTO_BATCH_RERUN_WEAK_BACKENDS:
-                raise ValueError(f"Backend weak invalide : {value}")
-            weak_backend = value
-            continue
-        if name in PHOTO_BATCH_BOOLEAN_OPTIONS:
-            if value not in {"0", "1"}:
-                raise ValueError(f"Valeur booléenne attendue pour {name} : 0 ou 1.")
-            numeric_value = int(value)
-        elif name == "--limit":
-            if not re.fullmatch(r"\d+", value):
-                raise ValueError(f"Valeur numérique attendue pour {name}.")
-            numeric_value = int(value)
-        else:
-            raise ValueError(f"Valeur numérique attendue pour {name}.")
-        if name == "--limit" and numeric_value < 0:
-            raise ValueError("La limite ne peut pas être négative.")
-        if name == "--rerun-weak" and numeric_value == 1:
-            rerun_weak_enabled = True
-        if name in {"--reset-vlm", "--reset-llm", "--reset-vlm-plus"} and numeric_value:
-            reset_count += 1
-    if reset_count > 1:
-        raise ValueError("Utiliser un seul reset parmi --reset-vlm, --reset-llm et --reset-vlm-plus.")
-    if weak_backend != "same" and not rerun_weak_enabled:
-        raise ValueError("--rerun-weak-backend est interdit sans --rerun-weak 1.")
 
 
 def _annotation_batch_options_are_public(options: list[str]) -> tuple[bool, str]:
