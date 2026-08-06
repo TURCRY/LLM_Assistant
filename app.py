@@ -168,6 +168,28 @@ PCFIXE_AFFAIRES_SHARE_CANDIDATES = (
     r"\\192.168.0.155\Affaires",
     r"\\10.0.1.10\Affaires",
 )
+
+
+def _pcfixe_affaires_share_candidates(vpn_active: bool | None = None) -> list[str]:
+    if vpn_active is None:
+        vpn_active = _pcfixe_vpn_active()
+    ordered = (
+        [r"\\10.0.1.10\Affaires", r"\\192.168.0.155\Affaires"]
+        if vpn_active
+        else list(PCFIXE_AFFAIRES_SHARE_CANDIDATES)
+    )
+    ordered.extend(PCFIXE_AFFAIRES_SHARE_CANDIDATES)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw_root in ordered:
+        key = str(raw_root or "").casefold()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(str(raw_root))
+    return out
+
+
 PCFIXE_SMB_TEST_TIMEOUT_SECONDS = float(os.getenv("PCFIXE_SMB_TEST_TIMEOUT_SECONDS", "2.5"))
 ANNOTATION_JOBS_DIAGNOSTIC_TTL_SECONDS = float(os.getenv("ANNOTATION_JOBS_DIAGNOSTIC_TTL_SECONDS", "45"))
 ANNOTATION_FILE_PROFILE_TTL_SECONDS = float(os.getenv("ANNOTATION_FILE_PROFILE_TTL_SECONDS", "45"))
@@ -396,7 +418,7 @@ def _annotation_list_json_candidates(
 def probe_pcfixe_affaires_shares(require_jobs_queue: bool = True) -> list[dict]:
     vpn_active = _pcfixe_vpn_active()
     rows: list[dict] = []
-    for raw_root in PCFIXE_AFFAIRES_SHARE_CANDIDATES:
+    for raw_root in _pcfixe_affaires_share_candidates(vpn_active):
         root = Path(raw_root)
         host = raw_root.strip("\\").split("\\", 1)[0]
         queue = root / "_jobs" / "queued"
@@ -531,6 +553,149 @@ def get_pcfixe_jobs_root() -> Path:
 def get_pcfixe_jobs_logs_dir() -> Path:
     root, _ = resolve_pcfixe_affaires_share(require_jobs_queue=True)
     return root / "_jobs" / "logs"
+
+
+def _safe_deepseek_job_token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("_")
+
+
+def build_deepseek_ocr_job_id_value(project_id_value: str, source_pdf_stem: str, stamp: str | None = None) -> str:
+    stamp = stamp or datetime.now().strftime("%Y%m%d_%H%M%S")
+    raw = f"deepseek_ocr_{project_id_value}_{source_pdf_stem}_{stamp}"
+    ascii_raw = unicodedata.normalize("NFKD", raw)
+    ascii_raw = "".join(ch for ch in ascii_raw if not unicodedata.combining(ch))
+    return _safe_deepseek_job_token(ascii_raw)
+
+
+def write_deepseek_ocr_job_manifest(job: dict, queued_dir: str | Path | None = None) -> str:
+    queued_path = Path(queued_dir) if queued_dir is not None else get_pcfixe_jobs_queued_dir()
+    queued_path.mkdir(parents=True, exist_ok=True)
+    preflight_pcfixe_target_dir(queued_path)
+    safe_job_id = _safe_deepseek_job_token(str((job or {}).get("job_id") or "deepseek_ocr_job")) or "deepseek_ocr_job"
+    target = queued_path / f"{safe_job_id}.json"
+    if target.exists():
+        target = queued_path / f"{safe_job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    tmp_path = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, target)
+    except Exception:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        raise
+    return str(target)
+
+
+def pcfixe_server_path_to_resolved_jobs_unc(path_value: str, jobs_root: str | Path | None = None) -> str:
+    raw = _norm(path_value)
+    prefix = _norm(r"C:\Affaires")
+    if raw.lower().startswith(prefix.lower()):
+        rel = raw[len(prefix):].strip("\\/ ")
+        root = Path(jobs_root).parent if jobs_root is not None else get_pcfixe_affaires_root()
+        return pj(str(root), rel)
+    return path_value or ""
+
+
+def find_deepseek_ocr_job_status_in_root(job_id: str, jobs_root: str | Path | None = None) -> dict:
+    result = {"job_id": job_id, "status": "introuvable", "job_path": "", "job": {}, "logs": []}
+    safe_job_id = _safe_deepseek_job_token(job_id)
+    if not safe_job_id:
+        return result
+    root = Path(jobs_root) if jobs_root is not None else get_pcfixe_jobs_root()
+    for status in ("queued", "running", "done", "failed"):
+        status_dir = root / status
+        try:
+            matches = sorted(status_dir.glob(f"{safe_job_id}*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        except Exception:
+            matches = []
+        if matches:
+            job_path = str(matches[0])
+            result.update({"status": status, "job_path": job_path, "job": load_json(job_path, {})})
+            break
+    logs_dir = root / "logs"
+    try:
+        result["logs"] = [str(p) for p in sorted(logs_dir.glob(f"*{safe_job_id}*"), key=lambda p: p.stat().st_mtime, reverse=True)]
+    except Exception:
+        result["logs"] = []
+    return result
+
+
+def discover_deepseek_ocr_jobs_for_project_in_root(project_id_value: str, jobs_root: str | Path | None = None) -> list[dict]:
+    jobs: list[dict] = []
+    root = Path(jobs_root) if jobs_root is not None else get_pcfixe_jobs_root()
+    for status in ("done", "queued", "running", "failed"):
+        status_dir = root / status
+        try:
+            candidates = list(status_dir.glob("deepseek_ocr*.json"))
+        except Exception:
+            candidates = []
+        for job_path in candidates:
+            job = load_json(str(job_path), {})
+            if (job.get("type") or "") != "deepseek_ocr":
+                continue
+            if (job.get("project_id") or "") != project_id_value:
+                continue
+            try:
+                mtime = job_path.stat().st_mtime
+            except Exception:
+                mtime = 0
+            jobs.append({
+                "job_id": str(job.get("job_id") or job_path.stem),
+                "status": status,
+                "job_path": str(job_path),
+                "job": job,
+                "mtime": mtime,
+            })
+    jobs.sort(key=lambda item: item.get("mtime") or 0, reverse=True)
+    return jobs
+
+
+def deepseek_ocr_follow_state(session_last_job: str, discovered_jobs: list[dict], last_submission: dict | None = None) -> dict:
+    session_last_job = str(session_last_job or "").strip()
+    discovered_jobs = list(discovered_jobs or [])
+    current_by_id = {str(item.get("job_id") or ""): item for item in discovered_jobs if str(item.get("job_id") or "")}
+    discovered_default = str(discovered_jobs[0].get("job_id") or "") if discovered_jobs else ""
+    if session_last_job:
+        if session_last_job in current_by_id:
+            return {
+                "job_id": session_last_job,
+                "state": str(current_by_id[session_last_job].get("status") or "retrouvé"),
+                "found": True,
+            }
+        return {
+            "job_id": session_last_job,
+            "state": "déposé_non_retrouvé",
+            "found": False,
+            "submission": dict(last_submission or {}),
+        }
+    if discovered_default:
+        return {
+            "job_id": discovered_default,
+            "state": str(discovered_jobs[0].get("status") or "retrouvé"),
+            "found": True,
+        }
+    return {"job_id": "", "state": "jamais_déposé", "found": False}
+
+
+def deepseek_ocr_jobs_diagnostic(jobs_root: str | Path | None = None) -> dict:
+    vpn_active = _pcfixe_vpn_active()
+    root = Path(jobs_root) if jobs_root is not None else get_pcfixe_jobs_root()
+    folders = {}
+    for name in ("queued", "running", "done", "failed"):
+        folder = root / name
+        ok, detail = _test_path_with_timeout(folder)
+        folders[name] = {"path": str(folder), "accessible": bool(ok), "detail": detail}
+    candidates = _pcfixe_affaires_share_candidates(vpn_active)
+    return {
+        "vpn_active": bool(vpn_active),
+        "jobs_root": str(root),
+        "candidates": [str(Path(raw) / "_jobs") for raw in candidates],
+        "authoritative_candidate": str(Path(r"\\10.0.1.10\Affaires") / "_jobs"),
+        "folders": folders,
+    }
 
 
 def get_nas_affaires_root() -> Path:
@@ -15303,7 +15468,10 @@ elif page == "Pré-traitement dépôt PDF":
         key=f"dire_bord_ocr_engine_{project_id}",
     )
     if str(ocr_engine or "").startswith("DeepSeekOCR"):
-        st.info("DeepSeekOCR est préparé en dry-run uniquement dans ce lot : aucun OCR n'est lancé.")
+        st.info(
+            "Le bouton “Analyser Dire/Bordereau” prépare et valide le job DeepSeekOCR sans le lancer. "
+            "Après cette préparation, utilisez le bouton “Déposer le job DeepSeekOCR PC fixe”."
+        )
 
     def _write_log_event(event: dict):
         try:
@@ -15680,11 +15848,7 @@ elif page == "Pré-traitement dépôt PDF":
         st.json(payload)
 
     def build_deepseek_ocr_job_id(project_id_value: str, source_pdf_stem: str) -> str:
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        raw = f"deepseek_ocr_{project_id_value}_{source_pdf_stem}_{stamp}"
-        ascii_raw = unicodedata.normalize("NFKD", raw)
-        ascii_raw = "".join(ch for ch in ascii_raw if not unicodedata.combining(ch))
-        return re.sub(r"[^A-Za-z0-9_.-]+", "_", ascii_raw).strip("_")
+        return build_deepseek_ocr_job_id_value(project_id_value, source_pdf_stem)
 
     def build_deepseek_ocr_job(project_id_value: str, paths_info: dict) -> dict:
         source_pdf = paths_info.get("pdf_pcfixe_server") or ""
@@ -15706,28 +15870,16 @@ elif page == "Pré-traitement dépôt PDF":
         }
 
     def pcfixe_jobs_queued_unc() -> str:
-        return str(get_pcfixe_affaires_root() / "_jobs" / "queued")
+        return str(get_pcfixe_jobs_queued_dir())
 
     def pcfixe_jobs_root_unc() -> str:
-        return str(get_pcfixe_affaires_root() / "_jobs")
+        return str(get_pcfixe_jobs_root())
 
     def write_deepseek_ocr_job(job: dict, queued_dir_unc: str) -> str:
-        queued_dir = Path(queued_dir_unc)
-        preflight_pcfixe_target_dir(queued_dir)
-        safe_job_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(job.get("job_id") or "deepseek_ocr_job")).strip("_")
-        target = queued_dir / f"{safe_job_id}.json"
-        if target.exists():
-            target = queued_dir / f"{safe_job_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        target.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
-        return str(target)
+        return write_deepseek_ocr_job_manifest(job, queued_dir_unc)
 
     def pcfixe_server_path_to_jobs_unc(path_value: str) -> str:
-        raw = _norm(path_value)
-        prefix = _norm(r"C:\Affaires")
-        if raw.lower().startswith(prefix.lower()):
-            rel = raw[len(prefix):].strip("\\/ ")
-            return pj(str(get_pcfixe_affaires_root()), rel)
-        return path_value or ""
+        return pcfixe_server_path_to_resolved_jobs_unc(path_value, pcfixe_jobs_root_unc())
 
     def _read_json_file_best_effort(path_value: str) -> dict:
         try:
@@ -15751,58 +15903,10 @@ elif page == "Pré-traitement dépôt PDF":
         return ""
 
     def find_deepseek_ocr_job_status(job_id: str) -> dict:
-        result = {"job_id": job_id, "status": "introuvable", "job_path": "", "job": {}, "logs": []}
-        safe_job_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(job_id or "")).strip("_")
-        if not safe_job_id:
-            return result
-
-        root = Path(pcfixe_jobs_root_unc())
-        for status in ("queued", "running", "done", "failed"):
-            status_dir = root / status
-            try:
-                matches = sorted(status_dir.glob(f"{safe_job_id}*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-            except Exception:
-                matches = []
-            if matches:
-                job_path = str(matches[0])
-                result.update({"status": status, "job_path": job_path, "job": _read_json_file_best_effort(job_path)})
-                break
-
-        logs_dir = root / "logs"
-        try:
-            result["logs"] = [str(p) for p in sorted(logs_dir.glob(f"*{safe_job_id}*"), key=lambda p: p.stat().st_mtime, reverse=True)]
-        except Exception:
-            result["logs"] = []
-        return result
+        return find_deepseek_ocr_job_status_in_root(job_id, pcfixe_jobs_root_unc())
 
     def discover_deepseek_ocr_jobs_for_project(project_id_value: str) -> list[dict]:
-        jobs: list[dict] = []
-        root = Path(pcfixe_jobs_root_unc())
-        for status in ("done", "queued", "running", "failed"):
-            status_dir = root / status
-            try:
-                candidates = list(status_dir.glob("deepseek_ocr*.json"))
-            except Exception:
-                candidates = []
-            for job_path in candidates:
-                job = _read_json_file_best_effort(str(job_path))
-                if (job.get("type") or "") != "deepseek_ocr":
-                    continue
-                if (job.get("project_id") or "") != project_id_value:
-                    continue
-                try:
-                    mtime = job_path.stat().st_mtime
-                except Exception:
-                    mtime = 0
-                jobs.append({
-                    "job_id": str(job.get("job_id") or job_path.stem),
-                    "status": status,
-                    "job_path": str(job_path),
-                    "job": job,
-                    "mtime": mtime,
-                })
-        jobs.sort(key=lambda item: item.get("mtime") or 0, reverse=True)
-        return jobs
+        return discover_deepseek_ocr_jobs_for_project_in_root(project_id_value, pcfixe_jobs_root_unc())
 
     def load_deepseek_ocr_done_result(job_status: dict) -> dict:
         job = job_status.get("job") or {}
@@ -16231,6 +16335,7 @@ elif page == "Pré-traitement dépôt PDF":
             deepseek_last_result_key,
             deepseek_last_job_key,
             deepseek_last_job_signature_key,
+            deepseek_last_submission_key,
             deepseek_follow_job_widget_key,
             f"deepseek_ocr_preview_{project_id}",
             f"dire_bord_ocr_preview_{project_id}",
@@ -16266,6 +16371,7 @@ elif page == "Pré-traitement dépôt PDF":
     deepseek_last_job_key = f"deepseek_ocr_last_job_id_{project_id}"
     deepseek_last_result_key = f"deepseek_ocr_last_result_{project_id}"
     deepseek_last_job_signature_key = f"deepseek_ocr_last_job_signature_{project_id}"
+    deepseek_last_submission_key = f"deepseek_ocr_last_submission_{project_id}"
     deepseek_follow_job_widget_key = f"deepseek_ocr_follow_job_id_{project_id}"
     ocr_signature_key = f"dire_bord_ocr_signature_{project_id}"
     ocr_result_key = f"dire_bord_ocr_result_{project_id}"
@@ -16290,6 +16396,28 @@ elif page == "Pré-traitement dépôt PDF":
         clear_dire_bord_ocr_state("Résultat OCR courant réinitialisé.", mark_reset=True)
         st.session_state[ocr_signature_key] = ocr_current_signature
 
+    if ocr_engine == "DeepSeekOCR avancé":
+        with st.expander("Diagnostic DeepSeekOCR VPN / jobs", expanded=False):
+            try:
+                diag = deepseek_ocr_jobs_diagnostic()
+                st.write("VPN détecté :", "oui" if diag.get("vpn_active") else "non")
+                st.write("Racine _jobs retenue :", diag.get("jobs_root") or "")
+                st.write("Candidat autoritaire :", diag.get("authoritative_candidate") or "")
+                st.write("Candidats essayés :", diag.get("candidates") or [])
+                folder_rows = [
+                    {
+                        "dossier": name,
+                        "chemin": info.get("path") or "",
+                        "accessible": "oui" if info.get("accessible") else "non",
+                        "détail": info.get("detail") or "",
+                    }
+                    for name, info in (diag.get("folders") or {}).items()
+                ]
+                if folder_rows:
+                    st.dataframe(prepare_df_for_streamlit_display(folder_rows), width="stretch", hide_index=True)
+            except Exception as exc:
+                st.warning(f"Diagnostic _jobs indisponible : {exc}")
+
     if str(ocr_engine or "").startswith("DeepSeekOCR"):
         existing_deepseek_dry_run = st.session_state.get(deepseek_state_key)
         if existing_deepseek_dry_run and not deepseek_dry_run_matches_current(existing_deepseek_dry_run, deepseek_current_signature):
@@ -16297,7 +16425,7 @@ elif page == "Pré-traitement dépôt PDF":
             st.session_state.pop(deepseek_last_result_key, None)
             st.caption("Dry-run DeepSeekOCR precedent ignore : la selection courante a change.")
     if ocr_engine == "DeepSeekOCR avancé" and st.session_state.get(deepseek_state_key):
-        st.markdown("#### Job PC fixe DeepSeekOCR")
+        st.markdown("#### Dépôt réel du job DeepSeekOCR PC fixe")
         queued_dir_unc = pcfixe_jobs_queued_unc()
         for item in st.session_state.get(deepseek_state_key, []):
             st.markdown(f"### {item['type'].capitalize()}")
@@ -16327,17 +16455,35 @@ elif page == "Pré-traitement dépôt PDF":
                         raise RuntimeError(availability["error"])
                     job = build_deepseek_ocr_job(project_id, paths_info)
                     created_path = write_deepseek_ocr_job(job, queued_dir_unc)
-                    created_jobs.append({"job_id": job["job_id"], "json_path": created_path, "job": job, "availability": availability})
+                    created = {
+                        "job_id": job["job_id"],
+                        "jobs_root": pcfixe_jobs_root_unc(),
+                        "queued_dir": queued_dir_unc,
+                        "json_path": created_path,
+                        "job": job,
+                        "availability": availability,
+                        "submitted_at": datetime.now().isoformat(timespec="seconds"),
+                    }
+                    st.session_state[deepseek_last_job_key] = created["job_id"]
+                    st.session_state[deepseek_last_job_signature_key] = ocr_current_signature
+                    st.session_state[deepseek_follow_job_widget_key] = created["job_id"]
+                    st.session_state[deepseek_last_submission_key] = created
+                    created_jobs.append(created)
             except Exception as exc:
                 st.error(f"Dépôt du job DeepSeekOCR impossible : {exc}")
             else:
                 st.success(f"{len(created_jobs)} job(s) DeepSeekOCR déposé(s) dans la queue PC fixe.")
-                st.info("Rappel : le spooler DeepSeekOCR PC fixe est actuellement validé en simulation côté draft.")
                 for created in created_jobs:
-                    st.session_state[deepseek_last_job_key] = created["job_id"]
-                    st.session_state[deepseek_last_job_signature_key] = ocr_current_signature
+                    known_status = find_deepseek_ocr_job_status(created["job_id"])
                     st.write("job_id :", created["job_id"])
-                    st.write("JSON créé :", created["json_path"])
+                    st.write("Racine _jobs utilisée :", created["jobs_root"])
+                    st.write("Manifest déposé :", created["json_path"])
+                    st.write("État connu :", known_status.get("status") or "introuvable")
+                    if known_status.get("status") == "introuvable":
+                        st.warning(
+                            "Le manifest vient d'être écrit mais le scan immédiat ne le retrouve pas encore "
+                            "dans queued/running/done/failed. L'identifiant est conservé pour le prochain contrôle."
+                        )
                     st.json(created["job"])
 
     if ocr_engine == "DeepSeekOCR avancé":
@@ -16365,7 +16511,11 @@ elif page == "Pré-traitement dépôt PDF":
         discovered_default = discovered_jobs[0]["job_id"] if discovered_jobs else ""
         session_last_job = st.session_state.get(deepseek_last_job_key) or ""
         current_job_ids = {item["job_id"] for item in discovered_jobs}
-        last_job_default = session_last_job if session_last_job in current_job_ids else discovered_default
+        last_submission = st.session_state.get(deepseek_last_submission_key) or {}
+        follow_state = deepseek_ocr_follow_state(session_last_job, discovered_jobs, last_submission)
+        last_job_default = follow_state.get("job_id") or discovered_default
+        if follow_state.get("state") == "jamais_déposé" and not last_submission:
+            st.info("État DeepSeekOCR : aucun job encore déposé pour cette sélection.")
         selected_job_from_dropdown = ""
         if discovered_jobs:
             labels = [
@@ -16397,9 +16547,10 @@ elif page == "Pré-traitement dépôt PDF":
         if (
             st.session_state.get(deepseek_follow_job_widget_key)
             and st.session_state.get(deepseek_follow_job_widget_key) not in current_job_ids
+            and not session_last_job
         ):
             st.session_state[deepseek_follow_job_widget_key] = last_job_default
-        if session_last_job and session_last_job in current_job_ids:
+        if session_last_job:
             st.session_state[deepseek_follow_job_widget_key] = session_last_job
             last_job_default = session_last_job
         last_job_id = st.text_input(
@@ -16409,6 +16560,16 @@ elif page == "Pré-traitement dépôt PDF":
         )
         if selected_job_from_dropdown:
             last_job_id = selected_job_from_dropdown
+        if follow_state.get("state") == "déposé_non_retrouvé":
+            st.warning(
+                "État DeepSeekOCR : job déposé, mais non encore retrouvé dans queued/running/done/failed "
+                "sur la racine _jobs actuellement résolue."
+            )
+            if last_submission:
+                st.write("Racine _jobs utilisée au dépôt :", last_submission.get("jobs_root") or "")
+                st.write("Manifest déposé :", last_submission.get("json_path") or "")
+        elif follow_state.get("found"):
+            st.info(f"État DeepSeekOCR : {follow_state.get('state') or 'retrouvé'}.")
         if st.button("Vérifier le résultat DeepSeekOCR", key=f"check_deepseek_ocr_result_{project_id}"):
             status = find_deepseek_ocr_job_status(last_job_id)
             st.write("job_id :", status.get("job_id") or "")
@@ -16587,19 +16748,47 @@ elif page == "Pré-traitement dépôt PDF":
                 "lang": "fra",
                 "dpi": 300,
             }
-            r_ocr = requests.post(
-                f"{SERVER_URL}/ocr",
-                headers={"x-api-key": API_KEY},
-                json=payload_ocr,
-                timeout=900
-            )
-            if r_ocr.headers.get("Content-Type", "").startswith("application/json"):
-                data_ocr = r_ocr.json()
+            ocr_url = f"{SERVER_URL}/ocr"
+            input_exists = ""
+            try:
+                input_exists = "oui" if Path(pdf_path_pc).exists() else "non"
+            except Exception as exc:
+                input_exists = f"inconnu ({type(exc).__name__}: {exc})"
+            try:
+                r_ocr = requests.post(
+                    ocr_url,
+                    headers={"x-api-key": API_KEY},
+                    json=payload_ocr,
+                    timeout=900
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    "OCR standard / Tesseract impossible : "
+                    f"url={ocr_url} ; input_path={pdf_path_pc} ; existence laptop={input_exists} ; erreur={exc}"
+                ) from exc
+            content_type = r_ocr.headers.get("Content-Type", "")
+            if content_type.startswith("application/json"):
+                try:
+                    data_ocr = r_ocr.json()
+                except Exception as exc:
+                    raise RuntimeError(
+                        "OCR standard / Tesseract : réponse JSON illisible ; "
+                        f"url={ocr_url} ; HTTP={r_ocr.status_code} ; input_path={pdf_path_pc} ; "
+                        f"existence laptop={input_exists} ; erreur={exc}"
+                    ) from exc
             else:
-                raise RuntimeError(f"OCR: réponse non-JSON (HTTP {r_ocr.status_code})")
+                raise RuntimeError(
+                    "OCR standard / Tesseract : réponse non-JSON ; "
+                    f"url={ocr_url} ; HTTP={r_ocr.status_code} ; input_path={pdf_path_pc} ; "
+                    f"existence laptop={input_exists} ; réponse={r_ocr.text[:1000]}"
+                )
 
-            if data_ocr.get("error"):
-                raise RuntimeError(data_ocr["error"])
+            if r_ocr.status_code < 200 or r_ocr.status_code >= 300 or data_ocr.get("error"):
+                raise RuntimeError(
+                    "OCR standard / Tesseract refusé par Flask ; "
+                    f"url={ocr_url} ; HTTP={r_ocr.status_code} ; input_path={pdf_path_pc} ; "
+                    f"existence laptop={input_exists} ; réponse={json.dumps(data_ocr, ensure_ascii=False)[:1000]}"
+                )
 
             # /ocr renvoie typiquement csv_path / docx_path
             csv_path = data_ocr.get("csv_path") or ""
