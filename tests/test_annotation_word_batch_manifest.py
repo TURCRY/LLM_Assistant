@@ -29,8 +29,19 @@ def _load_annotation_functions():
         "_infos_declared_path",
         "_annotation_localize_pcfixe_job_path",
         "_annotation_prepare_batch_runtime_infos",
+        "_annotation_sync_captation_session_state",
+        "_annotation_clear_captation_session_state",
+        "_annotation_sync_active_scope_state",
+        "assert_annotation_paths_match_captation",
+        "_annotation_pcfixe_required_resources",
+        "_annotation_nas_required_resources",
+        "_annotation_laptop_config_resources",
+        "_annotation_sync_configs_from_nas_to_laptop",
+        "_annotation_batch_resource_plan",
+        "_assert_annotation_nas_resources_ready",
         "_annotation_resolve_batch_submission_notice",
         "_annotation_cache_prune",
+        "_annotation_clear_runtime_caches",
         "_annotation_perf_begin",
         "_annotation_perf_end",
         "_annotation_list_json_candidates",
@@ -76,6 +87,7 @@ def _load_annotation_functions():
         "csv": csv,
         "json": json,
         "os": os,
+        "shutil": shutil,
         "time": time,
         "uuid": uuid,
         "datetime": datetime,
@@ -217,7 +229,6 @@ def _load_annotation_functions():
             "_safe_job_token": lambda value: re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip()).strip("_") or "na",
             "_job_failure_details": lambda job_id: {},
             "get_pcfixe_jobs_queued_dir": lambda: ns["_queue_dir"],
-            "_assert_annotation_pcfixe_resources_ready": lambda *args, **kwargs: {},
             "preflight_pcfixe_target_dir": lambda *args, **kwargs: {},
             "_annotation_canonical_paths": lambda affaire, captation: ns["_paths"],
             "get_pcfixe_affaires_root": lambda: Path(r"\\10.0.1.10\Affaires"),
@@ -256,11 +267,14 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
         self.ns["PCFIXE_AFFAIRES_ROOT"] = self.pcfixe_root
         self.ns["NAS_AFFAIRES_ROOT"] = Path(r"\\192.168.1.20\Affaires")
         self.paths = {
+            "nas_trans_dir": self.infos.parent,
             "nas_photos": self.photos,
             "nas_photos_batch": self.batch,
             "nas_infos": self.infos,
             "nas_report_dir": self.base / "nas" / "compte_rendu_LLM",
             "nas_report_out_dir": self.base / "nas" / "compte_rendu_LLM" / "out",
+            "laptop_trans_dir": self.base / "laptop" / "2025-J47" / "AF_Expert_ASR" / "transcriptions" / "cap",
+            "laptop_infos": self.base / "laptop" / "2025-J47" / "AF_Expert_ASR" / "transcriptions" / "cap" / "infos_projet.json",
             "pcfixe_trans_dir": self.pcfixe_root / "2025-J47" / "AF_Expert_ASR" / "transcriptions" / "cap",
             "pcfixe_unc_trans_dir": self.base / "pcfixe_unc" / "2025-J47" / "AF_Expert_ASR" / "transcriptions" / "cap",
             "pcfixe_infos": self.pcfixe_root / "2025-J47" / "AF_Expert_ASR" / "transcriptions" / "cap" / "infos_projet.json",
@@ -269,6 +283,16 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
             "pcfixe_photos": self.pcfixe_root / "2025-J47" / "AE_Expert_captations" / "cap" / "photos" / "photos.csv",
             "pcfixe_photos_batch": self.pcfixe_root / "2025-J47" / "AE_Expert_captations" / "cap" / "photos" / "photos_batch.csv",
         }
+        self.paths["pcfixe_unc_photos"] = self.paths["pcfixe_photos"]
+        self.paths["pcfixe_unc_photos_batch"] = self.paths["pcfixe_photos_batch"]
+        for filename in (
+            "config_llm.json",
+            "prompt_gpt.json",
+            "prompt_gpt_batch_only.json",
+            "contexte_general.json",
+            "contexte_general_photos.json",
+        ):
+            (self.paths["nas_trans_dir"] / filename).write_text("{}", encoding="utf-8")
         self.paths["pcfixe_photos"].parent.mkdir(parents=True, exist_ok=True)
         self.paths["pcfixe_trans_dir"].mkdir(parents=True, exist_ok=True)
         self.paths["pcfixe_unc_trans_dir"].mkdir(parents=True, exist_ok=True)
@@ -555,6 +579,8 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
         )
         self.assertEqual(result["status"], "dry-run")
         self.assertEqual(result["job"]["options"], WEAK_DRY_RUN_OPTIONS)
+        self.assertEqual(result["job"]["laptop_config_sync"], [])
+        self.assertFalse(self.paths["laptop_trans_dir"].exists())
         self.assertFalse(list(self.ns["_queue_dir"].glob("*.json")))
 
     def test_real_dry_run_job_is_tracked_in_queued_running_done_and_failed(self):
@@ -1069,20 +1095,11 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
         self.assertEqual(len(queued_files), 1)
         self.assertEqual(queued_files[0].name, f"{result['job_id']}.json")
         runtime_infos = self.paths["pcfixe_unc_trans_dir"] / "_runtime_jobs" / f"infos_projet_runtime_{result['job_id']}.json"
-        self.assertTrue(runtime_infos.is_file())
+        self.assertFalse(runtime_infos.exists())
 
-    def test_runtime_infos_localize_unc_paths_to_pcfixe_mirror(self):
-        self.infos.write_text(
-            json.dumps(
-                {
-                    "fichier_photos": r"\\192.168.1.20\Affaires\2025-J47\AE_Expert_captations\cap\photos\photos.csv",
-                    "fichier_photos_batch": r"\\192.168.1.20\Affaires\2025-J47\AE_Expert_captations\cap\photos\photos_batch.csv",
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
+    def test_submit_allows_pcfixe_staging_absent_and_describes_resources(self):
+        self.paths["pcfixe_photos"].unlink()
+        self.paths["pcfixe_photos_batch"].unlink()
         result = self.ns["submit_annotation_photos_batch_job"](
             id_affaire="2025-J47",
             id_captation="cap",
@@ -1091,13 +1108,304 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
             dry_run=False,
         )
         queued_job = json.loads((self.ns["_queue_dir"] / f"{result['job_id']}.json").read_text(encoding="utf-8"))
+        resources = {item["logical_name"]: item for item in queued_job["required_resources"]}
+        self.assertEqual(set(resources), {
+            "infos_projet.json",
+            "config_llm.json",
+            "prompt_gpt.json",
+            "prompt_gpt_batch_only.json",
+            "contexte_general.json",
+            "contexte_general_photos.json",
+            "photos.csv",
+            "photos_batch.csv",
+        })
+        self.assertTrue(all(item["nas_present"] for item in resources.values()))
+        self.assertTrue(all(item["sha256"] for item in resources.values()))
+        self.assertTrue(all(item["size"] is not None for item in resources.values()))
+        self.assertEqual(resources["photos.csv"]["status"], "staging requis par le spooler")
+        self.assertEqual(resources["photos.csv"]["nas_source"], str(self.photos))
+        self.assertEqual(resources["photos.csv"]["pcfixe_target"], str(self.paths["pcfixe_photos"]))
+        self.assertEqual(queued_job["infos_projet_source"], str(self.infos))
+        self.assertEqual(queued_job["infos_projet"], str(self.paths["pcfixe_infos"]))
         self.assertEqual(queued_job["fichier_photos"], str(self.paths["pcfixe_photos"]))
         self.assertEqual(queued_job["fichier_photos_batch"], str(self.paths["pcfixe_photos_batch"]))
-        runtime_infos = json.loads(
-            (self.paths["pcfixe_unc_trans_dir"] / "_runtime_jobs" / f"infos_projet_runtime_{result['job_id']}.json").read_text(encoding="utf-8")
+        sync = {item["logical_name"]: item for item in queued_job["laptop_config_sync"]}
+        self.assertEqual(set(sync), {
+            "infos_projet.json",
+            "config_llm.json",
+            "prompt_gpt.json",
+            "prompt_gpt_batch_only.json",
+        })
+        self.assertTrue(all(item["status"] == "copied" for item in sync.values()))
+        self.assertEqual(
+            (self.paths["laptop_trans_dir"] / "prompt_gpt.json").read_bytes(),
+            (self.paths["nas_trans_dir"] / "prompt_gpt.json").read_bytes(),
         )
-        self.assertEqual(runtime_infos["pcfixe"]["fichier_photos"], str(self.paths["pcfixe_photos"]))
-        self.assertEqual(runtime_infos["pcfixe"]["fichier_photos_batch"], str(self.paths["pcfixe_photos_batch"]))
+        self.assertFalse(self.paths["pcfixe_photos"].exists())
+        self.assertFalse(self.paths["pcfixe_photos_batch"].exists())
+
+    def test_config_sync_reports_identical_then_refreshes_changed_target(self):
+        first = self.ns["submit_annotation_photos_batch_job"](
+            id_affaire="2025-J47",
+            id_captation="cap",
+            infos_pcfixe=self.infos,
+            action_key="initial",
+            dry_run=False,
+        )
+        self.assertTrue(all(item["status"] == "copied" for item in first["job"]["laptop_config_sync"]))
+
+        second = self.ns["submit_annotation_photos_batch_job"](
+            id_affaire="2025-J47",
+            id_captation="cap",
+            infos_pcfixe=self.infos,
+            action_key="initial",
+            dry_run=False,
+        )
+        self.assertTrue(all(item["status"] == "already_identical" for item in second["job"]["laptop_config_sync"]))
+
+        laptop_prompt = self.paths["laptop_trans_dir"] / "prompt_gpt.json"
+        laptop_prompt.write_text('{"stale": true}', encoding="utf-8")
+        third = self.ns["submit_annotation_photos_batch_job"](
+            id_affaire="2025-J47",
+            id_captation="cap",
+            infos_pcfixe=self.infos,
+            action_key="initial",
+            dry_run=False,
+        )
+        statuses = {item["logical_name"]: item["status"] for item in third["job"]["laptop_config_sync"]}
+        self.assertEqual(statuses["prompt_gpt.json"], "refreshed")
+        self.assertEqual(laptop_prompt.read_bytes(), (self.paths["nas_trans_dir"] / "prompt_gpt.json").read_bytes())
+
+    def test_config_copy_failure_blocks_queue_submission(self):
+        target = self.paths["laptop_trans_dir"] / "config_llm.json"
+        target.mkdir(parents=True)
+        with self.assertRaisesRegex(OSError, "config_llm.json"):
+            self.ns["submit_annotation_photos_batch_job"](
+                id_affaire="2025-J47",
+                id_captation="cap",
+                infos_pcfixe=self.infos,
+                action_key="initial",
+                dry_run=False,
+            )
+        self.assertFalse(list(self.ns["_queue_dir"].glob("*.json")))
+
+    def test_submit_blocks_when_required_nas_resource_is_missing(self):
+        (self.paths["nas_trans_dir"] / "prompt_gpt.json").unlink()
+        with self.assertRaisesRegex(FileNotFoundError, "prompt_gpt.json"):
+            self.ns["submit_annotation_photos_batch_job"](
+                id_affaire="2025-J47",
+                id_captation="cap",
+                infos_pcfixe=self.infos,
+                action_key="initial",
+                dry_run=False,
+            )
+        self.assertFalse(list(self.ns["_queue_dir"].glob("*.json")))
+
+    def test_captation_session_state_drops_previous_affaire_values(self):
+        state = {
+            "ann_photos_captation_affaire": "2025-J46",
+            "ann_photos_id_captation_select": "ancienne-captation",
+            "ann_photos_id_captation_manual": "ancienne-manuelle",
+            "ann_photos_last_batch_submission": {"job_id": "old"},
+        }
+        self.ns["_annotation_sync_captation_session_state"](
+            state,
+            id_affaire="2025-J47",
+            captation_options=["captation-j47"],
+        )
+        self.assertEqual(state["ann_photos_id_captation_select"], "captation-j47")
+        self.assertNotIn("ann_photos_id_captation_manual", state)
+        self.assertNotIn("ann_photos_last_batch_submission", state)
+
+        state["ann_photos_id_captation_select"] = "captation-retirée"
+        self.ns["_annotation_sync_captation_session_state"](
+            state,
+            id_affaire="2025-J47",
+            captation_options=["nouvelle-captation-j47"],
+        )
+        self.assertEqual(state["ann_photos_id_captation_select"], "nouvelle-captation-j47")
+
+    def test_same_affaire_captation_change_refreshes_resources_job_and_word_preflight(self):
+        affaire = "2026-A60"
+        old_captation = "accedit-2026-05-21"
+        new_captation = "accedit-2026-06-17"
+        state = {
+            "ann_photos_captation_affaire": affaire,
+            "ann_photos_selection_scope": f"{affaire}|{old_captation}",
+            "ann_photos_active_scope": f"{affaire}|{old_captation}",
+            "ann_photos_id_captation_select": old_captation,
+            "ann_photos_infos_manual": rf"C:\Affaires\{affaire}\AF_Expert_ASR\transcriptions\{old_captation}\infos_projet.json",
+            "ann_photos_canonical_dir": rf"C:\Affaires\{affaire}\AF_Expert_ASR\transcriptions\{old_captation}",
+            "ann_photos_pcfixe_infos": rf"C:\Affaires\{affaire}\AF_Expert_ASR\transcriptions\{old_captation}\infos_projet.json",
+            "ann_photos_last_batch_submission": {"id_captation": old_captation, "job_id": "old"},
+        }
+
+        self.ns["_annotation_sync_captation_session_state"](
+            state,
+            id_affaire=affaire,
+            captation_options=[old_captation, new_captation],
+            preferred_captation=new_captation,
+        )
+        scope, changed = self.ns["_annotation_sync_active_scope_state"](
+            state,
+            id_affaire=affaire,
+            id_captation=state["ann_photos_id_captation_select"],
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(scope, f"{affaire}|{new_captation}")
+        self.assertEqual(state["ann_photos_id_captation_select"], new_captation)
+        self.assertNotIn(old_captation, json.dumps(state, ensure_ascii=False))
+
+        affaire_root = self.base / "Affaires" / affaire
+        trans_dir = affaire_root / "AF_Expert_ASR" / "transcriptions" / new_captation
+        photos_dir = affaire_root / "AE_Expert_captations" / new_captation / "photos"
+        pcfixe_root = self.base / "pcfixe" / "Affaires" / affaire
+        pcfixe_trans_dir = pcfixe_root / "AF_Expert_ASR" / "transcriptions" / new_captation
+        pcfixe_photos_dir = pcfixe_root / "AE_Expert_captations" / new_captation / "photos"
+        trans_dir.mkdir(parents=True)
+        photos_dir.mkdir(parents=True)
+        pcfixe_trans_dir.mkdir(parents=True)
+        pcfixe_photos_dir.mkdir(parents=True)
+        infos = trans_dir / "infos_projet.json"
+        photos = photos_dir / "photos.csv"
+        batch = photos_dir / "photos_batch.csv"
+        infos.write_text("{}", encoding="utf-8")
+        photos.write_text("photo_rel_native;nom_fichier_image\np1;P1.JPG\n", encoding="utf-8")
+        batch.write_text(
+            "photo_rel_native;batch_status;batch_id;batch_ts\np1;OK;b1;2026-08-05T11:49:54\n",
+            encoding="utf-8",
+        )
+        for filename in (
+            "config_llm.json",
+            "prompt_gpt.json",
+            "prompt_gpt_batch_only.json",
+            "contexte_general.json",
+            "contexte_general_photos.json",
+        ):
+            (trans_dir / filename).write_text("{}", encoding="utf-8")
+
+        paths = {
+            "nas_trans_dir": trans_dir,
+            "nas_infos": infos,
+            "nas_photos": photos,
+            "nas_photos_batch": batch,
+            "laptop_trans_dir": trans_dir,
+            "laptop_infos": infos,
+            "pcfixe_trans_dir": pcfixe_trans_dir,
+            "pcfixe_infos": pcfixe_trans_dir / "infos_projet.json",
+            "pcfixe_unc_trans_dir": pcfixe_trans_dir,
+            "pcfixe_unc_infos": pcfixe_trans_dir / "infos_projet.json",
+            "pcfixe_photos": pcfixe_photos_dir / "photos.csv",
+            "pcfixe_photos_batch": pcfixe_photos_dir / "photos_batch.csv",
+            "pcfixe_unc_photos": pcfixe_photos_dir / "photos.csv",
+            "pcfixe_unc_photos_batch": pcfixe_photos_dir / "photos_batch.csv",
+            "nas_report_dir": affaire_root / "BE_Traitement_captations" / new_captation / "compte_rendu_LLM",
+            "nas_report_out_dir": affaire_root / "BE_Traitement_captations" / new_captation / "compte_rendu_LLM" / "out",
+            "pcfixe_report_dir": pcfixe_root / "BE_Traitement_captations" / new_captation / "compte_rendu_LLM",
+        }
+        old_profile_key = (
+            str(self.base / "Affaires" / affaire / "AE_Expert_captations" / old_captation / "photos" / "photos.csv"),
+            1,
+            1.0,
+            True,
+            "photos",
+        )
+        new_profile_key = (str(photos), photos.stat().st_size, photos.stat().st_mtime, True, "photos")
+        self.ns["_ANNOTATION_FILE_PROFILE_CACHE"].update({
+            old_profile_key: {"ts": time.time(), "profile": {}},
+            new_profile_key: {"ts": time.time(), "profile": {}},
+        })
+        self.ns["_annotation_clear_runtime_caches"](
+            id_affaire=affaire,
+            id_captation=new_captation,
+        )
+        self.assertIn(old_profile_key, self.ns["_ANNOTATION_FILE_PROFILE_CACHE"])
+        self.assertNotIn(new_profile_key, self.ns["_ANNOTATION_FILE_PROFILE_CACHE"])
+        self.ns["_paths"] = paths
+        self.ns["_annotation_canonical_paths"] = lambda selected_affaire, selected_captation: paths
+        resources = self.ns["_annotation_batch_resource_plan"](paths)
+        self.assertTrue(all(item["nas_present"] for item in resources), resources)
+
+        job_id = "annotation_2026-A60_accedit-2026-06-17_run_standard_20260805_114954_5aea2794"
+        manifest = {
+            "job_id": job_id,
+            "type": "annotation_photos_batch",
+            "status": "done",
+            "affaire": affaire,
+            "captation": new_captation,
+            "profile": "run_standard",
+            "options": [],
+            "exit_code": 0,
+            "output_verified": True,
+            "output_verified_local": True,
+            "nas_publish_attempted": True,
+            "nas_publish_succeeded": True,
+            "nas_publish_error": "",
+            "photos_csv_path_used": str(photos),
+            "photos_csv_sha256_used": self._hash(photos),
+            "photos_batch_csv_path": str(batch),
+            "photos_batch_csv_sha256": self._hash(batch),
+            "photos_batch_csv_local_sha256": self._hash(batch),
+            "photos_batch_csv_nas_sha256": self._hash(batch),
+            "finished_at": "2026-08-05T11:49:54",
+        }
+        self._write_job(manifest, folder="done")
+        details, _ = self.ns["_annotation_job_details"](
+            affaire,
+            new_captation,
+            paths=paths,
+            include_diagnostics=True,
+            force_refresh=True,
+        )
+        latest_key, latest = self.ns["_annotation_latest_completed_batch"](details)
+        self.assertEqual(latest["job_id"], job_id)
+        self.assertEqual(latest["status"], "completed")
+
+        profile = self.ns["_annotation_file_profile"]
+        audit = {
+            "resources": {
+                "photos.csv": {"profiles": {"nas": profile(photos, csv_expected=True)}, "state": "aligné"},
+                "photos_batch.csv": {"profiles": {"nas": profile(batch, csv_expected=True)}, "state": "aligné"},
+            },
+            "join_audit": self.ns["_annotation_csv_join_audit"](photos, batch),
+        }
+        preflight = self.ns["_annotation_report_preflight"](audit, details, paths)
+        report_state = self.ns["_annotation_report_ui_state"](details, preflight, "provisoire", True)
+        self.assertTrue(preflight["ok"], preflight["reasons"])
+        self.assertTrue(report_state["available"], report_state)
+        self.assertNotIn(old_captation, json.dumps({key: str(value) for key, value in paths.items()}))
+
+    def test_annotation_path_guard_rejects_another_captation(self):
+        with self.assertRaisesRegex(ValueError, "captation active"):
+            self.ns["assert_annotation_paths_match_captation"](
+                {
+                    "photos.csv": Path(
+                        r"C:\Affaires\2026-A60\AE_Expert_captations\accedit-2026-05-21\photos\photos.csv"
+                    )
+                },
+                id_affaire="2026-A60",
+                id_captation="accedit-2026-06-17",
+            )
+
+    def test_batch_submission_uses_atomic_laptop_copy_without_metadata_restore(self):
+        tree = ast.parse(APP_PATH.read_text(encoding="utf-8-sig"))
+        names = {
+            "_annotation_sync_configs_from_nas_to_laptop",
+            "_annotation_batch_resource_plan",
+            "_assert_annotation_nas_resources_ready",
+            "submit_annotation_photos_batch_job",
+        }
+        selected = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        ]
+        rendered = "\n".join(ast.unparse(node) for node in selected)
+        self.assertNotIn("copy2", rendered)
+        self.assertNotIn("copystat", rendered)
+        self.assertIn("copyfileobj", rendered)
+        self.assertIn("os.replace", rendered)
+        self.assertIn("os.fsync", rendered)
 
     def test_localize_pcfixe_job_path_accepts_volume1_and_rejects_outside_roots(self):
         localized = self.ns["_annotation_localize_pcfixe_job_path"](

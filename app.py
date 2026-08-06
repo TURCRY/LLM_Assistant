@@ -13,6 +13,7 @@ import time
 import shutil
 import requests
 import streamlit as st
+import pandas as pd
 from pathlib import Path
 from dotenv import load_dotenv, find_dotenv
 import re, glob
@@ -289,6 +290,14 @@ def _annotation_clear_runtime_caches(*, id_affaire: str = "", id_captation: str 
         if wanted_captation and key[1] != wanted_captation:
             continue
         _ANNOTATION_JOB_DETAILS_CACHE.pop(key, None)
+    for key in list(_ANNOTATION_FILE_PROFILE_CACHE.keys()):
+        raw_path = str(key[0] if key else "")
+        path_parts = {part.casefold() for part in re.split(r"[\\/]", raw_path) if part}
+        if wanted_affaire and wanted_affaire.casefold() not in path_parts:
+            continue
+        if wanted_captation and wanted_captation.casefold() not in path_parts:
+            continue
+        _ANNOTATION_FILE_PROFILE_CACHE.pop(key, None)
 
 
 def _annotation_perf_begin(diagnostics: dict) -> float:
@@ -6149,6 +6158,30 @@ def _is_volume1_affaires_path(path_value: str) -> bool:
     normalized = str(path_value or "").replace("\\", "/")
     return normalized == "/volume1/Affaires" or normalized.startswith("/volume1/Affaires/")
 
+def _compte_rendu_existing_run_basename(run_value: str | Path) -> str:
+    raw = str(run_value or "").strip().strip('"').strip("'")
+    if not raw:
+        return ""
+    normalized = raw.replace("\\", "/").rstrip("/")
+    return normalized.rsplit("/", 1)[-1]
+
+def _validate_compte_rendu_existing_run_contract(existing_run: str) -> str:
+    run_name = str(existing_run or "").strip()
+    if not run_name:
+        raise ValueError("docx_only exige un existing_run valide.")
+    if "/" in run_name or "\\" in run_name:
+        raise ValueError("existing_run final doit être un identifiant job_*, pas un chemin.")
+    if not run_name.startswith("job_"):
+        raise ValueError("existing_run final doit commencer par job_.")
+    if not re.match(r"^job_[A-Za-z0-9_.-]+$", run_name):
+        raise ValueError("existing_run final invalide.")
+    return run_name
+
+def _compte_rendu_existing_run_contract(run_value: str | Path) -> str:
+    return _validate_compte_rendu_existing_run_contract(
+        _compte_rendu_existing_run_basename(run_value)
+    )
+
 def _compte_rendu_nas_command(job: dict) -> str:
     args = [
         "./run_compte_rendu_avec_sujets.sh",
@@ -6164,7 +6197,10 @@ def _compte_rendu_nas_command(job: dict) -> str:
     if job.get("docx_only"):
         args.append("--docx-only")
     if job.get("existing_run"):
-        args.extend(["--existing-run", str(job["existing_run"])])
+        args.extend([
+            "--existing-run",
+            _compte_rendu_existing_run_contract(str(job["existing_run"])),
+        ])
     if job.get("only_pass2b_batches"):
         args.extend(["--only-pass2b-batches", str(job["only_pass2b_batches"])])
     if job.get("only_subjects"):
@@ -6211,6 +6247,94 @@ def discover_compte_rendu_run_dirs(out_dir: Path) -> list[Path]:
         runs = [out_dir]
     return runs
 
+def inspect_compte_rendu_docx_run(
+    run_value: str | Path,
+    *,
+    id_affaire: str,
+    id_captation: str,
+) -> dict:
+    expected_root = _compte_rendu_nas_out_dir(id_affaire, id_captation).rstrip("/")
+    raw_run = str(run_value or "").strip().strip('"').strip("'")
+    run_name = _compte_rendu_existing_run_basename(raw_run)
+    if raw_run and "/" not in raw_run and "\\" not in raw_run:
+        nas_path = f"{expected_root}/{raw_run}"
+    else:
+        nas_path = _nas_affaires_path_to_volume1(raw_run).rstrip("/")
+    valid_scope = bool(
+        nas_path
+        and nas_path.startswith(expected_root + "/job_")
+        and nas_path.rsplit("/", 1)[0] == expected_root
+        and re.match(r"^job_[A-Za-z0-9_.-]+$", run_name or nas_path.rsplit("/", 1)[-1])
+    )
+    unc_path = _volume1_affaires_path_to_unc(nas_path) if valid_scope else Path("")
+
+    def _nonempty(filename: str) -> bool:
+        if not valid_scope:
+            return False
+        candidate = unc_path / filename
+        try:
+            return candidate.is_file() and candidate.stat().st_size > 0
+        except OSError:
+            return False
+
+    global_final = _nonempty("global_final.json")
+    global_by_sujet = _nonempty("global_by_sujet.json")
+    prepared_docx_payload = _nonempty("global_final_depseudonymized_for_docx.json")
+    audit_json = _nonempty("audit_reunion_quality.json")
+    qa_path = unc_path / "pipeline_qa_status.json" if valid_scope else Path("")
+    qa_ok = True
+    if valid_scope and qa_path.is_file():
+        qa = load_json(str(qa_path), {})
+        qa_ok = isinstance(qa, dict) and qa.get("ok") is not False
+    supporting_artifact = global_by_sujet or prepared_docx_payload
+    valid = bool(valid_scope and global_final and supporting_artifact and qa_ok)
+    reasons = []
+    if not valid_scope:
+        reasons.append("le run n’appartient pas à l’affaire/captation active ou à compte_rendu_LLM/out/job_*")
+    if valid_scope and not global_final:
+        reasons.append("global_final.json absent ou vide")
+    if valid_scope and not supporting_artifact:
+        reasons.append("global_by_sujet.json et payload DOCX préparé absents ou vides")
+    if valid_scope and not qa_ok:
+        reasons.append("pipeline_qa_status.json interdit le rendu DOCX")
+    return {
+        "valid": valid,
+        "nas_path": nas_path,
+        "existing_run": _compte_rendu_existing_run_basename(nas_path) if valid_scope else run_name,
+        "unc_path": str(unc_path) if valid_scope else "",
+        "audited": audit_json,
+        "global_final": global_final,
+        "global_by_sujet": global_by_sujet,
+        "prepared_docx_payload": prepared_docx_payload,
+        "qa_ok": qa_ok,
+        "existing_docx": any(unc_path.glob("*.docx")) if valid_scope and unc_path.is_dir() else False,
+        "reasons": reasons,
+    }
+
+def discover_compte_rendu_docx_runs(
+    out_dir: Path,
+    *,
+    id_affaire: str,
+    id_captation: str,
+) -> list[dict]:
+    profiles = [
+        inspect_compte_rendu_docx_run(
+            run_dir,
+            id_affaire=id_affaire,
+            id_captation=id_captation,
+        )
+        for run_dir in discover_compte_rendu_run_dirs(out_dir)
+    ]
+    valid_profiles = [profile for profile in profiles if profile["valid"]]
+    valid_profiles.sort(
+        key=lambda profile: (
+            1 if profile["audited"] else 0,
+            Path(profile["unc_path"]).name,
+        ),
+        reverse=True,
+    )
+    return valid_profiles
+
 def audit_reunion_quality_artifacts(job_dir: Path) -> list[dict]:
     rows = []
     for name in AUDIT_REUNION_QUALITY_ARTIFACTS:
@@ -6236,6 +6360,12 @@ def audit_reunion_quality_report_candidates(job_dir: Path) -> list[dict]:
             "chemin": str(path),
         })
     return rows
+
+def prepare_audit_reunion_quality_dataframe(rows: list[dict]):
+    dataframe = pd.DataFrame(rows)
+    if "taille" in dataframe.columns:
+        dataframe["taille"] = pd.to_numeric(dataframe["taille"], errors="coerce").astype("Int64")
+    return dataframe
 
 def _audit_quality_read_text(path_value: str | Path, limit: int = 12000) -> str:
     path = Path(str(path_value or ""))
@@ -6714,6 +6844,25 @@ def submit_compte_rendu_job(
         raise ValueError("id_affaire/id_captation invalides.")
     if only_pass2b_batches and only_subjects:
         raise ValueError("Utiliser soit reprise Pass2B, soit reprise Sujets, pas les deux.")
+    existing_run = (existing_run or "").strip()
+    if docx_only:
+        if only_pass2b_batches or only_subjects:
+            raise ValueError("docx_only ne peut pas être combiné avec une reprise Pass2B ou Sujets.")
+        if not existing_run:
+            raise ValueError("docx_only exige un existing_run valide.")
+        run_profile = inspect_compte_rendu_docx_run(
+            existing_run,
+            id_affaire=id_affaire,
+            id_captation=id_captation,
+        )
+        if not run_profile["valid"]:
+            raise ValueError("Run DOCX invalide : " + "; ".join(run_profile["reasons"]))
+        existing_run_path = run_profile["nas_path"]
+        existing_run = _compte_rendu_existing_run_contract(existing_run_path)
+    else:
+        existing_run_path = ""
+        if existing_run:
+            existing_run = _compte_rendu_existing_run_contract(existing_run)
 
     infos_source = Path(str(infos_path).strip().strip('"'))
     if not infos_source.is_file():
@@ -6735,11 +6884,13 @@ def submit_compte_rendu_job(
         "force": bool(force),
         "strict_sync": bool(strict_sync),
         "docx_only": bool(docx_only),
-        "existing_run": (existing_run or "").strip(),
+        "existing_run": existing_run,
         "only_pass2b_batches": (only_pass2b_batches or "").strip(),
         "only_subjects": (only_subjects or "").strip(),
         "mirror_pc": bool(mirror_pc),
     }
+    if existing_run_path:
+        job["existing_run_path"] = existing_run_path
 
     queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
     result = {
@@ -7138,6 +7289,8 @@ def _annotation_canonical_paths(id_affaire: str, id_captation: str) -> dict[str,
         "nas_photos_dir": NAS_AFFAIRES_ROOT / photos_rel,
         "nas_photos": NAS_AFFAIRES_ROOT / photos_rel / "photos.csv",
         "nas_photos_batch": NAS_AFFAIRES_ROOT / photos_rel / "photos_batch.csv",
+        "laptop_trans_dir": Path(AFFAIRES_ROOT) / rel,
+        "laptop_infos": Path(AFFAIRES_ROOT) / rel / "infos_projet.json",
         "pcfixe_trans_dir": PCFIXE_AFFAIRES_ROOT / rel,
         "pcfixe_infos": PCFIXE_AFFAIRES_ROOT / rel / "infos_projet.json",
         "pcfixe_photos_dir": PCFIXE_AFFAIRES_ROOT / photos_rel,
@@ -7153,6 +7306,91 @@ def _annotation_canonical_paths(id_affaire: str, id_captation: str) -> dict[str,
         "nas_report_dir": NAS_AFFAIRES_ROOT / out_rel,
         "nas_report_out_dir": NAS_AFFAIRES_ROOT / out_rel / "out",
     }
+
+def _annotation_sync_captation_session_state(
+    session_state,
+    *,
+    id_affaire: str,
+    captation_options: list[str],
+    preferred_captation: str = "",
+) -> None:
+    scope_key = "ann_photos_captation_affaire"
+    selection_scope_key = "ann_photos_selection_scope"
+    selection_key = "ann_photos_id_captation_select"
+    manual_key = "ann_photos_id_captation_manual"
+    preferred = preferred_captation if preferred_captation in captation_options else ""
+    selection_scope = f"{id_affaire}|{preferred}"
+    if session_state.get(selection_scope_key) != selection_scope:
+        _annotation_clear_captation_session_state(session_state)
+        session_state.pop(manual_key, None)
+        if preferred:
+            session_state[selection_key] = preferred
+        elif session_state.get(scope_key) != id_affaire:
+            session_state.pop(selection_key, None)
+    session_state[scope_key] = id_affaire
+    session_state[selection_scope_key] = selection_scope
+    if session_state.get(selection_key) not in captation_options:
+        session_state[selection_key] = captation_options[0]
+
+def _annotation_clear_captation_session_state(session_state) -> None:
+    exact_keys = (
+        "ann_photos_infos_manual",
+        "ann_photos_infos_auto",
+        "ann_photos_canonical_dir",
+        "ann_photos_pcfixe_infos",
+        "ann_photos_llm_backend",
+        "ann_photos_last_batch_submission",
+    )
+    for key in exact_keys:
+        session_state.pop(key, None)
+    for key in list(session_state.keys()):
+        if str(key).startswith("ann_photos_source_"):
+            session_state.pop(key, None)
+
+def _annotation_sync_active_scope_state(
+    session_state,
+    *,
+    id_affaire: str,
+    id_captation: str,
+) -> tuple[str, bool]:
+    scope = f"{id_affaire}|{id_captation}"
+    scope_key = "ann_photos_active_scope"
+    changed = str(session_state.get(scope_key) or "") != scope
+    if changed:
+        _annotation_clear_captation_session_state(session_state)
+    session_state[scope_key] = scope
+    return scope, changed
+
+def assert_annotation_paths_match_captation(
+    paths: dict[str, Path],
+    *,
+    id_affaire: str,
+    id_captation: str,
+) -> None:
+    expected = (id_affaire.casefold(), id_captation.casefold())
+    markers = {
+        "af_expert_asr": 2,
+        "ae_expert_captations": 1,
+        "be_traitement_captations": 1,
+    }
+    for logical_name, value in paths.items():
+        if value in (None, ""):
+            continue
+        parts = [part.casefold() for part in re.split(r"[\\/]", str(value)) if part]
+        actual = None
+        for marker, captation_offset in markers.items():
+            if marker not in parts:
+                continue
+            index = parts.index(marker)
+            captation_index = index + captation_offset
+            if index > 0 and captation_index < len(parts):
+                actual = (parts[index - 1], parts[captation_index])
+                break
+        if actual is not None and actual != expected:
+            raise ValueError(
+                "Chemin annotation incohérent avec la captation active "
+                f"{id_affaire}|{id_captation} ({logical_name}) : {value}"
+            )
 
 def _annotation_existing_infos_path(paths: dict[str, Path]) -> Path:
     for key in ("nas_infos", "pcfixe_unc_infos"):
@@ -7250,7 +7488,7 @@ def _annotation_prepare_batch_runtime_infos(
     paths: dict[str, Path] | None = None,
 ) -> tuple[Path, Path, dict]:
     paths = paths or _annotation_canonical_paths(id_affaire, id_captation)
-    source_infos_path = _annotation_existing_infos_path(paths)
+    source_infos_path = paths["nas_infos"]
     source_infos = load_json(str(source_infos_path), {})
     if not isinstance(source_infos, dict):
         raise ValueError(f"infos_projet.json invalide : {source_infos_path}")
@@ -7261,13 +7499,13 @@ def _annotation_prepare_batch_runtime_infos(
         pcfixe.get("fichier_photos") or runtime_infos.get("fichier_photos"),
         field_name="fichier_photos",
         fallback=paths["pcfixe_photos"],
-        require_file=True,
+        require_file=False,
     )
     runtime_batch = _annotation_localize_pcfixe_job_path(
         pcfixe.get("fichier_photos_batch") or runtime_infos.get("fichier_photos_batch"),
         field_name="fichier_photos_batch",
         fallback=paths["pcfixe_photos_batch"],
-        require_file=True,
+        require_file=False,
     )
     runtime_infos["fichier_photos"] = str(runtime_photos)
     runtime_infos["fichier_photos_batch"] = str(runtime_batch)
@@ -7348,16 +7586,156 @@ def _annotation_pcfixe_required_resources(paths: dict[str, Path]) -> dict[str, P
         "photos_batch.csv": paths["pcfixe_unc_photos_batch"],
     }
 
-def _assert_annotation_pcfixe_resources_ready(id_affaire: str, id_captation: str) -> dict[str, Path]:
-    paths = _annotation_canonical_paths(id_affaire, id_captation)
-    required = _annotation_pcfixe_required_resources(paths)
-    missing = [f"{name} : {path}" for name, path in required.items() if not path.is_file()]
+def _annotation_nas_required_resources(paths: dict[str, Path]) -> dict[str, Path]:
+    base = paths["nas_trans_dir"]
+    return {
+        "infos_projet.json": paths["nas_infos"],
+        "config_llm.json": base / "config_llm.json",
+        "prompt_gpt.json": base / "prompt_gpt.json",
+        "prompt_gpt_batch_only.json": base / "prompt_gpt_batch_only.json",
+        "contexte_general.json": base / "contexte_general.json",
+        "contexte_general_photos.json": base / "contexte_general_photos.json",
+        "photos.csv": paths["nas_photos"],
+        "photos_batch.csv": paths["nas_photos_batch"],
+    }
+
+def _annotation_laptop_config_resources(paths: dict[str, Path]) -> dict[str, tuple[Path, Path]]:
+    filenames = (
+        "infos_projet.json",
+        "config_llm.json",
+        "prompt_gpt.json",
+        "prompt_gpt_batch_only.json",
+    )
+    return {
+        filename: (
+            paths["nas_trans_dir"] / filename,
+            paths["laptop_trans_dir"] / filename,
+        )
+        for filename in filenames
+    }
+
+def _annotation_sync_configs_from_nas_to_laptop(paths: dict[str, Path]) -> list[dict]:
+    resources = _annotation_laptop_config_resources(paths)
+    missing = [f"{name} : {source}" for name, (source, _) in resources.items() if not source.is_file()]
     if missing:
         raise FileNotFoundError(
-            "Job annotation_photos_batch bloqué : ressources PC fixe manquantes ou inaccessibles.\n"
+            "Préparation annotation_photos_batch bloquée : configuration absente du NAS canonique.\n"
             + "\n".join(missing)
         )
-    return required
+
+    paths["laptop_trans_dir"].mkdir(parents=True, exist_ok=True)
+    results: list[dict] = []
+    for logical_name, (source, target) in resources.items():
+        row = {
+            "logical_name": logical_name,
+            "nas_source": str(source),
+            "laptop_target": str(target),
+            "status": "error",
+            "size": None,
+            "sha256": "",
+            "error": "",
+        }
+        tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            source_size = source.stat().st_size
+            source_sha256 = _sha256_file(source)
+            row["size"] = source_size
+            row["sha256"] = source_sha256
+            target_existed = target.is_file()
+            if target_existed and target.stat().st_size == source_size and _sha256_file(target) == source_sha256:
+                row["status"] = "already_identical"
+                results.append(row)
+                continue
+            with source.open("rb") as source_stream, tmp.open("wb") as target_stream:
+                shutil.copyfileobj(source_stream, target_stream, length=1024 * 1024)
+                target_stream.flush()
+                os.fsync(target_stream.fileno())
+            if tmp.stat().st_size != source_size or _sha256_file(tmp) != source_sha256:
+                raise OSError(f"Vérification du fichier temporaire impossible pour {logical_name}")
+            os.replace(tmp, target)
+            if target.stat().st_size != source_size or _sha256_file(target) != source_sha256:
+                raise OSError(f"Vérification finale impossible pour {logical_name}")
+            row["status"] = "refreshed" if target_existed else "copied"
+        except Exception as exc:
+            row["error"] = str(exc)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        results.append(row)
+
+    errors = [row for row in results if row["status"] == "error"]
+    if errors:
+        details = "; ".join(f"{row['logical_name']}: {row['error']}" for row in errors)
+        journal = json.dumps(results, ensure_ascii=False)
+        raise OSError(f"Copie NAS vers laptop incomplète : {details}. Journal : {journal}")
+    return results
+
+def _annotation_batch_resource_plan(paths: dict[str, Path]) -> list[dict]:
+    nas_resources = _annotation_nas_required_resources(paths)
+    laptop_configs = _annotation_laptop_config_resources(paths)
+    pcfixe_targets = {
+        "infos_projet.json": paths["pcfixe_infos"],
+        "config_llm.json": paths["pcfixe_trans_dir"] / "config_llm.json",
+        "prompt_gpt.json": paths["pcfixe_trans_dir"] / "prompt_gpt.json",
+        "prompt_gpt_batch_only.json": paths["pcfixe_trans_dir"] / "prompt_gpt_batch_only.json",
+        "contexte_general.json": paths["pcfixe_trans_dir"] / "contexte_general.json",
+        "contexte_general_photos.json": paths["pcfixe_trans_dir"] / "contexte_general_photos.json",
+        "photos.csv": paths["pcfixe_photos"],
+        "photos_batch.csv": paths["pcfixe_photos_batch"],
+    }
+    pcfixe_probes = _annotation_pcfixe_required_resources(paths)
+    resources: list[dict] = []
+    for logical_name, nas_source in nas_resources.items():
+        nas_present = False
+        source_size: int | None = None
+        source_sha256 = ""
+        source_error = ""
+        try:
+            nas_present = nas_source.is_file()
+            if nas_present:
+                source_size = nas_source.stat().st_size
+                source_sha256 = _sha256_file(nas_source)
+            else:
+                source_error = "ressource obligatoire absente du NAS"
+        except OSError as exc:
+            source_error = str(exc)
+        try:
+            pcfixe_present = pcfixe_probes[logical_name].is_file()
+        except OSError:
+            pcfixe_present = False
+        if not nas_present:
+            status = "ressource NAS manquante"
+        elif not pcfixe_present:
+            status = "staging requis par le spooler"
+        else:
+            status = "présente sur le PC fixe"
+        resources.append({
+            "logical_name": logical_name,
+            "nas_source": str(nas_source),
+            "laptop_target": str(laptop_configs[logical_name][1]) if logical_name in laptop_configs else "",
+            "pcfixe_target": str(pcfixe_targets[logical_name]),
+            "size": source_size,
+            "sha256": source_sha256,
+            "nas_present": nas_present,
+            "pcfixe_present_at_submission": pcfixe_present,
+            "status": status,
+            "error": source_error,
+        })
+    return resources
+
+def _assert_annotation_nas_resources_ready(paths: dict[str, Path]) -> list[dict]:
+    resources = _annotation_batch_resource_plan(paths)
+    missing = [
+        f"{item['logical_name']} : {item['nas_source']}"
+        for item in resources
+        if not item["nas_present"]
+    ]
+    if missing:
+        raise FileNotFoundError(
+            "Job annotation_photos_batch bloqué : ressources obligatoires absentes ou inaccessibles sur le NAS canonique.\n"
+            + "\n".join(missing)
+        )
+    return resources
 
 def _read_text_excerpt(path: Path, limit: int = 4000) -> str:
     try:
@@ -8873,23 +9251,25 @@ def submit_annotation_photos_batch_job(
         options = [str(item) for item in options]
         validate_annotation_photos_batch_options(options)
 
-    infos = Path(str(infos_pcfixe).strip().strip('"'))
     paths = _annotation_canonical_paths(id_affaire, id_captation)
+    required_resources = _assert_annotation_nas_resources_ready(paths)
+    resources_by_name = {item["logical_name"]: item for item in required_resources}
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     job_id = (
         f"annotation_{_safe_job_token(id_affaire)}_{_safe_job_token(id_captation)}_"
         f"{_safe_job_token(profile_key)}_{stamp}_{uuid.uuid4().hex[:8]}"
     )
-    runtime_infos_path = paths["pcfixe_trans_dir"] / "_runtime_jobs" / f"infos_projet_runtime_{job_id}.json"
     job = {
         "job_id": job_id,
         "type": "annotation_photos_batch",
         "affaire": id_affaire,
         "captation": id_captation,
-        "infos_projet": str(runtime_infos_path),
-        "infos_projet_source": str(infos),
+        "infos_projet": str(paths["pcfixe_infos"]),
+        "infos_projet_source": resources_by_name["infos_projet.json"]["nas_source"],
         "fichier_photos": str(paths["pcfixe_photos"]),
         "fichier_photos_batch": str(paths["pcfixe_photos_batch"]),
+        "required_resources": required_resources,
+        "laptop_config_sync": [],
         "profile": profile_key,
         "options": list(options),
     }
@@ -8902,18 +9282,7 @@ def submit_annotation_photos_batch_job(
     }
     if dry_run:
         return result
-    _assert_annotation_pcfixe_resources_ready(id_affaire, id_captation)
-    runtime_infos_local, runtime_infos_unc, runtime_infos = _annotation_prepare_batch_runtime_infos(
-        id_affaire=id_affaire,
-        id_captation=id_captation,
-        job_id=job_id,
-        paths=paths,
-    )
-    _atomic_write_json(runtime_infos_unc, runtime_infos)
-    runtime_pcfixe = runtime_infos.get("pcfixe") if isinstance(runtime_infos.get("pcfixe"), dict) else {}
-    job["infos_projet"] = str(runtime_infos_local)
-    job["fichier_photos"] = str(runtime_pcfixe.get("fichier_photos") or runtime_infos.get("fichier_photos") or paths["pcfixe_photos"])
-    job["fichier_photos_batch"] = str(runtime_pcfixe.get("fichier_photos_batch") or runtime_infos.get("fichier_photos_batch") or paths["pcfixe_photos_batch"])
+    job["laptop_config_sync"] = _annotation_sync_configs_from_nas_to_laptop(paths)
     preflight_pcfixe_target_dir(queued_path.parent)
     tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
     tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -9003,6 +9372,11 @@ def _photo_report_job_preview(
     report_mode = "UI" if mode == "provisoire" else "GTP"
     retenue = "oui" if only_retenue else "non"
     paths = paths or _annotation_canonical_paths(id_affaire, id_captation)
+    assert_annotation_paths_match_captation(
+        {**paths, "infos_projet PC fixe": infos_pcfixe},
+        id_affaire=id_affaire,
+        id_captation=id_captation,
+    )
     audit = audit or {}
     resources = audit.get("resources", {}) if isinstance(audit, dict) else {}
     photos_profile = ((resources.get("photos.csv") or {}).get("profiles") or {}).get("nas", {})
@@ -9416,6 +9790,66 @@ def update_infos_projet_debrief(
 
 DEBRIEF_CSV_KEYWORDS = ("debrief", "debref", "amendement", "correction", "complément", "complement")
 DEBRIEF_ASR_TEXT_COLUMNS = ("text", "texte", "transcript", "transcription")
+CR_DEBRIEF_SCOPE_STATE_KEYS = (
+    "cr_debrief_csv_dir",
+    "cr_debrief_csv_sources",
+    "cr_debrief_csv_manual_paths",
+    "cr_debrief_csv_order",
+    "cr_debrief_global_output_display",
+)
+
+def sync_cr_debrief_scope_state(
+    session_state,
+    *,
+    id_affaire: str,
+    id_captation: str,
+) -> tuple[str, bool]:
+    scope = f"{id_affaire}|{id_captation}"
+    scope_key = "cr_debrief_active_scope"
+    changed = str(session_state.get(scope_key) or "") != scope
+    if changed:
+        for key in CR_DEBRIEF_SCOPE_STATE_KEYS:
+            session_state.pop(key, None)
+        for key in list(session_state.keys()):
+            if str(key).startswith("cr_debrief_csv_canonical_dir_"):
+                session_state.pop(key, None)
+    session_state[scope_key] = scope
+    return scope, changed
+
+def default_debrief_csv_selection(
+    options: list[str],
+    lookup: dict[str, Path],
+    declared_debrief_csv: str | Path | None,
+) -> list[str]:
+    if len(options) == 1:
+        return list(options)
+    if not declared_debrief_csv:
+        return []
+    declared_name = Path(str(declared_debrief_csv)).name.casefold()
+    return [
+        label for label, path in lookup.items()
+        if path.name.casefold() == declared_name
+    ]
+
+def assert_debrief_global_destination_matches_captation(
+    output_path: str | Path,
+    *,
+    canonical_debrief_dir: str | Path,
+    id_captation: str,
+) -> None:
+    output = Path(str(output_path).strip().strip('"'))
+    expected_dir = Path(str(canonical_debrief_dir).strip().strip('"'))
+    output_parent = os.path.normcase(os.path.normpath(str(output.parent)))
+    expected = os.path.normcase(os.path.normpath(str(expected_dir)))
+    captation_matches = (
+        output.parent.name.casefold() == "debrief"
+        and output.parent.parent.name.casefold() == str(id_captation).casefold()
+    )
+    if output.name.casefold() != "debrief_global.csv" or output_parent != expected or not captation_matches:
+        raise ValueError(
+            "Destination debrief_global.csv incohérente avec la captation active "
+            f"{id_captation} : attendu {expected_dir / 'debrief_global.csv'}, reçu {output}."
+        )
 
 def _is_debrief_global_csv(path: Path) -> bool:
     name = path.name.casefold()
@@ -12043,7 +12477,7 @@ elif page == "Voxtral (ASR / CR)":
     if st.session_state.get("voxtral_selected_captation") not in captation_options:
         st.session_state["voxtral_selected_captation"] = "(aucune)"
     selected_captation = st.selectbox(
-        "Captation liÃ©e Ã  l'ASR",
+        "Captation liée à l’ASR",
         captation_options,
         index=captation_options.index(st.session_state["voxtral_selected_captation"]),
         key="voxtral_selected_captation",
@@ -12056,18 +12490,18 @@ elif page == "Voxtral (ASR / CR)":
         if asr_ctx.get("infos_exists"):
             st.caption(f"infos_projet.json détecté: {asr_ctx.get('infos_path_effective')}")
         else:
-            st.warning("`infos_projet.json` non dÃ©tectÃ© pour cette captation; repli sur l'arborescence canonique.")
+            st.warning("`infos_projet.json` non détecté pour cette captation; repli sur l'arborescence canonique.")
 
         col_auto = st.columns(2)
         with col_auto[0]:
-            st.text_input("Audio source rÃ©solu (PC fixe)", value=asr_ctx.get("server_audio_path", ""), disabled=True, key="voxtral_asr_audio_source_resolved")
+            st.text_input("Audio source résolu (PC fixe)", value=asr_ctx.get("server_audio_path", ""), disabled=True, key="voxtral_asr_audio_source_resolved")
             st.text_input("Proper names détecté", value=asr_ctx.get("proper_names_local_path", "") or asr_ctx.get("proper_names_server_path", ""), disabled=True, key="voxtral_asr_proper_names_expected")
         with col_auto[1]:
             st.text_input("Sortie transcription cible (PC fixe)", value=asr_ctx.get("trans_dir_pcfixe", ""), disabled=True, key="voxtral_asr_transcription_target")
-            st.text_input("Boost vocab par dÃ©faut", value=asr_ctx.get("boost_server_path", ""), disabled=True, key="voxtral_asr_boost_vocab_default")
+            st.text_input("Boost vocab par défaut", value=asr_ctx.get("boost_server_path", ""), disabled=True, key="voxtral_asr_boost_vocab_default")
 
         if asr_ctx.get("auto_vocab_lines"):
-            st.caption(f"Vocabulaire auto injectÃ©: {len(asr_ctx['auto_vocab_lines'])} terme(s) depuis `proper_names`/`boost_vocab`.")
+            st.caption(f"Vocabulaire auto injecté: {len(asr_ctx['auto_vocab_lines'])} terme(s) depuis `proper_names`/`boost_vocab`.")
         else:
             st.caption("Aucun vocabulaire auto lisible localement pour cette captation.")
 
@@ -12806,26 +13240,35 @@ elif page == "Voxtral (ASR / CR)":
 
             st.markdown("#### Debriefs CSV à intégrer")
             debrief_csv_default_dir = (cr_trans_dir_nas or cr_trans_dir) / "debrief"
+            sync_cr_debrief_scope_state(
+                st.session_state,
+                id_affaire=cr_affaire_id,
+                id_captation=cr_id_captation,
+            )
             st.text_input(
                 "Dossier canonique proposé",
                 value=str(debrief_csv_default_dir or ""),
                 disabled=True,
                 key=f"cr_debrief_csv_canonical_dir_{cr_affaire_id}_{cr_id_captation}",
             )
-            debrief_csv_custom_dir = st.text_input(
-                "Dossier contenant les CSV de debrief",
-                value=str(debrief_csv_default_dir or ""),
-                disabled=True,
-                key="cr_debrief_csv_dir",
-                help="Le dossier par défaut est AF_Expert_ASR/transcriptions/<id_captation>/ ; il peut être remplacé par un dossier laptop ou réseau.",
-            ).strip().strip('"')
             debrief_csv_advanced = st.checkbox(
                 "Mode avancé CSV debrief",
                 value=False,
                 key="cr_debrief_csv_advanced",
                 help="Permet d’inclure des CSV exclus par défaut ou d’ajouter des chemins manuels.",
             )
-            debrief_csv_scan_dir = Path(debrief_csv_custom_dir) if debrief_csv_custom_dir else Path("")
+            debrief_csv_custom_dir = st.text_input(
+                "Dossier contenant les CSV de debrief",
+                value=str(debrief_csv_default_dir or ""),
+                disabled=not debrief_csv_advanced,
+                key="cr_debrief_csv_dir",
+                help="Le dossier par défaut est AF_Expert_ASR/transcriptions/<id_captation>/ ; il peut être remplacé par un dossier laptop ou réseau.",
+            ).strip().strip('"')
+            debrief_csv_scan_dir = (
+                Path(debrief_csv_custom_dir)
+                if debrief_csv_advanced and debrief_csv_custom_dir
+                else Path(debrief_csv_default_dir)
+            )
             debrief_csv_candidates = list_debrief_csv_candidates(
                 debrief_csv_scan_dir,
                 None,
@@ -12899,15 +13342,11 @@ elif page == "Voxtral (ASR / CR)":
                 debrief_csv_options.append(label)
                 debrief_csv_lookup[label] = item["path"]
 
-            default_selected_labels: list[str] = []
-            if len(debrief_csv_options) == 1:
-                default_selected_labels = debrief_csv_options
-            elif declared_debrief_csv:
-                declared_name = Path(str(declared_debrief_csv)).name.casefold()
-                default_selected_labels = [
-                    label for label, path in debrief_csv_lookup.items()
-                    if path.name.casefold() == declared_name
-                ]
+            default_selected_labels = default_debrief_csv_selection(
+                debrief_csv_options,
+                debrief_csv_lookup,
+                declared_debrief_csv,
+            )
             selected_debrief_csv_labels = st.multiselect(
                 "CSV de debrief à intégrer",
                 debrief_csv_options,
@@ -12999,6 +13438,11 @@ elif page == "Voxtral (ASR / CR)":
                 try:
                     if not can_build_debrief_global:
                         raise ValueError("Sélectionner une affaire, une captation et un infos_projet.json avant génération.")
+                    assert_debrief_global_destination_matches_captation(
+                        effective_global_output_path,
+                        canonical_debrief_dir=debrief_csv_default_dir,
+                        id_captation=cr_id_captation,
+                    )
                     outside_debrief_sources = [
                         str(path)
                         for path in ordered_debrief_csv_paths
@@ -13217,13 +13661,44 @@ elif page == "Voxtral (ASR / CR)":
             st.markdown("#### Paramètres du job")
             reprise_mode = st.radio(
                 "Type de lancement",
-                ["run complet", "reprise Pass2B", "reprise Sujets"],
+                [
+                    "run complet",
+                    "reprise Pass2B",
+                    "reprise Sujets",
+                    "DOCX uniquement depuis un run existant",
+                ],
                 horizontal=True,
                 key="cr_job_reprise_mode",
             )
+            cr_docx_only = reprise_mode == "DOCX uniquement depuis un run existant"
+            docx_run_profiles: list[dict] = []
+            if cr_docx_only:
+                docx_out_dir = (
+                    Path(cr_nas_root)
+                    / "BE_Traitement_captations"
+                    / cr_id_captation
+                    / "compte_rendu_LLM"
+                    / "out"
+                )
+                docx_run_profiles = discover_compte_rendu_docx_runs(
+                    docx_out_dir,
+                    id_affaire=cr_affaire_id,
+                    id_captation=cr_id_captation,
+                )
+                docx_scope = f"{cr_affaire_id}|{cr_id_captation}"
+                if st.session_state.get("cr_job_docx_scope") != docx_scope:
+                    st.session_state["cr_job_existing_run"] = (
+                        docx_run_profiles[0]["nas_path"] if docx_run_profiles else ""
+                    )
+                st.session_state["cr_job_docx_scope"] = docx_scope
             col_resume = st.columns(3)
             with col_resume[0]:
-                existing_run = st.text_input("existing_run", value="", key="cr_job_existing_run")
+                existing_run = st.text_input(
+                    "existing_run",
+                    value="",
+                    disabled=(reprise_mode == "run complet"),
+                    key="cr_job_existing_run",
+                ).strip()
             with col_resume[1]:
                 only_pass2b_batches = st.text_input(
                     "only_pass2b_batches",
@@ -13239,6 +13714,7 @@ elif page == "Voxtral (ASR / CR)":
                     key="cr_job_only_subjects",
                 )
             if reprise_mode == "run complet":
+                existing_run = ""
                 only_pass2b_batches = ""
                 only_subjects = ""
             elif reprise_mode == "reprise Pass2B":
@@ -13246,13 +13722,39 @@ elif page == "Voxtral (ASR / CR)":
             elif reprise_mode == "reprise Sujets":
                 only_pass2b_batches = ""
 
+            docx_run_profile = (
+                inspect_compte_rendu_docx_run(
+                    existing_run,
+                    id_affaire=cr_affaire_id,
+                    id_captation=cr_id_captation,
+                )
+                if cr_docx_only and existing_run
+                else {"valid": False, "reasons": ["aucun run DOCX valide détecté"]}
+            )
+            if cr_docx_only:
+                if docx_run_profile["valid"]:
+                    st.success(f"Run source DOCX : {docx_run_profile['nas_path']}")
+                    st.caption(
+                        "global_final.json : oui | "
+                        f"global_by_sujet.json : {'oui' if docx_run_profile['global_by_sujet'] else 'non'} | "
+                        f"audité : {'oui' if docx_run_profile['audited'] else 'non'} | "
+                        f"DOCX existant : {'oui' if docx_run_profile['existing_docx'] else 'non'}"
+                    )
+                else:
+                    st.error("Mode DOCX bloqué : " + "; ".join(docx_run_profile["reasons"]))
+
             col_opts = st.columns(5)
             with col_opts[0]:
                 cr_force = st.checkbox("force", value=False, key="cr_job_force")
             with col_opts[1]:
                 cr_strict_sync = st.checkbox("strict_sync", value=False, key="cr_job_strict_sync")
             with col_opts[2]:
-                cr_docx_only = st.checkbox("docx_only", value=False, key="cr_job_docx_only")
+                st.checkbox(
+                    "docx_only",
+                    value=cr_docx_only,
+                    disabled=True,
+                    key=f"cr_job_docx_only_display::{cr_docx_only}",
+                )
             with col_opts[3]:
                 cr_mirror_pc = st.checkbox("mirror_pc", value=True, key="cr_job_mirror_pc")
             with col_opts[4]:
@@ -13260,10 +13762,24 @@ elif page == "Voxtral (ASR / CR)":
 
             if not cr_spooler_available:
                 st.warning("Soumission compte-rendu désactivée : accès SMB au spooler indisponible.")
+            if cr_docx_only and docx_run_profile["valid"]:
+                st.markdown("Commande NAS prévisualisée :")
+                st.code(
+                    _compte_rendu_nas_command({
+                        "id_affaire": cr_affaire_id,
+                        "id_captation": cr_id_captation,
+                        "infos_projet": _compte_rendu_nas_infos_path(cr_affaire_id, cr_id_captation),
+                        "docx_only": True,
+                        "existing_run": docx_run_profile["existing_run"],
+                        "mirror_pc": cr_mirror_pc,
+                    }),
+                    language="bash",
+                )
+            docx_submission_blocked = cr_docx_only and not docx_run_profile["valid"]
             if st.button(
                 "📨 Soumettre le compte-rendu au spooler",
                 key="cr_job_submit",
-                disabled=not cr_spooler_available,
+                disabled=not cr_spooler_available or docx_submission_blocked,
             ):
                 if cr_id_captation == "(aucune)":
                     st.error("Sélectionner une captation.")
@@ -13371,13 +13887,17 @@ elif page == "Voxtral (ASR / CR)":
             if audit_job_dir is not None:
                 st.markdown("Artefacts détectés")
                 st.dataframe(
-                    audit_reunion_quality_artifacts(audit_job_dir),
+                    prepare_audit_reunion_quality_dataframe(
+                        audit_reunion_quality_artifacts(audit_job_dir)
+                    ),
                     width="stretch",
                     hide_index=True,
                 )
                 st.markdown("Rapports attendus après exécution")
                 st.dataframe(
-                    audit_reunion_quality_report_candidates(audit_job_dir),
+                    prepare_audit_reunion_quality_dataframe(
+                        audit_reunion_quality_report_candidates(audit_job_dir)
+                    ),
                     width="stretch",
                     hide_index=True,
                 )
@@ -13590,7 +14110,12 @@ elif page == "Annotation photos / Rapport Word":
     st.subheader("Annotation photos / Rapport Word")
 
     ann_id_affaire = selection if selection != "➕ Créer une nouvelle affaire…" else get_project_id(project_config, "")
-    st.text_input("id_affaire", value=ann_id_affaire, disabled=True, key="ann_photos_id_affaire_display")
+    st.text_input(
+        "id_affaire",
+        value=ann_id_affaire,
+        disabled=True,
+        key=f"ann_photos_id_affaire_display::{ann_id_affaire}",
+    )
     ann_known_captations: list[str] = []
     if ann_id_affaire:
         ann_known_captations.extend([c["id_captation"] for c in list_captations(ann_id_affaire)])
@@ -13599,8 +14124,12 @@ elif page == "Annotation photos / Rapport Word":
             ann_known_captations.extend([p.name for p in sorted(ann_nas_trans_root.iterdir()) if p.is_dir()])
     ann_known_captations = list(dict.fromkeys([x for x in ann_known_captations if x]))
     ann_captation_options = ann_known_captations or ["(saisir manuellement)"]
-    if st.session_state.get("ann_photos_id_captation_select") not in ann_captation_options:
-        st.session_state["ann_photos_id_captation_select"] = ann_captation_options[0]
+    _annotation_sync_captation_session_state(
+        st.session_state,
+        id_affaire=ann_id_affaire,
+        captation_options=ann_captation_options,
+        preferred_captation=str(st.session_state.get("cr_job_id_captation") or ""),
+    )
     ann_selected_captation = st.selectbox(
         "id_captation",
         ann_captation_options,
@@ -13615,6 +14144,16 @@ elif page == "Annotation photos / Rapport Word":
     if not ann_id_affaire or not ann_id_captation or ann_id_captation == "(saisir manuellement)":
         st.info("Sélectionner une affaire et une captation pour afficher le contrôle.")
     else:
+        _, ann_scope_changed = _annotation_sync_active_scope_state(
+            st.session_state,
+            id_affaire=ann_id_affaire,
+            id_captation=ann_id_captation,
+        )
+        if ann_scope_changed:
+            _annotation_clear_runtime_caches(
+                id_affaire=ann_id_affaire,
+                id_captation=ann_id_captation,
+            )
         st.markdown("### 1. Vérification des ressources")
         ann_paths = _annotation_canonical_paths(ann_id_affaire, ann_id_captation)
         ann_advanced = st.checkbox(
@@ -13650,6 +14189,11 @@ elif page == "Annotation photos / Rapport Word":
             })
 
         ann_infos_path = Path(ann_infos_path_text) if ann_infos_path_text else ann_paths["nas_infos"]
+        assert_annotation_paths_match_captation(
+            {**ann_paths, "infos_projet sélectionné": ann_infos_path},
+            id_affaire=ann_id_affaire,
+            id_captation=ann_id_captation,
+        )
         infos_started = time.perf_counter()
         ann_infos = load_json(str(ann_infos_path), {}) if ann_infos_path.is_file() else {}
         _ann_mark("lecture infos_projet.json", infos_started)
@@ -13679,11 +14223,10 @@ elif page == "Annotation photos / Rapport Word":
             ann_id_captation,
         )
         _ann_mark("inspection photos.csv / photos_batch.csv", resource_audit_started)
-        try:
-            ann_pcfixe_resources = _annotation_pcfixe_required_resources(ann_paths)
-        except Exception as exc:
-            st.warning(f"Ressources PC fixe utilisées par le job indisponibles : {exc}")
-            ann_pcfixe_resources = {}
+        ann_batch_resource_plan = _annotation_batch_resource_plan(ann_paths)
+        ann_missing_nas_resources = [
+            item for item in ann_batch_resource_plan if not item["nas_present"]
+        ]
         jobs_light_started = time.perf_counter()
         ann_job_details, ann_jobs_diag = _annotation_job_details(
             ann_id_affaire,
@@ -13719,7 +14262,10 @@ elif page == "Annotation photos / Rapport Word":
         elif ann_latest_batch:
             ann_report_status = "à générer"
 
-        ann_photos_resource_missing = ann_resources.get("photos.csv") is None
+        ann_photos_resource_missing = not any(
+            item["logical_name"] == "photos.csv" and item["nas_present"]
+            for item in ann_batch_resource_plan
+        )
         status_rows = []
         for name, path in ann_resources.items():
             valid_path = _valid_file_path(path)
@@ -13840,15 +14386,19 @@ elif page == "Annotation photos / Rapport Word":
             st.warning(f"photos.csv : {photos_state}. Aucune écriture automatique n'est effectuée.")
         if batch_state != "aligné":
             st.warning(f"photos_batch.csv : {batch_state}. La source prioritaire du rapport reste le NAS.")
-        st.markdown("#### Ressources PC fixe utilisées par le batch")
+        st.markdown("#### Ressources requises par le batch")
         st.dataframe(
             [
                 {
-                    "ressource": name,
-                    "état": "présent" if path.is_file() else "absent",
-                    "chemin laptop vers PC fixe": str(path),
+                    "ressource": item["logical_name"],
+                    "source NAS canonique": item["nas_source"],
+                    "copie laptop": item["laptop_target"],
+                    "cible PC fixe": item["pcfixe_target"],
+                    "état": item["status"],
+                    "taille source": item["size"] if item["size"] is not None else "",
+                    "sha256 source": item["sha256"],
                 }
-                for name, path in ann_pcfixe_resources.items()
+                for item in ann_batch_resource_plan
             ],
             width="stretch",
             hide_index=True,
@@ -14086,7 +14636,15 @@ elif page == "Annotation photos / Rapport Word":
         )
         batch_defaults = _annotation_batch_profile_defaults(selected_batch_profile)
         action_state = _annotation_batch_action_state(ann_job_details, selected_batch_profile)
-        if ann_photos_resource_missing:
+        if ann_missing_nas_resources:
+            missing_names = ", ".join(item["logical_name"] for item in ann_missing_nas_resources)
+            action_state = {
+                **action_state,
+                "can_submit": False,
+                "status_code": "MISSING_NAS_RESOURCES",
+                "message": f"Ressources obligatoires absentes du NAS canonique : {missing_names}.",
+            }
+        elif ann_photos_resource_missing:
             action_state = {
                 **action_state,
                 "can_submit": False,
