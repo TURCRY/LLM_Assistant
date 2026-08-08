@@ -4713,6 +4713,7 @@ def copy_ingestion_uploaded_originals(
     document_roles: dict[str, str] | None = None,
     document_labels: dict[str, str] | None = None,
     document_parent_sources: dict[str, str] | None = None,
+    document_piece_refs: dict[str, dict] | None = None,
 ) -> dict:
     folder_rel = (party.get("folder_rel") or "").strip()
     if not folder_rel:
@@ -4739,6 +4740,18 @@ def copy_ingestion_uploaded_originals(
         for k, v in (document_parent_sources or {}).items()
         if compact_spaces(v or "")
     }
+    document_piece_refs = {
+        Path(str(k)).name: {
+            **piece_reference_metadata(
+                coerce_editor_int((v or {}).get("numero_piece")),
+                (v or {}).get("sous_piece") or "",
+                (v or {}).get("piece_ref_style") or "",
+            ),
+            "piece_ref_style": compact_spaces((v or {}).get("piece_ref_style") or ""),
+        }
+        for k, v in (document_piece_refs or {}).items()
+        if isinstance(v, dict)
+    }
     for file_obj in selected_files or []:
         src_name = Path(file_obj.name).name
         if not src_name:
@@ -4757,6 +4770,11 @@ def copy_ingestion_uploaded_originals(
                 "source_parent": document_parent_sources[src_name],
                 "parent_source": document_parent_sources[src_name],
             }
+        piece_ref_meta = {
+            key: value
+            for key, value in (document_piece_refs.get(src_name) or {}).items()
+            if key in {"numero_piece", "sous_piece", "reference_piece", "piece_ref_style"} and value is not None
+        }
         dst = dst_dir / src_name
         if dst.exists():
             page_meta = file_page_count_record(dst)
@@ -4770,6 +4788,7 @@ def copy_ingestion_uploaded_originals(
                 **role_meta,
                 **label_meta,
                 **parent_meta,
+                **piece_ref_meta,
                 **page_meta,
             })
             continue
@@ -4788,6 +4807,7 @@ def copy_ingestion_uploaded_originals(
                 **role_meta,
                 **label_meta,
                 **parent_meta,
+                **piece_ref_meta,
                 **page_meta,
             })
         except Exception as e:
@@ -4979,8 +4999,95 @@ DOCUMENTARY_HINT_RE = re.compile(
     r"socabat|sma|notaire|assignation|d[eé]claration|mise en demeure)\b"
 )
 
+PIECE_REF_TEXT_SUFFIXES = {"bis", "ter", "quater"}
+
+def _ascii_piece_ref_text(value: str) -> str:
+    text = str(value or "")
+    suffix = Path(text).suffix.lower()
+    if suffix in {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".csv", ".txt"}:
+        text = str(Path(text).with_suffix(""))
+    text = text.replace("_", " ")
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.replace("°", "o").replace("º", "o")
+    return re.sub(r"\s+", " ", text).strip().lower()
+
 def compact_spaces(value: str) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
+
+def _normalize_piece_suffix(value: str) -> str:
+    suffix = compact_spaces(value or "").replace(",", ".")
+    if len(suffix) == 1 and suffix.isalpha():
+        return suffix.upper()
+    if suffix.lower() in PIECE_REF_TEXT_SUFFIXES:
+        return suffix.lower()
+    return suffix
+
+def piece_reference_piece(numero_piece, sous_piece: str = "", piece_ref_style: str = "") -> str:
+    try:
+        numero = int(numero_piece)
+    except Exception:
+        return ""
+    suffix = _normalize_piece_suffix(sous_piece)
+    style = compact_spaces(piece_ref_style or "").lower()
+    if not suffix:
+        return str(numero)
+    if style == "annexe" or re.fullmatch(r"\d+\.\d+", suffix):
+        return f"{numero} annexe {suffix}"
+    if style == "hyphen":
+        return f"{numero}-{suffix}"
+    if len(suffix) == 1 and suffix.isalpha():
+        return f"{numero}.{suffix.upper()}"
+    if suffix.lower() in PIECE_REF_TEXT_SUFFIXES:
+        return f"{numero} {suffix.lower()}"
+    if suffix.isdigit():
+        return f"{numero}.{suffix}"
+    return f"{numero} {suffix}"
+
+def piece_reference_metadata(numero_piece, sous_piece: str = "", piece_ref_style: str = "") -> dict:
+    suffix = _normalize_piece_suffix(sous_piece)
+    return {
+        "numero_piece": numero_piece,
+        "sous_piece": suffix,
+        "reference_piece": piece_reference_piece(numero_piece, suffix, piece_ref_style),
+    }
+
+def detect_piece_ref_details_from_filename(filename: str) -> dict:
+    text = _ascii_piece_ref_text(filename)
+    match = re.search(
+        r"\bpiece\s*(?:n\s*o)?\s*0*(\d{1,4})\b|\bn\s*o?\s*0*(\d{1,4})\b",
+        text,
+    )
+    if not match:
+        return {"numero_piece": None, "sous_piece": "", "reference_piece": "", "piece_ref_style": ""}
+
+    numero = int(match.group(1) or match.group(2))
+    rest = text[match.end():]
+    sous_piece = ""
+    style = ""
+
+    annexe_match = re.search(r"^\s*(?:[-_:.)]+)?\s*annexe\s+([0-9]+(?:[.,][0-9]+)?)\b", rest)
+    if annexe_match:
+        sous_piece = annexe_match.group(1).replace(",", ".")
+        style = "annexe"
+    else:
+        suffix_match = re.search(r"^\s*([.-])\s*([a-z]|\d{1,4})\b", rest)
+        if suffix_match:
+            sous_piece = suffix_match.group(2)
+            style = "hyphen" if suffix_match.group(1) == "-" else "dot"
+        else:
+            text_match = re.search(r"^\s+(bis|ter|quater|[a-z])\b", rest)
+            if text_match:
+                sous_piece = text_match.group(1)
+                style = "text" if text_match.group(1) in PIECE_REF_TEXT_SUFFIXES else "dot"
+
+    sous_piece = _normalize_piece_suffix(sous_piece)
+    return {
+        "numero_piece": numero,
+        "sous_piece": sous_piece,
+        "reference_piece": piece_reference_piece(numero, sous_piece, style),
+        "piece_ref_style": style,
+    }
 
 def strip_file_title(filename: str) -> str:
     stem = Path(filename).stem
@@ -5009,22 +5116,20 @@ def fallback_piece_title_from_filename(filename: str, numero_piece: int | None =
     return compact_spaces(stem.strip(" \t\r\n-_–—:.()"))
 
 def detect_piece_ref_from_filename(filename: str) -> tuple[int | None, str]:
+    details = detect_piece_ref_details_from_filename(filename)
+    if details.get("numero_piece") is not None:
+        return details.get("numero_piece"), details.get("sous_piece") or ""
     match = PIECE_FILE_RE.search(filename or "")
     if not match:
         return None, ""
-    return int(match.group(1)), (match.group(2) or match.group(3) or "").lower()
+    return int(match.group(1)), _normalize_piece_suffix(match.group(2) or match.group(3) or "")
 
 def build_libelle_affichage(numero_piece, sous_piece: str, libelle_final: str) -> str:
     libelle = compact_spaces(libelle_final)
-    try:
-        numero = int(numero_piece)
-    except Exception:
+    reference = piece_reference_piece(numero_piece, sous_piece or "")
+    if not reference:
         return libelle
-    suffix = compact_spaces(sous_piece).lower()
-    if suffix and suffix.isdigit():
-        ref = f"Piece {numero}.{suffix}"
-    else:
-        ref = f"Piece {numero}{suffix}" if suffix else f"Piece {numero}"
+    ref = f"Piece {reference}"
     return f"{ref} - {libelle}" if libelle else ref
 
 def ocr_source_path_candidates(path: str) -> list[str]:
@@ -18144,6 +18249,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             for row in source_rows or []:
                 item = dict(row or {})
                 numero_piece = coerce_editor_int(item.get("numero_piece") or item.get("numero"))
+                sous_piece = compact_spaces(item.get("sous_piece") or "")
                 if numero_piece is None:
                     continue
                 page_debut = coerce_editor_int(item.get("page_debut") or item.get("start_page"))
@@ -18160,6 +18266,8 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 out.append({
                     "fichier_source": Path(str(item.get("fichier_sortie") or target_name or f"piece_{numero_piece}.pdf")).name,
                     "numero_piece": numero_piece,
+                    "sous_piece": sous_piece,
+                    "reference_piece": piece_reference_piece(numero_piece, sous_piece),
                     "libelle_ocr": libelle,
                     "nom_cible_propose": target_name,
                     "action": action,
@@ -18199,18 +18307,24 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             try:
                 found_files = [path for path in Path(split_dir_unc).glob("*.pdf") if path.is_file()]
                 for path in found_files:
-                    numero_piece, _sub_piece = detect_piece_ref_from_filename(path.name)
+                    piece_ref = detect_piece_ref_details_from_filename(path.name)
+                    numero_piece = piece_ref.get("numero_piece")
+                    sous_piece = piece_ref.get("sous_piece") or ""
                     if numero_piece is None or (expected_numbers and numero_piece not in expected_numbers):
                         continue
-                    current = selected_by_number.get(numero_piece)
+                    selected_key = (numero_piece, sous_piece.lower())
+                    current = selected_by_number.get(selected_key)
                     if current is None or path.stat().st_mtime > current.stat().st_mtime:
-                        selected_by_number[numero_piece] = path
+                        selected_by_number[selected_key] = path
             except Exception:
                 found_files = []
                 selected_by_number = {}
 
             rows = []
-            for numero_piece, path in sorted(selected_by_number.items()):
+            for (numero_piece, sous_piece_key), path in sorted(selected_by_number.items()):
+                piece_ref = detect_piece_ref_details_from_filename(path.name)
+                sous_piece = piece_ref.get("sous_piece") or sous_piece_key
+                piece_ref_style = piece_ref.get("piece_ref_style") or ""
                 libelle = compact_spaces(
                     title_lookup.get(numero_piece)
                     or fallback_piece_title_from_filename(path.name, numero_piece)
@@ -18219,6 +18333,8 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 rows.append({
                     "fichier_source": path.name,
                     "numero_piece": numero_piece,
+                    "sous_piece": sous_piece,
+                    "reference_piece": piece_reference_piece(numero_piece, sous_piece, piece_ref_style),
                     "libelle_ocr": libelle,
                     "nom_cible_propose": (
                         f"PIECE n°{numero_piece} {sanitize_filename(libelle)}.pdf"
@@ -18276,7 +18392,9 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             next_unnumbered_idx = 0
             dry_rows = []
             for name in piece_names or []:
-                numero_piece, _sub_piece = detect_piece_ref_from_filename(name)
+                piece_ref = detect_piece_ref_details_from_filename(name)
+                numero_piece = piece_ref.get("numero_piece")
+                sous_piece = piece_ref.get("sous_piece") or ""
                 used_unnumbered_fallback = False
                 dry_row_origin = ""
                 libelle_ocr = compact_spaces(
@@ -18330,6 +18448,8 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 dry_rows.append({
                     "fichier_source": name,
                     "numero_piece": numero_piece or "",
+                    "sous_piece": sous_piece,
+                    "reference_piece": piece_reference_piece(numero_piece, sous_piece, piece_ref.get("piece_ref_style") or ""),
                     "libelle_ocr": libelle_ocr,
                     "nom_cible_propose": target_name,
                     "action": action,
@@ -18394,14 +18514,26 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
 
         for filename in separated_piece_rows_by_name:
             selected_document_roles[filename] = "piece"
+        original_piece_refs_by_name = {}
         for name in selected_names:
             role = normalize_document_role(selected_document_roles.get(Path(name).name, ""))
-            numero_piece, _sub_piece = detect_piece_ref_from_filename(name) if role == "piece" else (None, "")
+            piece_ref = detect_piece_ref_details_from_filename(name) if role == "piece" else {
+                "numero_piece": None,
+                "sous_piece": "",
+                "reference_piece": "",
+                "piece_ref_style": "",
+            }
+            numero_piece = piece_ref.get("numero_piece")
+            sous_piece = piece_ref.get("sous_piece") or ""
+            piece_ref_style = piece_ref.get("piece_ref_style") or ""
             libelle = compact_spaces(title_lookup_for_summary.get(numero_piece) or "") if numero_piece is not None else ""
             dry_piece_row = separated_piece_rows_by_name.get(Path(name).name)
             if dry_piece_row:
                 role = "piece"
                 numero_piece = coerce_editor_int(dry_piece_row.get("numero_piece"))
+                sous_piece = compact_spaces(dry_piece_row.get("sous_piece") or sous_piece)
+                if sous_piece != (piece_ref.get("sous_piece") or ""):
+                    piece_ref_style = ""
                 target_stem = compact_spaces(Path(str(dry_piece_row.get("nom_cible_propose") or "")).stem)
                 fallback_title = (
                     compact_spaces(f"PIECE n°{numero_piece} {dry_piece_row.get('libelle_ocr') or ''}")
@@ -18411,17 +18543,28 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 libelle = target_stem or fallback_title
             if role != "piece" and not libelle:
                 libelle = strip_file_title(name)
+            reference_piece = piece_reference_piece(numero_piece, sous_piece, piece_ref_style) if role == "piece" else ""
+            original_piece_refs_by_name[Path(name).name] = {
+                "numero_piece": numero_piece,
+                "sous_piece": sous_piece,
+                "reference_piece": reference_piece,
+                "piece_ref_style": piece_ref_style,
+            }
             qualification_rows.append({
                 "fichier_source": name,
                 "role": role,
                 "type": document_type_from_role(role),
                 "numero_piece": numero_piece or "",
+                "sous_piece": sous_piece,
+                "reference_piece": reference_piece,
                 "libelle_retenu": libelle,
                 "action": "classer" if role else "à vérifier",
             })
         for child_row in current_split_child_rows:
             child_path = Path(str(child_row.get("chemin_source") or ""))
             numero_piece = coerce_editor_int(child_row.get("numero_piece"))
+            sous_piece = compact_spaces(child_row.get("sous_piece") or "")
+            reference_piece = piece_reference_piece(numero_piece, sous_piece)
             target_stem = compact_spaces(
                 Path(str(child_row.get("nom_cible_propose") or "")).stem
             )
@@ -18441,11 +18584,19 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 "role": "piece",
                 "type": "piece",
                 "numero_piece": numero_piece or "",
+                "sous_piece": sous_piece,
+                "reference_piece": reference_piece,
                 "libelle_retenu": libelle,
                 "page_count": page_meta.get("page_count"),
                 "source_parent": multi_pdf_name if multi_pdf_name != "(aucun)" else "",
                 "action": "classer",
             })
+            original_piece_refs_by_name[child_path.name] = {
+                "numero_piece": numero_piece,
+                "sous_piece": sous_piece,
+                "reference_piece": reference_piece,
+                "piece_ref_style": "",
+            }
         multi_pdf_children_missing = bool(
             multi_pdf_name
             and multi_pdf_name != "(aucun)"
@@ -18464,7 +18615,9 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                     "fichier_source": st.column_config.TextColumn("fichier_source", disabled=True),
                     "role": st.column_config.TextColumn("role", disabled=True),
                     "type": st.column_config.TextColumn("type", disabled=True),
-                    "numero_piece": st.column_config.TextColumn("numero_piece", disabled=True),
+                    "numero_piece": st.column_config.TextColumn("numero_piece"),
+                    "sous_piece": st.column_config.TextColumn("sous_piece"),
+                    "reference_piece": st.column_config.TextColumn("reference_piece", disabled=True),
                     "page_count": st.column_config.NumberColumn("page_count", disabled=True),
                     "source_parent": st.column_config.TextColumn("source_parent", disabled=True),
                     "libelle_retenu": st.column_config.TextColumn("libelle_retenu"),
@@ -18490,6 +18643,26 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             for row in qualification_rows
             if compact_spaces(row.get("libelle_retenu") or "")
         }
+        selected_document_piece_refs = {}
+        for row in qualification_rows:
+            row_name = Path(str(row.get("fichier_source") or "")).name
+            if normalize_document_role(row.get("role") or "") != "piece" or not row_name:
+                continue
+            numero_piece = coerce_editor_int(row.get("numero_piece"))
+            if numero_piece is None:
+                continue
+            sous_piece = _normalize_piece_suffix(row.get("sous_piece") or "")
+            original_ref = original_piece_refs_by_name.get(row_name, {})
+            piece_ref_style = ""
+            if (
+                str(original_ref.get("numero_piece") or "") == str(numero_piece)
+                and _normalize_piece_suffix(original_ref.get("sous_piece") or "") == sous_piece
+            ):
+                piece_ref_style = original_ref.get("piece_ref_style") or ""
+            selected_document_piece_refs[row_name] = {
+                **piece_reference_metadata(numero_piece, sous_piece, piece_ref_style),
+                "piece_ref_style": piece_ref_style,
+            }
     
         if st.button("Valider le dépôt documentaire et copier les originaux", key="ingestion_copy_originals"):
             if not ingestion_party:
@@ -18536,6 +18709,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                         selected_document_roles,
                         selected_document_labels,
                         document_parent_sources,
+                        selected_document_piece_refs,
                     )
                     st.session_state["last_ingestion_event"] = event
                     st.session_state["last_transmission_id"] = event.get("transmission_id")
