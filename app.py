@@ -12421,7 +12421,8 @@ if st.button("🔧 (Re)créer l’arborescence canonique"):
 
 st.markdown("### États / Synthèses documentaires")
 with st.expander("États récapitulatifs des documents reçus", expanded=False):
-    st.caption("Source principale : AA_Expert_Admin\\_Logs\\transmissions.jsonl")
+    st.caption("Source principale :")
+    st.code(r"AA_Expert_Admin\_Logs\transmissions.jsonl", language=None)
     try:
         records_for_states = load_transmission_records(aff_root_local, project_config)
         aff_id_states = get_project_id(project_config, "")
@@ -15766,7 +15767,8 @@ elif page == "Pré-traitement dépôt PDF":
             "note": "Dépôt provisoire; aucun code expert attribué.",
         })
         st.success(f"Cohorte enregistrée dans Depot_initial : {len(saved_names)} fichier(s). Aucun code expert attribué.")
-        st.caption(f"Journal cohorte provisoire : {cohort_log_path}")
+        st.caption("Journal cohorte provisoire :")
+        st.code(str(cohort_log_path), language=None)
 
     # chemins par défaut basés sur la config projet existante
     split_aff_id = get_project_id(project_config, "")
