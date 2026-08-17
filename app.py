@@ -680,6 +680,10 @@ def deepseek_ocr_follow_state(session_last_job: str, discovered_jobs: list[dict]
     return {"job_id": "", "state": "jamais_déposé", "found": False}
 
 
+def deepseek_ocr_should_scan_jobs(last_job_id: str) -> bool:
+    return bool(str(last_job_id or "").strip())
+
+
 def deepseek_ocr_jobs_diagnostic(jobs_root: str | Path | None = None) -> dict:
     vpn_active = _pcfixe_vpn_active()
     root = Path(jobs_root) if jobs_root is not None else get_pcfixe_jobs_root()
@@ -16501,6 +16505,25 @@ elif page == "Pré-traitement dépôt PDF":
         clear_dire_bord_ocr_state("Résultat OCR courant réinitialisé.", mark_reset=True)
         st.session_state[ocr_signature_key] = ocr_current_signature
 
+    analyze_dire_bord_clicked = st.button("🔎 Analyser Dire/Bordereau", key=f"analyze_dire_bord_{project_id}")
+    deepseek_stop_after_submit_panel = False
+    if analyze_dire_bord_clicked:
+        clear_dire_bord_ocr_state()
+        st.session_state[ocr_signature_key] = ocr_current_signature
+        if ocr_engine == "DeepSeekOCR avancé":
+            dry_run_docs = build_current_deepseek_dry_run_docs()
+
+            if not dry_run_docs:
+                st.warning("Aucun document sélectionné pour le dry-run DeepSeekOCR.")
+                st.stop()
+
+            st.session_state[deepseek_state_key] = dry_run_docs
+            st.info("Dry-run DeepSeekOCR : aucune conversion PNG, aucun appel /ocr_deepseek_batch, aucun OCR lancé.")
+            st.success("Préparation terminée. Aucun job OCR n’a encore été déposé sur le PC fixe.")
+            st.info("Étape suivante : cliquer sur « Déposer le job DeepSeekOCR PC fixe ».")
+            st.caption(f"Racine PC fixe locale calculée : {pcfixe_local_root_for_server(project_config, project_id)}")
+            deepseek_stop_after_submit_panel = True
+
     if ocr_engine == "DeepSeekOCR avancé":
         with st.expander("Diagnostic DeepSeekOCR VPN / jobs", expanded=False):
             try:
@@ -16529,10 +16552,14 @@ elif page == "Pré-traitement dépôt PDF":
             st.session_state.pop(deepseek_state_key, None)
             st.session_state.pop(deepseek_last_result_key, None)
             st.caption("Dry-run DeepSeekOCR precedent ignore : la selection courante a change.")
-    if ocr_engine == "DeepSeekOCR avancé" and st.session_state.get(deepseek_state_key):
+
+    def render_deepseek_submit_panel(dry_run_docs: list[dict] | None = None) -> None:
+        dry_run_docs = dry_run_docs if dry_run_docs is not None else st.session_state.get(deepseek_state_key, [])
+        if not dry_run_docs:
+            return
         st.markdown("#### Dépôt réel du job DeepSeekOCR PC fixe")
         queued_dir_unc = pcfixe_jobs_queued_unc()
-        for item in st.session_state.get(deepseek_state_key, []):
+        for item in dry_run_docs:
             st.markdown(f"### {item['type'].capitalize()}")
             render_deepseek_dry_run(item.get("paths") or {}, item.get("payload") or {}, item.get("signature") or {})
         st.caption(f"Queue cible : {queued_dir_unc}")
@@ -16580,167 +16607,190 @@ elif page == "Pré-traitement dépôt PDF":
                 st.success(f"{len(created_jobs)} job(s) DeepSeekOCR déposé(s) dans la queue PC fixe.")
                 for created in created_jobs:
                     known_status = find_deepseek_ocr_job_status(created["job_id"])
-                    st.write("job_id :", created["job_id"])
-                    st.write("Racine _jobs utilisée :", created["jobs_root"])
-                    st.write("Manifest déposé :", created["json_path"])
                     st.write("État connu :", known_status.get("status") or "introuvable")
                     if known_status.get("status") == "introuvable":
                         st.warning(
                             "Le manifest vient d'être écrit mais le scan immédiat ne le retrouve pas encore "
                             "dans queued/running/done/failed. L'identifiant est conservé pour le prochain contrôle."
                         )
-                    st.json(created["job"])
+                    with st.expander("Diagnostic dépôt DeepSeekOCR", expanded=False):
+                        st.write("Racine _jobs retenue :", created["jobs_root"])
+                        st.write("Chemin complet queued :", created["queued_dir"])
+                        st.write("job_id créé :", created["job_id"])
+                        st.write("Manifest écrit :", created["json_path"])
+                        st.json(created["job"])
+
+    if ocr_engine == "DeepSeekOCR avancé" and st.session_state.get(deepseek_state_key):
+        render_deepseek_submit_panel()
+        if deepseek_stop_after_submit_panel:
+            st.stop()
 
     if ocr_engine == "DeepSeekOCR avancé":
         st.markdown("#### Suivi du job DeepSeekOCR")
-        discovered_jobs_all = discover_deepseek_ocr_jobs_for_project(project_id)
-        reset_timestamp = float(st.session_state.get(ocr_reset_timestamp_key) or 0)
-        matching_jobs_all = [
-            item for item in discovered_jobs_all
-            if deepseek_job_matches_current_selection(item.get("job") or {}, deepseek_current_signature)
-        ]
-        discovered_jobs = [
-            item for item in matching_jobs_all
-            if float(item.get("mtime") or 0) >= reset_timestamp
-        ]
-        if discovered_jobs_all and not discovered_jobs:
-            st.caption("Aucun job DeepSeekOCR correspondant à la sélection courante.")
-        old_matching_jobs = [
-            item for item in matching_jobs_all
-            if float(item.get("mtime") or 0) < reset_timestamp
-        ]
-        if old_matching_jobs:
-            with st.expander("Anciens jobs DeepSeekOCR masqués par le reset", expanded=False):
-                for item in old_matching_jobs[:20]:
-                    st.write(f"{item.get('job_id')} — {item.get('status')} — {item.get('job_path')}")
-        discovered_default = discovered_jobs[0]["job_id"] if discovered_jobs else ""
-        session_last_job = st.session_state.get(deepseek_last_job_key) or ""
-        current_job_ids = {item["job_id"] for item in discovered_jobs}
-        last_submission = st.session_state.get(deepseek_last_submission_key) or {}
-        follow_state = deepseek_ocr_follow_state(session_last_job, discovered_jobs, last_submission)
-        last_job_default = follow_state.get("job_id") or discovered_default
-        if follow_state.get("state") == "jamais_déposé" and not last_submission:
-            st.info("État DeepSeekOCR : aucun job encore déposé pour cette sélection.")
-        selected_job_from_dropdown = ""
-        if discovered_jobs:
-            labels = [
-                f"{item['job_id']} — {item['status']}"
-                for item in discovered_jobs
-            ]
-            default_index = 1
-            if last_job_default:
-                for idx, item in enumerate(discovered_jobs, start=1):
-                    if item.get("job_id") == last_job_default:
-                        default_index = idx
-                        break
-            selected_label = st.selectbox(
-                "Jobs DeepSeekOCR trouvés pour cette affaire",
-                ["(saisie manuelle)"] + labels,
-                index=default_index if labels else 0,
-                key=f"deepseek_ocr_found_jobs_{project_id}",
-            )
-            if selected_label != "(saisie manuelle)":
-                selected_idx = labels.index(selected_label)
-                dropdown_job_id = discovered_jobs[selected_idx]["job_id"]
-                if not (session_last_job and session_last_job in current_job_ids):
-                    last_job_default = dropdown_job_id
-                    selected_job_from_dropdown = last_job_default
-        else:
-            st.caption("Aucun job DeepSeekOCR correspondant à la sélection courante.")
-
-        deepseek_follow_job_widget_key = f"deepseek_ocr_follow_job_id_{project_id}"
-        if (
-            st.session_state.get(deepseek_follow_job_widget_key)
-            and st.session_state.get(deepseek_follow_job_widget_key) not in current_job_ids
-            and not session_last_job
-        ):
-            st.session_state[deepseek_follow_job_widget_key] = last_job_default
-        if session_last_job:
-            st.session_state[deepseek_follow_job_widget_key] = session_last_job
-            last_job_default = session_last_job
-        last_job_id = st.text_input(
-            "Dernier job_id DeepSeekOCR",
-            value=last_job_default,
-            key=deepseek_follow_job_widget_key,
+        session_last_job = (
+            st.session_state.get(deepseek_last_job_key)
+            or st.session_state.get(deepseek_follow_job_widget_key)
+            or ""
         )
-        if selected_job_from_dropdown:
-            last_job_id = selected_job_from_dropdown
-        if follow_state.get("state") == "déposé_non_retrouvé":
-            st.warning(
-                "État DeepSeekOCR : job déposé, mais non encore retrouvé dans queued/running/done/failed "
-                "sur la racine _jobs actuellement résolue."
+        last_submission = st.session_state.get(deepseek_last_submission_key) or {}
+        if not deepseek_ocr_should_scan_jobs(session_last_job):
+            st.info("Aucun job DeepSeekOCR n’a encore été déposé pour cette sélection.")
+            st.text_input(
+                "Dernier job_id DeepSeekOCR",
+                value="",
+                key=deepseek_follow_job_widget_key,
+                disabled=True,
             )
-            if last_submission:
-                st.write("Racine _jobs utilisée au dépôt :", last_submission.get("jobs_root") or "")
-                st.write("Manifest déposé :", last_submission.get("json_path") or "")
-        elif follow_state.get("found"):
-            st.info(f"État DeepSeekOCR : {follow_state.get('state') or 'retrouvé'}.")
-        if st.button("Vérifier le résultat DeepSeekOCR", key=f"check_deepseek_ocr_result_{project_id}"):
-            status = find_deepseek_ocr_job_status(last_job_id)
-            st.write("job_id :", status.get("job_id") or "")
-            st.write("statut :", status.get("status") or "")
-            st.write("job JSON :", status.get("job_path") or "")
-            if status.get("job") and not deepseek_job_matches_current_selection(status.get("job") or {}, deepseek_current_signature):
-                st.warning("Job DeepSeekOCR ignoré : il ne correspond pas à la sélection courante.")
-                st.stop()
-
-            if status.get("status") in {"queued", "running"}:
-                st.info("Job DeepSeekOCR en attente ou en cours côté PC fixe.")
-            elif status.get("status") == "failed":
-                render_deepseek_failed_status(status)
-            elif status.get("status") == "done":
-                result = load_deepseek_ocr_done_result(status)
-                st.session_state[deepseek_last_result_key] = {"signature": ocr_current_signature, "status": status, "result": result}
-                st.success("Job DeepSeekOCR terminé.")
-                st.write("final_md_path :", result.get("final_md_path") or "")
-                st.write("final_txt_path :", result.get("final_txt_path") or "")
-                st.write("manifest_path :", result.get("manifest_path") or "")
-                manifest = result.get("manifest") or {}
-                if manifest:
-                    st.markdown("#### Qualité OCR DeepSeek")
-                    leading_noise_removed = bool(manifest.get("leading_noise_removed"))
-                    quality_warning = bool(manifest.get("quality_warning"))
-                    detected_numbers = manifest.get("bordereau_piece_numbers_detected") or []
-                    missing_numbers = manifest.get("bordereau_missing_piece_numbers") or []
-                    removed_text = str(manifest.get("leading_noise_removed_text") or "").strip()
-
-                    st.write("Bruit initial supprimé :", "oui" if leading_noise_removed else "non")
-                    if removed_text:
-                        st.write("Texte supprimé :", removed_text)
-                    st.write("Pièces détectées :", ", ".join(str(n) for n in detected_numbers) if detected_numbers else "(aucune)")
-                    st.write("Pièces manquantes :", ", ".join(str(n) for n in missing_numbers) if missing_numbers else "(aucune)")
-                    st.write("quality_warning :", "oui" if quality_warning else "non")
-                    if quality_warning:
-                        st.warning("OCR DeepSeek à vérifier : pièces manquantes détectées.")
-                    if leading_noise_removed:
-                        st.info("Un texte parasite initial a été supprimé avant fusion.")
-                if result.get("warnings"):
-                    st.warning(json.dumps(result["warnings"], ensure_ascii=False, indent=2))
-                if result.get("metrics"):
-                    st.write("Métriques :")
-                    st.json(result["metrics"])
-                if result.get("manifest"):
-                    with st.expander("Manifest final DeepSeekOCR", expanded=False):
-                        st.json(result["manifest"])
-                if result.get("preview"):
-                    token = ocr_signature_token(ocr_current_signature, f"deepseek_preview_{status.get('job_id') or ''}")
-                    source_method = (result.get("metrics") or {}).get("source_method") or (result.get("manifest") or {}).get("source_method") or ""
-                    if source_method:
-                        st.write("source_method :", source_method)
-                    preview_chars = int(result.get("preview_chars") or len(result.get("preview") or ""))
-                    total_chars = int(result.get("preview_total_chars") or preview_chars)
-                    st.caption(f"Aperçu OCR final tronqué : {preview_chars} / {total_chars} caractères")
-                    st.text_area("Aperçu OCR final", value=result["preview"], height=240, key=f"deepseek_ocr_preview_{project_id}_{token}")
-                    if result.get("full_text") and total_chars > preview_chars:
-                        with st.expander("Afficher le texte OCR complet", expanded=False):
-                            st.text_area(
-                                "Texte OCR complet",
-                                value=result["full_text"],
-                                height=420,
-                                key=f"deepseek_ocr_full_text_{project_id}_{token}",
-                            )
+            st.button(
+                "Vérifier le résultat DeepSeekOCR",
+                key=f"check_deepseek_ocr_result_{project_id}",
+                disabled=True,
+            )
+            discovered_jobs = []
+        else:
+            discovered_jobs_all = discover_deepseek_ocr_jobs_for_project(project_id)
+            reset_timestamp = float(st.session_state.get(ocr_reset_timestamp_key) or 0)
+            matching_jobs_all = [
+                item for item in discovered_jobs_all
+                if deepseek_job_matches_current_selection(item.get("job") or {}, deepseek_current_signature)
+            ]
+            discovered_jobs = [
+                item for item in matching_jobs_all
+                if float(item.get("mtime") or 0) >= reset_timestamp
+            ]
+            if discovered_jobs_all and not discovered_jobs:
+                st.caption("Aucun job DeepSeekOCR correspondant à la sélection courante.")
+            old_matching_jobs = [
+                item for item in matching_jobs_all
+                if float(item.get("mtime") or 0) < reset_timestamp
+            ]
+            if old_matching_jobs:
+                with st.expander("Anciens jobs DeepSeekOCR masqués par le reset", expanded=False):
+                    for item in old_matching_jobs[:20]:
+                        st.write(f"{item.get('job_id')} — {item.get('status')} — {item.get('job_path')}")
+            discovered_default = discovered_jobs[0]["job_id"] if discovered_jobs else ""
+            current_job_ids = {item["job_id"] for item in discovered_jobs}
+            follow_state = deepseek_ocr_follow_state(session_last_job, discovered_jobs, last_submission)
+            last_job_default = follow_state.get("job_id") or discovered_default
+            selected_job_from_dropdown = ""
+            if discovered_jobs:
+                labels = [
+                    f"{item['job_id']} — {item['status']}"
+                    for item in discovered_jobs
+                ]
+                default_index = 1
+                if last_job_default:
+                    for idx, item in enumerate(discovered_jobs, start=1):
+                        if item.get("job_id") == last_job_default:
+                            default_index = idx
+                            break
+                selected_label = st.selectbox(
+                    "Jobs DeepSeekOCR trouvés pour cette affaire",
+                    ["(saisie manuelle)"] + labels,
+                    index=default_index if labels else 0,
+                    key=f"deepseek_ocr_found_jobs_{project_id}",
+                )
+                if selected_label != "(saisie manuelle)":
+                    selected_idx = labels.index(selected_label)
+                    dropdown_job_id = discovered_jobs[selected_idx]["job_id"]
+                    if not (session_last_job and session_last_job in current_job_ids):
+                        last_job_default = dropdown_job_id
+                        selected_job_from_dropdown = last_job_default
             else:
-                st.warning("Job DeepSeekOCR introuvable dans queued/running/done/failed.")
+                st.caption("Aucun job DeepSeekOCR correspondant à la sélection courante.")
+
+            if (
+                st.session_state.get(deepseek_follow_job_widget_key)
+                and st.session_state.get(deepseek_follow_job_widget_key) not in current_job_ids
+                and not session_last_job
+            ):
+                st.session_state[deepseek_follow_job_widget_key] = last_job_default
+            if session_last_job:
+                st.session_state[deepseek_follow_job_widget_key] = session_last_job
+                last_job_default = session_last_job
+            last_job_id = st.text_input(
+                "Dernier job_id DeepSeekOCR",
+                value=last_job_default,
+                key=deepseek_follow_job_widget_key,
+            )
+            if selected_job_from_dropdown:
+                last_job_id = selected_job_from_dropdown
+            if follow_state.get("state") == "déposé_non_retrouvé":
+                st.warning(
+                    "État DeepSeekOCR : job déposé, mais non encore retrouvé dans queued/running/done/failed "
+                    "sur la racine _jobs actuellement résolue."
+                )
+                if last_submission:
+                    st.write("Racine _jobs utilisée au dépôt :", last_submission.get("jobs_root") or "")
+                    st.write("Manifest déposé :", last_submission.get("json_path") or "")
+            elif follow_state.get("found"):
+                st.info(f"État DeepSeekOCR : {follow_state.get('state') or 'retrouvé'}.")
+            if st.button("Vérifier le résultat DeepSeekOCR", key=f"check_deepseek_ocr_result_{project_id}"):
+                status = find_deepseek_ocr_job_status(last_job_id)
+                st.write("job_id :", status.get("job_id") or "")
+                st.write("statut :", status.get("status") or "")
+                st.write("job JSON :", status.get("job_path") or "")
+                if status.get("job") and not deepseek_job_matches_current_selection(status.get("job") or {}, deepseek_current_signature):
+                    st.warning("Job DeepSeekOCR ignoré : il ne correspond pas à la sélection courante.")
+                    st.stop()
+
+                if status.get("status") in {"queued", "running"}:
+                    st.info("Job DeepSeekOCR en attente ou en cours côté PC fixe.")
+                elif status.get("status") == "failed":
+                    render_deepseek_failed_status(status)
+                elif status.get("status") == "done":
+                    result = load_deepseek_ocr_done_result(status)
+                    st.session_state[deepseek_last_result_key] = {"signature": ocr_current_signature, "status": status, "result": result}
+                    st.success("Job DeepSeekOCR terminé.")
+                    st.write("final_md_path :", result.get("final_md_path") or "")
+                    st.write("final_txt_path :", result.get("final_txt_path") or "")
+                    st.write("manifest_path :", result.get("manifest_path") or "")
+                    manifest = result.get("manifest") or {}
+                    if manifest:
+                        st.markdown("#### Qualité OCR DeepSeek")
+                        leading_noise_removed = bool(manifest.get("leading_noise_removed"))
+                        quality_warning = bool(manifest.get("quality_warning"))
+                        detected_numbers = manifest.get("bordereau_piece_numbers_detected") or []
+                        missing_numbers = manifest.get("bordereau_missing_piece_numbers") or []
+                        removed_text = str(manifest.get("leading_noise_removed_text") or "").strip()
+
+                        st.write("Bruit initial supprimé :", "oui" if leading_noise_removed else "non")
+                        if removed_text:
+                            st.write("Texte supprimé :", removed_text)
+                        st.write("Pièces détectées :", ", ".join(str(n) for n in detected_numbers) if detected_numbers else "(aucune)")
+                        st.write("Pièces manquantes :", ", ".join(str(n) for n in missing_numbers) if missing_numbers else "(aucune)")
+                        st.write("quality_warning :", "oui" if quality_warning else "non")
+                        if quality_warning:
+                            st.warning("OCR DeepSeek à vérifier : pièces manquantes détectées.")
+                        if leading_noise_removed:
+                            st.info("Un texte parasite initial a été supprimé avant fusion.")
+                    if result.get("warnings"):
+                        st.warning(json.dumps(result["warnings"], ensure_ascii=False, indent=2))
+                    if result.get("metrics"):
+                        st.write("Métriques :")
+                        st.json(result["metrics"])
+                    if result.get("manifest"):
+                        with st.expander("Manifest final DeepSeekOCR", expanded=False):
+                            st.json(result["manifest"])
+                    if result.get("preview"):
+                        token = ocr_signature_token(ocr_current_signature, f"deepseek_preview_{status.get('job_id') or ''}")
+                        source_method = (result.get("metrics") or {}).get("source_method") or (result.get("manifest") or {}).get("source_method") or ""
+                        if source_method:
+                            st.write("source_method :", source_method)
+                        preview_chars = int(result.get("preview_chars") or len(result.get("preview") or ""))
+                        total_chars = int(result.get("preview_total_chars") or preview_chars)
+                        st.caption(f"Aperçu OCR final tronqué : {preview_chars} / {total_chars} caractères")
+                        st.text_area("Aperçu OCR final", value=result["preview"], height=240, key=f"deepseek_ocr_preview_{project_id}_{token}")
+                        if result.get("full_text") and total_chars > preview_chars:
+                            with st.expander("Afficher le texte OCR complet", expanded=False):
+                                st.text_area(
+                                    "Texte OCR complet",
+                                    value=result["full_text"],
+                                    height=420,
+                                    key=f"deepseek_ocr_full_text_{project_id}_{token}",
+                                )
+                else:
+                    st.warning("Job DeepSeekOCR introuvable dans queued/running/done/failed.")
 
         saved_deepseek_result = st.session_state.get(deepseek_last_result_key) or {}
         if saved_deepseek_result.get("result") and saved_deepseek_result.get("signature") == ocr_current_signature:
@@ -16798,22 +16848,8 @@ elif page == "Pré-traitement dépôt PDF":
     ):
         render_standard_ocr_result(saved_standard_ocr_result)
 
-    if st.button("🔎 Analyser Dire/Bordereau", key=f"analyze_dire_bord_{project_id}"):
-        clear_dire_bord_ocr_state()
-        st.session_state[ocr_signature_key] = ocr_current_signature
+    if analyze_dire_bord_clicked:
         if ocr_engine == "DeepSeekOCR avancé":
-            dry_run_docs = build_current_deepseek_dry_run_docs()
-
-            if not dry_run_docs:
-                st.warning("Aucun document sélectionné pour le dry-run DeepSeekOCR.")
-                st.stop()
-
-            st.session_state[deepseek_state_key] = dry_run_docs
-            st.info("Dry-run DeepSeekOCR : aucune conversion PNG, aucun appel /ocr_deepseek_batch, aucun OCR lancé.")
-            st.caption(f"Racine PC fixe locale calculée : {pcfixe_local_root_for_server(project_config, project_id)}")
-            for item in dry_run_docs:
-                st.markdown(f"### {item['type'].capitalize()}")
-                render_deepseek_dry_run(item["paths"], item["payload"], item.get("signature") or {})
             st.stop()
 
         if not ensure_server_ready(MAC_PCFIXE, SERVER_IP, int(SERVER_PORT)):

@@ -25,6 +25,7 @@ def _load_deepseek_helpers(base: Path):
         "find_deepseek_ocr_job_status_in_root",
         "discover_deepseek_ocr_jobs_for_project_in_root",
         "deepseek_ocr_follow_state",
+        "deepseek_ocr_should_scan_jobs",
     }
     module = ast.Module(
         body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted],
@@ -104,8 +105,8 @@ class DeepSeekOcrJobsTests(unittest.TestCase):
 
     def test_deepseek_dry_run_branch_does_not_write_manifest(self):
         text = APP_PATH.read_text(encoding="utf-8-sig")
-        start = text.index('if ocr_engine == "DeepSeekOCR avancé":\n            dry_run_docs')
-        end = text.index("        if not ensure_server_ready", start)
+        start = text.index('        if ocr_engine == "DeepSeekOCR avancé":\n            dry_run_docs')
+        end = text.index('    if ocr_engine == "DeepSeekOCR avancé":\n        with st.expander("Diagnostic DeepSeekOCR VPN / jobs"', start)
         dry_run_branch = text[start:end]
         self.assertIn("st.session_state[deepseek_state_key] = dry_run_docs", dry_run_branch)
         self.assertNotIn("write_deepseek_ocr_job", dry_run_branch)
@@ -137,6 +138,52 @@ class DeepSeekOcrJobsTests(unittest.TestCase):
         self.assertEqual(state["job_id"], "deepseek_ocr_2026-A60_missing")
         self.assertEqual(state["state"], "déposé_non_retrouvé")
         self.assertFalse(state["found"])
+
+    def test_empty_job_id_disables_queue_scan(self):
+        self.assertFalse(self.ns["deepseek_ocr_should_scan_jobs"](""))
+        self.assertFalse(self.ns["deepseek_ocr_should_scan_jobs"]("   "))
+        self.assertTrue(self.ns["deepseek_ocr_should_scan_jobs"]("deepseek_ocr_2026-A60_doc"))
+
+    def test_empty_job_id_ui_disables_check_button_and_avoids_scan(self):
+        text = APP_PATH.read_text(encoding="utf-8-sig")
+        start = text.index('if not deepseek_ocr_should_scan_jobs(session_last_job):')
+        end = text.index("        else:\n            discovered_jobs_all", start)
+        empty_job_block = text[start:end]
+        self.assertIn("Aucun job DeepSeekOCR n’a encore été déposé pour cette sélection.", empty_job_block)
+        self.assertIn('disabled=True', empty_job_block)
+        self.assertNotIn("discover_deepseek_ocr_jobs_for_project", empty_job_block)
+        self.assertNotIn("find_deepseek_ocr_job_status", empty_job_block)
+
+    def test_dry_run_shows_next_step_and_submit_panel_before_stop(self):
+        text = APP_PATH.read_text(encoding="utf-8-sig")
+        start = text.index("    analyze_dire_bord_clicked = st.button")
+        end = text.index('    if ocr_engine == "DeepSeekOCR avancé" and st.session_state.get(deepseek_state_key):', start)
+        dry_run_branch = text[start:end]
+        self.assertIn("Préparation terminée. Aucun job OCR n’a encore été déposé sur le PC fixe.", dry_run_branch)
+        self.assertIn("Étape suivante : cliquer sur « Déposer le job DeepSeekOCR PC fixe ».", dry_run_branch)
+        panel_start = end
+        panel_end = text.index('    if ocr_engine == "DeepSeekOCR avancé":\n        st.markdown("#### Suivi du job DeepSeekOCR")', panel_start)
+        panel_block = text[panel_start:panel_end]
+        self.assertEqual(panel_block.count("render_deepseek_submit_panel()"), 1)
+        self.assertIn("if deepseek_stop_after_submit_panel:", panel_block)
+        self.assertLess(panel_block.index("render_deepseek_submit_panel()"), panel_block.index("st.stop()"))
+
+    def test_submit_panel_is_rendered_once_per_deepseek_run(self):
+        text = APP_PATH.read_text(encoding="utf-8-sig")
+        submit_call_count = text.count("render_deepseek_submit_panel(") - text.count("def render_deepseek_submit_panel(")
+        self.assertEqual(submit_call_count, 1)
+        self.assertEqual(text.count('key=f"submit_deepseek_ocr_job_{project_id}"'), 1)
+        self.assertIn("deepseek_stop_after_submit_panel = True", text)
+
+    def test_submit_diagnostic_includes_jobs_root_queue_job_id_and_manifest(self):
+        text = APP_PATH.read_text(encoding="utf-8-sig")
+        start = text.index('with st.expander("Diagnostic dépôt DeepSeekOCR"')
+        end = text.index('                    st.json(created["job"])', start)
+        diagnostic_block = text[start:end]
+        self.assertIn("Racine _jobs retenue", diagnostic_block)
+        self.assertIn("Chemin complet queued", diagnostic_block)
+        self.assertIn("job_id créé", diagnostic_block)
+        self.assertIn("Manifest écrit", diagnostic_block)
 
     def test_discovery_finds_same_job_in_each_status_folder(self):
         jobs_root = self.base / "_jobs"
