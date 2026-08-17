@@ -4864,6 +4864,13 @@ def data_editor_rows(value) -> list[dict]:
         raw_rows = list(value or [])
     return [sanitize_editor_row(row) for row in raw_rows if isinstance(row, dict)]
 
+def selected_document_labels_from_rows(rows: list[dict]) -> dict[str, str]:
+    return {
+        Path(str(row.get("fichier_source") or "")).name: compact_spaces(row.get("libelle_retenu") or "")
+        for row in rows or []
+        if compact_spaces(row.get("libelle_retenu") or "")
+    }
+
 def is_blank_editor_value(value) -> bool:
     if value is None:
         return True
@@ -5056,6 +5063,46 @@ def piece_reference_metadata(numero_piece, sous_piece: str = "", piece_ref_style
         "reference_piece": piece_reference_piece(numero_piece, suffix, piece_ref_style),
     }
 
+def piece_reference_key(numero_piece, sous_piece: str = "", piece_ref_style: str = "") -> str:
+    return compact_spaces(piece_reference_piece(numero_piece, sous_piece, piece_ref_style)).lower()
+
+def piece_reference_key_from_item(item: dict | None) -> str:
+    item = item or {}
+    return piece_reference_key(
+        coerce_editor_int(item.get("numero_piece") or item.get("numero")),
+        item.get("sous_piece") or "",
+        item.get("piece_ref_style") or "",
+    )
+
+def piece_reference_parent_key(numero_piece) -> str:
+    return piece_reference_key(numero_piece, "", "")
+
+def piece_title_lookup_get(
+    title_lookup: dict,
+    numero_piece,
+    sous_piece: str = "",
+    piece_ref_style: str = "",
+    allow_parent_fallback: bool = True,
+) -> str:
+    numero = coerce_editor_int(numero_piece)
+    if numero is None:
+        return ""
+    full_key = piece_reference_key(numero, sous_piece, piece_ref_style)
+    title = compact_spaces((title_lookup or {}).get(full_key) or "")
+    if title:
+        return title
+    if not sous_piece:
+        return compact_spaces((title_lookup or {}).get(piece_reference_parent_key(numero)) or "")
+    if allow_parent_fallback:
+        return compact_spaces((title_lookup or {}).get(piece_reference_parent_key(numero)) or "")
+    return ""
+
+def piece_reference_details_from_key(value: str) -> dict:
+    key = compact_spaces(value or "")
+    if not key:
+        return {"numero_piece": None, "sous_piece": "", "reference_piece": "", "piece_ref_style": ""}
+    return detect_piece_ref_details_from_filename(f"Piece {key}")
+
 def detect_piece_ref_details_from_filename(filename: str) -> dict:
     text = _ascii_piece_ref_text(filename)
     match = re.search(
@@ -5100,12 +5147,31 @@ def strip_file_title(filename: str) -> str:
     stem = re.sub(r"[_\-]+", " ", stem)
     return compact_spaces(stem)
 
-def fallback_piece_title_from_filename(filename: str, numero_piece: int | None = None) -> str:
+def fallback_piece_title_from_filename(
+    filename: str,
+    numero_piece: int | None = None,
+    sous_piece: str = "",
+    piece_ref_style: str = "",
+) -> str:
     stem = Path(filename or "").stem
     stem = re.sub(r"^\s*\d+\s+", "", stem)
     if numero_piece is not None:
+        suffix = _normalize_piece_suffix(sous_piece)
+        if suffix:
+            if piece_ref_style == "annexe" or re.fullmatch(r"\d+\.\d+", suffix):
+                suffix_pattern = rf"\s*annexe\s+{re.escape(suffix)}"
+            elif piece_ref_style == "hyphen":
+                suffix_pattern = rf"\s*-\s*{re.escape(suffix)}"
+            elif suffix.isdigit() or len(suffix) == 1 and suffix.isalpha():
+                suffix_pattern = rf"\s*[.]\s*{re.escape(suffix)}"
+            elif suffix.lower() in PIECE_REF_TEXT_SUFFIXES:
+                suffix_pattern = rf"\s+{re.escape(suffix)}"
+            else:
+                suffix_pattern = rf"\s+{re.escape(suffix)}"
+        else:
+            suffix_pattern = ""
         stem = re.sub(
-            rf"(?i)^\s*pi[eèé]ce\s*(?:n\s*[°ºo]?\s*)?0*{int(numero_piece)}\b\s*[-–—_:.)]*\s*",
+            rf"(?i)^\s*pi[eèé]ce\s*(?:n\s*[°ºo]?\s*)?0*{int(numero_piece)}{suffix_pattern}(?=$|[\s\-–—_:.)])\s*[-–—_:.)]*\s*",
             "",
             stem,
             count=1,
@@ -5135,6 +5201,219 @@ def build_libelle_affichage(numero_piece, sous_piece: str, libelle_final: str) -
         return libelle
     ref = f"Piece {reference}"
     return f"{ref} - {libelle}" if libelle else ref
+
+def extract_piece_titles_from_deepseek_text(text: str) -> dict:
+    lines = (text or "").splitlines()
+    piece_re = re.compile(
+        r"\bpi[eèéê]ce\s*(?:n\s*[°ºo]?|no|num(?:e|é)ro|#)?\s*0*(\d{1,4})"
+        r"(?P<suffix>\s*annexe\s+[0-9]+(?:[.,][0-9]+)?|\s*[.-]\s*(?:[a-z]|\d{1,4})|\s+(?:bis|ter|quater|[a-z]))?"
+        r"\b\s*(?:[:;|\-–—]\s*)?(?P<title>.*)$",
+        re.IGNORECASE,
+    )
+    simple_numbered_piece_re = re.compile(r"^\s*0*(\d{1,4})\s*[.)/:;\-–—]\s+(.+)$")
+
+    def normalized_line(value: str) -> str:
+        norm = unicodedata.normalize("NFKD", str(value or ""))
+        norm = "".join(ch for ch in norm if not unicodedata.combining(ch)).lower()
+        norm = norm.replace("œ", "oe").replace("æ", "ae")
+        return compact_spaces(re.sub(r"[^a-z0-9]+", " ", norm))
+
+    def clean_title(value: str) -> str:
+        title = str(value or "").strip()
+        title = re.sub(r"^(?:[•*]|\-|e)\s+", "", title, flags=re.IGNORECASE)
+        title = re.sub(r"^[|:\-–—\s]+", "", title)
+        title = re.sub(r"[|`*]+", " ", title)
+        return compact_spaces(title).strip(" .;:-")
+
+    def ignored_line(value: str) -> bool:
+        raw = str(value or "").strip()
+        if not raw:
+            return True
+        if re.fullmatch(r"\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?", raw):
+            return True
+        norm = normalized_line(raw)
+        if norm in {"bordereau de pieces", "bordereau des pieces"}:
+            return True
+        if norm.startswith("page ") and len(norm) <= 12:
+            return True
+        return False
+
+    def piece_match(value: str):
+        return piece_re.search(str(value or ""))
+
+    def piece_key_from_match(match) -> str:
+        raw_ref = f"{match.group(1)}{match.group('suffix') or ''}"
+        details = piece_reference_details_from_key(raw_ref)
+        return piece_reference_key_from_item(details)
+
+    def table_cells(value: str) -> list[str]:
+        raw = str(value or "").strip()
+        if "|" not in raw:
+            return []
+        return [cell.strip() for cell in raw.strip("|").split("|") if cell.strip()]
+
+    def is_bullet_line(value: str) -> bool:
+        return bool(re.match(r"^\s*(?:[•*]|\-|e)\s*(.*)$", str(value or ""), flags=re.IGNORECASE))
+
+    def bullet_tail(value: str) -> str:
+        match = re.match(r"^\s*(?:[•*]|\-|e)\s*(.*)$", str(value or ""), flags=re.IGNORECASE)
+        return clean_title(match.group(1) if match else value)
+
+    def has_attachment_context(value: str) -> bool:
+        norm = normalized_line(value)
+        return "vous trouverez ci joint" in norm or "suite a votre demande" in norm
+
+    def has_bordereau_context(value: str) -> bool:
+        norm = normalized_line(value)
+        if "nouvelles pieces" in norm:
+            return True
+        if "pieces communiquees" in norm or "piece communiquee" in norm:
+            return True
+        return "bordereau" in norm and "pieces" in norm
+
+    def looks_like_unnumbered_attachment(value: str) -> bool:
+        norm = normalized_line(value)
+        if len(norm) < 6:
+            return False
+        wanted = (
+            "devis",
+            "genetin",
+            "proposition",
+            "semofi",
+            "rapport",
+            "oregon",
+            "assignation",
+            "ordonnance commune",
+        )
+        return any(token in norm for token in wanted)
+
+    def collect_bullet_title(start_idx: int) -> str:
+        first = bullet_tail(lines[start_idx])
+        parts = [first] if first else []
+        for next_line in lines[start_idx + 1:]:
+            raw = str(next_line or "")
+            if not raw.strip():
+                if parts:
+                    break
+                continue
+            if is_bullet_line(raw) or raw.lstrip().startswith("## Page"):
+                break
+            if piece_match(raw):
+                break
+            parts.append(clean_title(raw))
+        return clean_title(" ".join(part for part in parts if part))
+
+    def collect_simple_numbered_title(start_idx: int, first_title: str) -> str:
+        parts = [clean_title(first_title)] if clean_title(first_title) else []
+        for next_line in lines[start_idx + 1:]:
+            raw = str(next_line or "")
+            if not raw.strip():
+                if parts:
+                    break
+                continue
+            if raw.lstrip().startswith("## Page"):
+                break
+            if has_bordereau_context(raw):
+                break
+            if simple_numbered_piece_re.match(raw) or piece_match(raw) or is_bullet_line(raw):
+                break
+            if table_cells(raw):
+                break
+            title = clean_title(raw)
+            if title:
+                parts.append(title)
+        return clean_title(" ".join(part for part in parts if part))
+
+    def following_title(start_idx: int) -> str:
+        for next_line in lines[start_idx + 1:]:
+            if ignored_line(next_line):
+                continue
+            cells = table_cells(next_line)
+            candidates = cells if cells else [next_line]
+            for candidate in candidates:
+                if piece_match(candidate):
+                    return ""
+                title = clean_title(candidate)
+                if title:
+                    return title
+        return ""
+
+    pieces: dict[str, str] = {}
+    unnumbered: list[dict] = []
+    seen_unnumbered: set[str] = set()
+    attachment_context_remaining = 0
+    bordereau_context_remaining = 0
+    for idx, line in enumerate(lines):
+        if has_attachment_context(line):
+            attachment_context_remaining = 12
+        if has_bordereau_context(line):
+            bordereau_context_remaining = 80
+            if attachment_context_remaining > 0:
+                attachment_context_remaining -= 1
+            continue
+
+        if is_bullet_line(line):
+            title = collect_bullet_title(idx)
+            key = normalized_line(title)
+            if title and key not in seen_unnumbered and (attachment_context_remaining > 0 or looks_like_unnumbered_attachment(title)):
+                seen_unnumbered.add(key)
+                unnumbered.append({
+                    "numero": "",
+                    "numero_piece": "",
+                    "titre_propose": title,
+                    "editable_title": title,
+                    "origine": "OCR dire / native_pdf_text",
+                    "etat": "à qualifier",
+                    "start_page": None,
+                    "end_page": None,
+                })
+            if attachment_context_remaining > 0:
+                attachment_context_remaining -= 1
+            continue
+
+        if ignored_line(line):
+            if attachment_context_remaining > 0:
+                attachment_context_remaining -= 1
+            if bordereau_context_remaining > 0:
+                bordereau_context_remaining -= 1
+            continue
+
+        if bordereau_context_remaining > 0:
+            simple_match = simple_numbered_piece_re.match(str(line or ""))
+            if simple_match:
+                key = piece_reference_key(simple_match.group(1), "")
+                title = collect_simple_numbered_title(idx, simple_match.group(2) or "")
+                if title:
+                    pieces.setdefault(key, title)
+                bordereau_context_remaining -= 1
+                if attachment_context_remaining > 0:
+                    attachment_context_remaining -= 1
+                continue
+
+        cells = table_cells(line)
+        candidates = cells if cells else [line]
+        for cell_idx, candidate in enumerate(candidates):
+            match = piece_match(candidate)
+            if not match:
+                continue
+            key = piece_key_from_match(match)
+            title = clean_title(match.group("title") or "")
+            if not title and cell_idx + 1 < len(candidates):
+                title = clean_title(candidates[cell_idx + 1])
+            if not title:
+                title = following_title(idx)
+            if key and title:
+                pieces.setdefault(key, title)
+            break
+        if attachment_context_remaining > 0:
+            attachment_context_remaining -= 1
+        if bordereau_context_remaining > 0:
+            bordereau_context_remaining -= 1
+
+    out: dict[str, str | list[dict]] = dict(sorted(pieces.items()))
+    if unnumbered:
+        out["__unnumbered__"] = unnumbered
+    return out
 
 def ocr_source_path_candidates(path: str) -> list[str]:
     raw = str(path or "").strip()
@@ -5691,16 +5970,19 @@ def piece_title_lookup_from_state(mapping_rows: list[dict], extracted_titles: di
             lookup[numero] = title
     return lookup
 
-def piece_title_lookup_from_split_rows(split_rows: list[dict], suggestions: dict | None = None) -> dict[int, str]:
+def piece_title_lookup_from_split_rows(split_rows: list[dict], suggestions: dict | None = None) -> dict[str, str]:
     lookup = {}
     for key, value in (suggestions or {}).items():
-        numero = coerce_editor_int(key)
+        details = piece_reference_details_from_key(str(key))
+        numero = coerce_editor_int(details.get("numero_piece") or key)
+        sous_piece = details.get("sous_piece") or ""
         title = compact_spaces(value or "")
         if numero is not None and title:
-            lookup[numero] = title
+            lookup[piece_reference_key(numero, sous_piece, details.get("piece_ref_style") or "")] = title
     for row in split_rows or []:
         item = dict(row or {})
         numero = coerce_editor_int(item.get("numero_piece") or item.get("numero"))
+        sous_piece = item.get("sous_piece") or ""
         title = compact_spaces(
             item.get("editable_title")
             or item.get("titre_propose")
@@ -5708,8 +5990,9 @@ def piece_title_lookup_from_split_rows(split_rows: list[dict], suggestions: dict
             or item.get("libelle_affichage")
             or ""
         )
-        if numero is not None and title and numero not in lookup:
-            lookup[numero] = title
+        key = piece_reference_key(numero, sous_piece, item.get("piece_ref_style") or "")
+        if numero is not None and title and key not in lookup:
+            lookup[key] = title
     return lookup
 
 def is_piece_placeholder_label(value: str, numero_piece) -> bool:
@@ -5731,18 +6014,19 @@ def is_any_piece_placeholder_label(value: str) -> bool:
     normalized = re.sub(r"[^a-zA-Z0-9]+", "", normalized).lower()
     return bool(re.fullmatch(r"piece\d+", normalized))
 
-def apply_piece_titles_to_split_rows(rows: list[dict], title_lookup: dict[int, str]) -> list[dict]:
+def apply_piece_titles_to_split_rows(rows: list[dict], title_lookup: dict[str, str]) -> list[dict]:
     out = []
     diagnostics = []
     for row in rows or []:
         item = dict(row or {})
         numero = coerce_editor_int(item.get("numero_piece"))
+        sous_piece = item.get("sous_piece") or ""
         current = compact_spaces(item.get("libelle_final") or "")
         placeholder = is_piece_placeholder_label(current, numero)
-        title = compact_spaces(title_lookup.get(numero) or "") if numero is not None else ""
+        title = piece_title_lookup_get(title_lookup, numero, sous_piece, item.get("piece_ref_style") or "") if numero is not None else ""
         if title and placeholder:
             item["libelle_final"] = title
-            item["libelle_affichage"] = build_libelle_affichage(numero, item.get("sous_piece") or "", title)
+            item["libelle_affichage"] = build_libelle_affichage(numero, sous_piece, title)
             item["fichier_sortie"] = split_row_filename(item)
         elif not item.get("fichier_sortie"):
             item["fichier_sortie"] = split_row_filename(item)
@@ -16174,211 +16458,7 @@ elif page == "Pré-traitement dépôt PDF":
                 st.json(job_status["job"])
 
     def extract_piece_titles_from_deepseek_markdown(text: str) -> dict:
-        lines = (text or "").splitlines()
-        piece_re = re.compile(
-            r"\bpi[eèéê]ce\s*(?:n\s*[°ºo]?|no|num(?:e|é)ro|#)?\s*0*(\d{1,3})\b\s*(?:[:;|\-–—]\s*)?(.*)$",
-            re.IGNORECASE,
-        )
-
-        simple_numbered_piece_re = re.compile(r"^\s*0*(\d{1,4})\s*[.)/:;\-–—]\s+(.+)$")
-
-        def normalized_line(value: str) -> str:
-            norm = unicodedata.normalize("NFKD", str(value or ""))
-            norm = "".join(ch for ch in norm if not unicodedata.combining(ch)).lower()
-            norm = norm.replace("œ", "oe").replace("æ", "ae")
-            return compact_spaces(re.sub(r"[^a-z0-9]+", " ", norm))
-
-        def clean_title(value: str) -> str:
-            title = str(value or "").strip()
-            title = re.sub(r"^(?:[•*]|\-|e)\s+", "", title, flags=re.IGNORECASE)
-            title = re.sub(r"^[|:\-–—\s]+", "", title)
-            title = re.sub(r"[|`*_]+", " ", title)
-            return compact_spaces(title).strip(" .;:-")
-
-        def ignored_line(value: str) -> bool:
-            raw = str(value or "").strip()
-            if not raw:
-                return True
-            if re.fullmatch(r"\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?", raw):
-                return True
-            norm = normalized_line(raw)
-            if norm in {"bordereau de pieces", "bordereau des pieces"}:
-                return True
-            if norm.startswith("page ") and len(norm) <= 12:
-                return True
-            return False
-
-        def match_piece(value: str):
-            return piece_re.search(str(value or ""))
-
-        def table_cells(value: str) -> list[str]:
-            raw = str(value or "").strip()
-            if "|" not in raw:
-                return []
-            return [cell.strip() for cell in raw.strip("|").split("|") if cell.strip()]
-
-        def is_bullet_line(value: str) -> bool:
-            return bool(re.match(r"^\s*(?:[•*]|\-|e)\s*(.*)$", str(value or ""), flags=re.IGNORECASE))
-
-        def bullet_tail(value: str) -> str:
-            match = re.match(r"^\s*(?:[•*]|\-|e)\s*(.*)$", str(value or ""), flags=re.IGNORECASE)
-            return clean_title(match.group(1) if match else value)
-
-        def has_attachment_context(value: str) -> bool:
-            norm = normalized_line(value)
-            return "vous trouverez ci joint" in norm or "suite a votre demande" in norm
-
-        def has_bordereau_context(value: str) -> bool:
-            norm = normalized_line(value)
-            if "nouvelles pieces" in norm:
-                return True
-            if "pieces communiquees" in norm or "piece communiquee" in norm:
-                return True
-            return "bordereau" in norm and "pieces" in norm
-
-        def looks_like_unnumbered_attachment(value: str) -> bool:
-            norm = normalized_line(value)
-            if len(norm) < 6:
-                return False
-            wanted = (
-                "devis",
-                "genetin",
-                "proposition",
-                "semofi",
-                "rapport",
-                "oregon",
-                "assignation",
-                "ordonnance commune",
-            )
-            return any(token in norm for token in wanted)
-
-        def collect_bullet_title(start_idx: int) -> str:
-            first = bullet_tail(lines[start_idx])
-            parts = [first] if first else []
-            for next_line in lines[start_idx + 1:]:
-                raw = str(next_line or "")
-                if not raw.strip():
-                    if parts:
-                        break
-                    continue
-                if is_bullet_line(raw) or raw.lstrip().startswith("## Page"):
-                    break
-                if match_piece(raw):
-                    break
-                parts.append(clean_title(raw))
-            return clean_title(" ".join(part for part in parts if part))
-
-        def collect_simple_numbered_title(start_idx: int, first_title: str) -> str:
-            parts = [clean_title(first_title)] if clean_title(first_title) else []
-            for next_line in lines[start_idx + 1:]:
-                raw = str(next_line or "")
-                if not raw.strip():
-                    if parts:
-                        break
-                    continue
-                if raw.lstrip().startswith("## Page"):
-                    break
-                if has_bordereau_context(raw):
-                    break
-                if simple_numbered_piece_re.match(raw) or match_piece(raw) or is_bullet_line(raw):
-                    break
-                if table_cells(raw):
-                    break
-                title = clean_title(raw)
-                if title:
-                    parts.append(title)
-            return clean_title(" ".join(part for part in parts if part))
-
-        def following_title(start_idx: int) -> str:
-            for next_line in lines[start_idx + 1:]:
-                if ignored_line(next_line):
-                    continue
-                cells = table_cells(next_line)
-                candidates = cells if cells else [next_line]
-                for candidate in candidates:
-                    if match_piece(candidate):
-                        return ""
-                    title = clean_title(candidate)
-                    if title:
-                        return title
-            return ""
-
-        pieces: dict[int, str] = {}
-        unnumbered: list[dict] = []
-        seen_unnumbered: set[str] = set()
-        attachment_context_remaining = 0
-        bordereau_context_remaining = 0
-        for idx, line in enumerate(lines):
-            if has_attachment_context(line):
-                attachment_context_remaining = 12
-            if has_bordereau_context(line):
-                bordereau_context_remaining = 80
-                if attachment_context_remaining > 0:
-                    attachment_context_remaining -= 1
-                continue
-
-            if is_bullet_line(line):
-                title = collect_bullet_title(idx)
-                key = normalized_line(title)
-                if title and key not in seen_unnumbered and (attachment_context_remaining > 0 or looks_like_unnumbered_attachment(title)):
-                    seen_unnumbered.add(key)
-                    unnumbered.append({
-                        "numero": "",
-                        "numero_piece": "",
-                        "titre_propose": title,
-                        "editable_title": title,
-                        "origine": "OCR dire / native_pdf_text",
-                        "etat": "à qualifier",
-                        "start_page": None,
-                        "end_page": None,
-                    })
-                if attachment_context_remaining > 0:
-                    attachment_context_remaining -= 1
-                continue
-
-            if ignored_line(line):
-                if attachment_context_remaining > 0:
-                    attachment_context_remaining -= 1
-                if bordereau_context_remaining > 0:
-                    bordereau_context_remaining -= 1
-                continue
-
-            if bordereau_context_remaining > 0:
-                simple_match = simple_numbered_piece_re.match(str(line or ""))
-                if simple_match:
-                    number = int(simple_match.group(1))
-                    title = collect_simple_numbered_title(idx, simple_match.group(2) or "")
-                    if title:
-                        pieces.setdefault(number, title)
-                    bordereau_context_remaining -= 1
-                    if attachment_context_remaining > 0:
-                        attachment_context_remaining -= 1
-                    continue
-
-            cells = table_cells(line)
-            candidates = cells if cells else [line]
-            for cell_idx, candidate in enumerate(candidates):
-                match = match_piece(candidate)
-                if not match:
-                    continue
-                number = int(match.group(1))
-                title = clean_title(match.group(2) or "")
-                if not title and cell_idx + 1 < len(candidates):
-                    title = clean_title(candidates[cell_idx + 1])
-                if not title:
-                    title = following_title(idx)
-                if title:
-                    pieces.setdefault(number, title)
-                break
-            if attachment_context_remaining > 0:
-                attachment_context_remaining -= 1
-            if bordereau_context_remaining > 0:
-                bordereau_context_remaining -= 1
-
-        out: dict[int | str, str | list[dict]] = dict(sorted(pieces.items()))
-        if unnumbered:
-            out["__unnumbered__"] = unnumbered
-        return out
+        return extract_piece_titles_from_deepseek_text(text)
 
     def deepseek_split_rows_from_piece_titles(titles: dict, manifest: dict) -> list[dict]:
         unnumbered_rows = list((titles or {}).get("__unnumbered__") or [])
@@ -16392,19 +16472,33 @@ elif page == "Pré-traitement dépôt PDF":
             int(n) for n in (manifest.get("bordereau_missing_piece_numbers") or [])
             if str(n).strip().isdigit()
         }
-        title_numbers = {
-            int(n) for n in (titles or {}).keys()
-            if str(n).strip().isdigit()
+        title_refs = {
+            piece_reference_key_from_item(piece_reference_details_from_key(str(ref)))
+            for ref in (titles or {}).keys()
+            if ref != "__unnumbered__"
         }
-        all_numbers = sorted(title_numbers | detected_numbers | missing_numbers)
+        detected_refs = {piece_reference_key(n, "") for n in detected_numbers | missing_numbers}
+        all_refs = sorted(
+            title_refs | detected_refs,
+            key=lambda ref: (
+                coerce_editor_int((piece_reference_details_from_key(ref) or {}).get("numero_piece")) or 0,
+                _normalize_piece_suffix((piece_reference_details_from_key(ref) or {}).get("sous_piece") or ""),
+            ),
+        )
 
         rows = []
-        for number in all_numbers:
-            title = compact_spaces((titles or {}).get(number) or "")
+        for ref in all_refs:
+            details = piece_reference_details_from_key(ref)
+            number = coerce_editor_int(details.get("numero_piece"))
+            sous_piece = details.get("sous_piece") or ""
+            title = compact_spaces((titles or {}).get(ref) or (titles or {}).get(number) or "")
             state = "manquante" if number in missing_numbers and not title else "OCR"
             rows.append({
                 "numero": number,
                 "numero_piece": number,
+                "sous_piece": sous_piece,
+                "reference_piece": piece_reference_piece(number, sous_piece, details.get("piece_ref_style") or ""),
+                "piece_ref_style": details.get("piece_ref_style") or "",
                 "titre_propose": title,
                 "editable_title": title,
                 "origine": numbered_origin,
@@ -16809,9 +16903,9 @@ elif page == "Pré-traitement dépôt PDF":
                         st.error(f"Extraction DeepSeekOCR impossible : {exc}")
                     else:
                         numbered_extracted = {
-                            int(number): title
-                            for number, title in (extracted or {}).items()
-                            if str(number).isdigit()
+                            piece_reference_key_from_item(piece_reference_details_from_key(str(reference))): title
+                            for reference, title in (extracted or {}).items()
+                            if reference != "__unnumbered__"
                         }
                         unnumbered_extracted = list((extracted or {}).get("__unnumbered__") or [])
                         st.session_state.piece_title_suggestions = numbered_extracted
@@ -16825,8 +16919,15 @@ elif page == "Pré-traitement dépôt PDF":
                             f"{len(unnumbered_extracted)} pièce(s) non numérotée(s) extraite(s) depuis le résultat DeepSeekOCR."
                         )
                         rows = [
-                            {"numero_piece": number, "libelle_retenu": title}
-                            for number, title in numbered_extracted.items()
+                            {
+                                **piece_reference_metadata(
+                                    (piece_reference_details_from_key(reference) or {}).get("numero_piece"),
+                                    (piece_reference_details_from_key(reference) or {}).get("sous_piece") or "",
+                                    (piece_reference_details_from_key(reference) or {}).get("piece_ref_style") or "",
+                                ),
+                                "libelle_retenu": title,
+                            }
+                            for reference, title in numbered_extracted.items()
                         ]
                         rows.extend({
                             "numero_piece": "",
@@ -18243,16 +18344,17 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 rows = [dict(row or {}) for row in editor_state if isinstance(row, dict)]
             return rows
 
-        def split_table_validated_titles() -> dict[int, str]:
+        def split_table_validated_titles() -> dict[str, str]:
             rows = current_split_table_rows()
-            lookup: dict[int, str] = {}
+            lookup: dict[str, str] = {}
             for row in rows:
                 numero = coerce_editor_int((row or {}).get("numero_piece") or (row or {}).get("numero"))
                 if numero is None:
                     continue
+                sous_piece = (row or {}).get("sous_piece") or ""
                 title = compact_spaces((row or {}).get("editable_title") or (row or {}).get("titre_propose") or "")
                 if title:
-                    lookup[numero] = title
+                    lookup[piece_reference_key(numero, sous_piece, (row or {}).get("piece_ref_style") or "")] = title
             return lookup
 
         def split_table_validated_unnumbered_titles() -> list[dict]:
@@ -18273,7 +18375,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 out.append({**item, "numero_valide": numero, "titre_valide": title})
             return out
 
-        def multi_pdf_child_rows_for_dry_run(title_lookup: dict[int, str]) -> list[dict]:
+        def multi_pdf_child_rows_for_dry_run(title_lookup: dict[str, str]) -> list[dict]:
             if not multi_pdf_name or multi_pdf_name == "(aucun)":
                 return []
             source_rows = (
@@ -18294,16 +18396,17 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                     item.get("libelle_final")
                     or item.get("editable_title")
                     or item.get("titre_propose")
-                    or title_lookup.get(numero_piece)
+                    or piece_title_lookup_get(title_lookup, numero_piece, sous_piece, item.get("piece_ref_style") or "")
                     or ""
                 )
-                target_name = f"PIECE n°{numero_piece} {sanitize_filename(libelle)}.pdf" if libelle else ""
+                reference_piece = piece_reference_piece(numero_piece, sous_piece, item.get("piece_ref_style") or "")
+                target_name = f"PIECE n°{reference_piece} {sanitize_filename(libelle)}.pdf" if libelle else ""
                 action = "classer" if libelle and page_debut is not None and page_fin is not None else "à vérifier"
                 out.append({
                     "fichier_source": Path(str(item.get("fichier_sortie") or target_name or f"piece_{numero_piece}.pdf")).name,
                     "numero_piece": numero_piece,
                     "sous_piece": sous_piece,
-                    "reference_piece": piece_reference_piece(numero_piece, sous_piece),
+                    "reference_piece": reference_piece,
                     "libelle_ocr": libelle,
                     "nom_cible_propose": target_name,
                     "action": action,
@@ -18313,7 +18416,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 })
             return out
 
-        def scan_canonical_split_children(title_lookup: dict[int, str]) -> dict:
+        def scan_canonical_split_children(title_lookup: dict[str, str]) -> dict:
             split_dir_unc = str(
                 Path(pcfixe_unc_root_for_laptop(project_config, get_project_id(project_config, "")))
                 / "AD_Expert_Traitements"
@@ -18362,8 +18465,9 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 sous_piece = piece_ref.get("sous_piece") or sous_piece_key
                 piece_ref_style = piece_ref.get("piece_ref_style") or ""
                 libelle = compact_spaces(
-                    title_lookup.get(numero_piece)
-                    or fallback_piece_title_from_filename(path.name, numero_piece)
+                    piece_title_lookup_get(title_lookup, numero_piece, sous_piece, piece_ref_style, allow_parent_fallback=False)
+                    or fallback_piece_title_from_filename(path.name, numero_piece, sous_piece, piece_ref_style)
+                    or piece_title_lookup_get(title_lookup, numero_piece, sous_piece, piece_ref_style)
                     or path.stem
                 )
                 rows.append({
@@ -18371,9 +18475,10 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                     "numero_piece": numero_piece,
                     "sous_piece": sous_piece,
                     "reference_piece": piece_reference_piece(numero_piece, sous_piece, piece_ref_style),
+                    "piece_ref_style": piece_ref_style,
                     "libelle_ocr": libelle,
                     "nom_cible_propose": (
-                        f"PIECE n°{numero_piece} {sanitize_filename(libelle)}.pdf"
+                        f"PIECE n°{piece_reference_piece(numero_piece, sous_piece, piece_ref_style)} {sanitize_filename(libelle)}.pdf"
                         if libelle else path.name
                     ),
                     "action": "classer" if libelle else "à vérifier",
@@ -18394,8 +18499,10 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             suggestions = st.session_state.get("piece_title_suggestions") or {}
             st.session_state.split_rows = current_split_table_rows()
             validated_titles = split_table_validated_titles()
+            suggestion_titles = piece_title_lookup_from_split_rows([], suggestions)
+            effective_titles = {**suggestion_titles, **validated_titles}
             validated_unnumbered_titles = split_table_validated_unnumbered_titles()
-            split_children_scan = scan_canonical_split_children(validated_titles)
+            split_children_scan = scan_canonical_split_children(effective_titles)
             st.write("Diagnostic enfants du PDF multi-pièces")
             st.json({
                 key: value
@@ -18434,9 +18541,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 used_unnumbered_fallback = False
                 dry_row_origin = ""
                 libelle_ocr = compact_spaces(
-                    validated_titles.get(numero_piece)
-                    or suggestions.get(numero_piece)
-                    or suggestions.get(str(numero_piece))
+                    piece_title_lookup_get(effective_titles, numero_piece, sous_piece, piece_ref.get("piece_ref_style") or "", allow_parent_fallback=False)
                     or ""
                 ) if numero_piece is not None else ""
                 if numero_piece is None or not libelle_ocr:
@@ -18457,27 +18562,38 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                             numero_piece = validated_numero_piece
                         action = "classer"
                         target_name = (
-                            f"PIECE n°{numero_piece} {sanitize_filename(libelle_ocr)}.pdf"
+                            f"PIECE n°{piece_reference_piece(numero_piece, sous_piece, piece_ref.get('piece_ref_style') or '')} {sanitize_filename(libelle_ocr)}.pdf"
                             if numero_piece is not None
                             else f"{sanitize_filename(libelle_ocr)}{Path(name).suffix}"
                         )
                     else:
-                        filename_libelle = fallback_piece_title_from_filename(name, numero_piece)
+                        filename_libelle = fallback_piece_title_from_filename(name, numero_piece, sous_piece, piece_ref.get("piece_ref_style") or "")
                         if filename_libelle:
                             libelle_ocr = filename_libelle
                             dry_row_origin = "nom_fichier"
                             action = "classer"
                             target_name = (
-                                f"PIECE n°{numero_piece} {sanitize_filename(libelle_ocr)}.pdf"
+                                f"PIECE n°{piece_reference_piece(numero_piece, sous_piece, piece_ref.get('piece_ref_style') or '')} {sanitize_filename(libelle_ocr)}.pdf"
                                 if numero_piece is not None
                                 else f"{sanitize_filename(libelle_ocr)}{Path(name).suffix}"
                             )
                         else:
-                            action = "à vérifier"
-                            target_name = ""
+                            parent_libelle = piece_title_lookup_get(
+                                effective_titles,
+                                numero_piece,
+                                sous_piece,
+                                piece_ref.get("piece_ref_style") or "",
+                            ) if numero_piece is not None else ""
+                            if parent_libelle:
+                                libelle_ocr = parent_libelle
+                                action = "classer"
+                                target_name = f"PIECE n°{piece_reference_piece(numero_piece, sous_piece, piece_ref.get('piece_ref_style') or '')} {sanitize_filename(libelle_ocr)}.pdf"
+                            else:
+                                action = "à vérifier"
+                                target_name = ""
                 elif libelle_ocr:
                     action = "classer"
-                    target_name = f"PIECE n°{numero_piece} {sanitize_filename(libelle_ocr)}.pdf"
+                    target_name = f"PIECE n°{piece_reference_piece(numero_piece, sous_piece, piece_ref.get('piece_ref_style') or '')} {sanitize_filename(libelle_ocr)}.pdf"
                 else:
                     action = "à vérifier"
                     target_name = ""
@@ -18486,6 +18602,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                     "numero_piece": numero_piece or "",
                     "sous_piece": sous_piece,
                     "reference_piece": piece_reference_piece(numero_piece, sous_piece, piece_ref.get("piece_ref_style") or ""),
+                    "piece_ref_style": piece_ref.get("piece_ref_style") or "",
                     "libelle_ocr": libelle_ocr,
                     "nom_cible_propose": target_name,
                     "action": action,
@@ -18517,11 +18634,11 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
 
         qualification_rows = []
         title_lookup_for_summary = split_table_validated_titles()
-        title_lookup_for_summary.update({
-            coerce_editor_int(k): v
-            for k, v in (st.session_state.get("piece_title_suggestions") or {}).items()
-            if coerce_editor_int(k) is not None and coerce_editor_int(k) not in title_lookup_for_summary
-        })
+        suggestion_lookup_for_summary = piece_title_lookup_from_split_rows(
+            [],
+            st.session_state.get("piece_title_suggestions") or {},
+        )
+        title_lookup_for_summary = {**suggestion_lookup_for_summary, **title_lookup_for_summary}
         current_split_children_scan = scan_canonical_split_children(title_lookup_for_summary)
         current_split_child_rows = current_split_children_scan.get("rows") or []
         separated_piece_rows_by_name = {
@@ -18562,7 +18679,25 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             numero_piece = piece_ref.get("numero_piece")
             sous_piece = piece_ref.get("sous_piece") or ""
             piece_ref_style = piece_ref.get("piece_ref_style") or ""
-            libelle = compact_spaces(title_lookup_for_summary.get(numero_piece) or "") if numero_piece is not None else ""
+            libelle = (
+                piece_title_lookup_get(
+                    title_lookup_for_summary,
+                    numero_piece,
+                    sous_piece,
+                    piece_ref_style,
+                    allow_parent_fallback=False,
+                )
+                if numero_piece is not None else ""
+            )
+            if role == "piece" and not libelle:
+                libelle = fallback_piece_title_from_filename(name, numero_piece, sous_piece, piece_ref_style)
+            if role == "piece" and not libelle:
+                libelle = piece_title_lookup_get(
+                    title_lookup_for_summary,
+                    numero_piece,
+                    sous_piece,
+                    piece_ref_style,
+                )
             dry_piece_row = separated_piece_rows_by_name.get(Path(name).name)
             if dry_piece_row:
                 role = "piece"
@@ -18572,7 +18707,10 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                     piece_ref_style = ""
                 target_stem = compact_spaces(Path(str(dry_piece_row.get("nom_cible_propose") or "")).stem)
                 fallback_title = (
-                    compact_spaces(f"PIECE n°{numero_piece} {dry_piece_row.get('libelle_ocr') or ''}")
+                    compact_spaces(
+                        f"PIECE n°{piece_reference_piece(numero_piece, sous_piece, dry_piece_row.get('piece_ref_style') or piece_ref_style)} "
+                        f"{dry_piece_row.get('libelle_ocr') or ''}"
+                    )
                     if numero_piece is not None
                     else compact_spaces(dry_piece_row.get("libelle_ocr") or "")
                 )
@@ -18600,17 +18738,23 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             child_path = Path(str(child_row.get("chemin_source") or ""))
             numero_piece = coerce_editor_int(child_row.get("numero_piece"))
             sous_piece = compact_spaces(child_row.get("sous_piece") or "")
-            reference_piece = piece_reference_piece(numero_piece, sous_piece)
+            child_piece_ref_style = child_row.get("piece_ref_style") or ""
+            reference_piece = piece_reference_piece(numero_piece, sous_piece, child_piece_ref_style)
             target_stem = compact_spaces(
                 Path(str(child_row.get("nom_cible_propose") or "")).stem
             )
             child_title = compact_spaces(
                 child_row.get("libelle_ocr")
-                or title_lookup_for_summary.get(numero_piece)
+                or piece_title_lookup_get(
+                    title_lookup_for_summary,
+                    numero_piece,
+                    sous_piece,
+                    allow_parent_fallback=False,
+                )
                 or child_path.stem
             )
             libelle = target_stem or (
-                f"PIECE n°{numero_piece} {child_title}"
+                f"PIECE n°{reference_piece} {child_title}"
                 if numero_piece is not None and child_title
                 else child_title
             )
@@ -18631,7 +18775,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 "numero_piece": numero_piece,
                 "sous_piece": sous_piece,
                 "reference_piece": reference_piece,
-                "piece_ref_style": "",
+                "piece_ref_style": child_piece_ref_style,
             }
         multi_pdf_children_missing = bool(
             multi_pdf_name
@@ -18674,11 +18818,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 and not re.match(r"(?i)^PIECE\b", compact_spaces(row.get("libelle_retenu") or ""))
             )
         ]
-        selected_document_labels = {
-            Path(str(row.get("fichier_source") or "")).name: compact_spaces(row.get("libelle_retenu") or "")
-            for row in qualification_rows
-            if compact_spaces(row.get("libelle_retenu") or "")
-        }
+        selected_document_labels = selected_document_labels_from_rows(qualification_rows)
         selected_document_piece_refs = {}
         for row in qualification_rows:
             row_name = Path(str(row.get("fichier_source") or "")).name

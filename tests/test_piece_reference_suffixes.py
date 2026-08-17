@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import ast
+import io
+import shutil
+import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 
@@ -15,11 +19,22 @@ def _load_piece_helpers():
         "_ascii_piece_ref_text",
         "compact_spaces",
         "_normalize_piece_suffix",
+        "is_blank_editor_value",
+        "coerce_editor_int",
         "piece_reference_piece",
         "piece_reference_metadata",
+        "piece_reference_key",
+        "piece_reference_key_from_item",
+        "piece_reference_parent_key",
+        "piece_title_lookup_get",
+        "piece_reference_details_from_key",
         "detect_piece_ref_details_from_filename",
         "detect_piece_ref_from_filename",
+        "fallback_piece_title_from_filename",
         "build_libelle_affichage",
+        "extract_piece_titles_from_deepseek_text",
+        "piece_title_lookup_from_split_rows",
+        "selected_document_labels_from_rows",
         "document_registry_fingerprint",
         "copy_ingestion_uploaded_originals",
     }
@@ -38,6 +53,8 @@ def _load_piece_helpers():
         "Path": Path,
         "re": __import__("re"),
         "unicodedata": __import__("unicodedata"),
+        "hashlib": __import__("hashlib"),
+        "datetime": datetime,
         "pj": lambda *parts: str(Path(str(parts[0])).joinpath(*[str(p) for p in parts[1:] if str(p)])),
         "normalize_document_role": lambda role: str(role or ""),
         "document_type_from_role": lambda role: str(role or ""),
@@ -151,6 +168,142 @@ class PieceReferenceSuffixTests(unittest.TestCase):
             fp({"numero_piece": 1, "sous_piece": "2.10", "fichier_source": "a.pdf"}),
             fp({"numero_piece": 1, "sous_piece": "2.11", "fichier_source": "a.pdf"}),
         )
+
+    def test_deepseek_extraction_keeps_sub_piece_references_distinct(self):
+        text = """Bordereau :
+Pièce 10
+Note LGI sur les 7 réserves à la livraison
+Pièce 10.1
+2022_12_16_SEBIA_SB_00_PRO_ENS_DOC_TN_073A_A Bilan thermique et aéraulique
+Pièce 10.2
+2024_07_26_Mail LG vers SEBIA_Réserve 2521
+"""
+        titles = self.ns["extract_piece_titles_from_deepseek_text"](text)
+        self.assertEqual(titles["10"], "Note LGI sur les 7 réserves à la livraison")
+        self.assertEqual(
+            titles["10.1"],
+            "2022_12_16_SEBIA_SB_00_PRO_ENS_DOC_TN_073A_A Bilan thermique et aéraulique",
+        )
+        self.assertEqual(titles["10.2"], "2024_07_26_Mail LG vers SEBIA_Réserve 2521")
+
+    def test_sub_piece_prefers_own_ocr_title_over_parent_title(self):
+        lookup = {
+            "10": "Note LGI sur les 7 réserves à la livraison",
+            "10.1": "2022_12_16_SEBIA_SB_00_PRO_ENS_DOC_TN_073A_A Bilan thermique et aéraulique",
+        }
+        self.assertEqual(
+            self.ns["piece_title_lookup_get"](lookup, 10, "1"),
+            "2022_12_16_SEBIA_SB_00_PRO_ENS_DOC_TN_073A_A Bilan thermique et aéraulique",
+        )
+
+    def test_sub_piece_uses_filename_before_parent_fallback(self):
+        lookup = {"10": "Note LGI sur les 7 réserves à la livraison"}
+        filename_title = self.ns["fallback_piece_title_from_filename"](
+            "Pièce n°10.1 - 2022_12_16_SEBIA_SB_00_PRO_ENS_DOC_TN_073A_A Bilan thermique et aéraulique.pdf",
+            10,
+            "1",
+            "dot",
+        )
+        self.assertEqual(
+            filename_title,
+            "2022_12_16_SEBIA_SB_00_PRO_ENS_DOC_TN_073A_A Bilan thermique et aéraulique",
+        )
+        self.assertEqual(
+            self.ns["piece_title_lookup_get"](lookup, 10, "1", "dot", allow_parent_fallback=False),
+            "",
+        )
+
+    def test_parent_fallback_is_last_resort_for_sub_piece(self):
+        lookup = {"10": "Note LGI sur les 7 réserves à la livraison"}
+        filename_title = self.ns["fallback_piece_title_from_filename"]("Pièce n°10.1.pdf", 10, "1", "dot")
+        self.assertEqual(filename_title, "")
+        self.assertEqual(
+            self.ns["piece_title_lookup_get"](lookup, 10, "1", "dot"),
+            "Note LGI sur les 7 réserves à la livraison",
+        )
+
+    def test_filename_fallback_preserves_annexes_and_simple_pieces(self):
+        self.assertEqual(
+            self.ns["fallback_piece_title_from_filename"](
+                "Piece 1 Annexe 1.1_Programme_version modifiée - signés.pdf",
+                1,
+                "1.1",
+                "annexe",
+            ),
+            "Programme_version modifiée - signés",
+        )
+        self.assertEqual(
+            self.ns["fallback_piece_title_from_filename"](
+                "Pièce n°2 - PV de livraison unité expedition du 25 juin 2024.pdf",
+                2,
+                "",
+            ),
+            "PV de livraison unité expedition du 25 juin 2024",
+        )
+
+    def test_selected_document_labels_are_distinct_and_manual_values_win(self):
+        rows = [
+            {
+                "fichier_source": "Piece 10 Note LGI.pdf",
+                "libelle_retenu": "PIECE n°10 Note LGI sur les 7 réserves à la livraison",
+            },
+            {
+                "fichier_source": "Pièce n°10.1 - Bilan.pdf",
+                "libelle_retenu": "PIECE n°10.1 Libellé corrigé manuel",
+            },
+            {
+                "fichier_source": "Pièce n°10.2 - Mail.pdf",
+                "libelle_retenu": "PIECE n°10.2 2024_07_26_Mail LG vers SEBIA_Réserve 2521",
+            },
+        ]
+        labels = self.ns["selected_document_labels_from_rows"](rows)
+        self.assertEqual(labels["Piece 10 Note LGI.pdf"], "PIECE n°10 Note LGI sur les 7 réserves à la livraison")
+        self.assertEqual(labels["Pièce n°10.1 - Bilan.pdf"], "PIECE n°10.1 Libellé corrigé manuel")
+        self.assertEqual(labels["Pièce n°10.2 - Mail.pdf"], "PIECE n°10.2 2024_07_26_Mail LG vers SEBIA_Réserve 2521")
+
+    def test_copy_persists_distinct_libelle_final_in_transmission_event(self):
+        tmp_root = Path(tempfile.mkdtemp(prefix="llm_assistant_piece_labels_", dir=r"C:\CodexWorkspace"))
+        try:
+            class Uploaded(io.BytesIO):
+                def __init__(self, name: str):
+                    super().__init__(b"%PDF-1.4\n")
+                    self.name = name
+
+            files = [
+                Uploaded("Piece 10 Note LGI.pdf"),
+                Uploaded("Pièce n°10.1 - Bilan.pdf"),
+                Uploaded("Pièce n°10.2 - Mail.pdf"),
+            ]
+            labels = {
+                "Piece 10 Note LGI.pdf": "PIECE n°10 Note LGI sur les 7 réserves à la livraison",
+                "Pièce n°10.1 - Bilan.pdf": "PIECE n°10.1 2022_12_16_SEBIA Bilan thermique",
+                "Pièce n°10.2 - Mail.pdf": "PIECE n°10.2 2024_07_26_Mail LG vers SEBIA",
+            }
+            refs = {
+                "Piece 10 Note LGI.pdf": {"numero_piece": 10, "sous_piece": "", "piece_ref_style": ""},
+                "Pièce n°10.1 - Bilan.pdf": {"numero_piece": 10, "sous_piece": "1", "piece_ref_style": "dot"},
+                "Pièce n°10.2 - Mail.pdf": {"numero_piece": 10, "sous_piece": "2", "piece_ref_style": "dot"},
+            }
+            event = self.ns["copy_ingestion_uploaded_originals"](
+                str(tmp_root),
+                "2026-A60",
+                {"code_partie": 2, "nom": "LEON GROSSE IMMOBILIER", "folder_rel": "02_Partie"},
+                files,
+                {"date_transmission_expert": "2026-06-15", "type_transmission": "lettre"},
+                {},
+                {name: "piece" for name in labels},
+                labels,
+                {},
+                refs,
+            )
+            copied = {item["name"]: item for item in event["copied"]}
+            self.assertEqual(copied["Piece 10 Note LGI.pdf"]["libelle_final"], labels["Piece 10 Note LGI.pdf"])
+            self.assertEqual(copied["Pièce n°10.1 - Bilan.pdf"]["libelle_final"], labels["Pièce n°10.1 - Bilan.pdf"])
+            self.assertEqual(copied["Pièce n°10.2 - Mail.pdf"]["libelle_affichage"], labels["Pièce n°10.2 - Mail.pdf"])
+            self.assertEqual(copied["Pièce n°10.1 - Bilan.pdf"]["reference_piece"], "10.1")
+            self.assertEqual(copied["Pièce n°10.2 - Mail.pdf"]["reference_piece"], "10.2")
+        finally:
+            shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 if __name__ == "__main__":
