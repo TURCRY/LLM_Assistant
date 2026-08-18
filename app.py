@@ -3223,6 +3223,32 @@ def normalize_document_label(*values, reject_values: list[str] | None = None, fi
         return clean_document_filename_label(values[-1])
     return ""
 
+def label_contains_piece_reference(label: str, numero_piece, sous_piece: str = "") -> bool:
+    clean_label = compact_spaces(label)
+    if not clean_label or not numero_piece:
+        return False
+    numero_text = str(numero_piece).strip()
+    if numero_text.isdigit():
+        numero_pattern = f"0*{int(numero_text)}"
+    else:
+        numero_pattern = re.escape(numero_text)
+    suffix = compact_spaces(str(sous_piece or ""))
+    piece_word = r"pi[eèé]ce"
+    reference_end = r"(?=\s*(?:-|$))"
+    if not suffix:
+        pattern = rf"\b{piece_word}\s+{numero_pattern}{reference_end}"
+        return bool(re.search(pattern, clean_label, flags=re.IGNORECASE))
+    suffix_pattern = re.escape(suffix).replace(r"\ ", r"\s+")
+    if re.fullmatch(r"[A-Za-z]", suffix):
+        pattern = rf"\b{piece_word}\s+{numero_pattern}\s*\.\s*{suffix_pattern}{reference_end}"
+    elif re.fullmatch(r"\d+(?:\.\d+)+", suffix):
+        pattern = rf"\b{piece_word}\s+{numero_pattern}(?:\s+annexe\s+|\s*\.\s*){suffix_pattern}{reference_end}"
+    elif re.fullmatch(r"\d+", suffix):
+        pattern = rf"\b{piece_word}\s+{numero_pattern}(?:\s*[-.]\s*|\s+annexe\s+){suffix_pattern}{reference_end}"
+    else:
+        pattern = rf"\b{piece_word}\s+{numero_pattern}\s+{suffix_pattern}{reference_end}"
+    return bool(re.search(pattern, clean_label, flags=re.IGNORECASE))
+
 def piece_label_with_reference(doc: dict, label: str) -> str:
     numero_piece = doc.get("numero_piece")
     if not numero_piece:
@@ -3238,6 +3264,8 @@ def piece_label_with_reference(doc: dict, label: str) -> str:
             or clean_document_filename_label(doc.get("fichier_source"))
         )
     if clean_label.lower().startswith(reference_only.lower()):
+        return clean_label
+    if label_contains_piece_reference(clean_label, numero_piece, sous_piece):
         return clean_label
     return build_libelle_affichage(numero_piece, sous_piece, clean_label)
 
@@ -3325,7 +3353,28 @@ def extract_numero_document_from_filename(doc: dict) -> str:
     return ""
 
 def valid_expert_doc_id(value: str) -> bool:
-    return bool(re.match(r"^\d{2}-\d{3}$", str(value or "").strip()))
+    return bool(re.match(r"^\d{2}-\d{3,4}$", str(value or "").strip()))
+
+def expert_doc_id_sort_key(value: str) -> tuple:
+    text = compact_spaces(value or "")
+    m = re.match(r"^(\d{2})-(\d{3,4})$", text)
+    if not m:
+        return (1, 0, 0, text)
+    return (0, int(m.group(1)), int(m.group(2)), text)
+
+def etat2_document_sort_key(doc: dict) -> tuple:
+    expert_doc_id = compact_spaces(doc.get("expert_doc_id") or "")
+    numero_piece_rank = int(doc.get("numero_piece") or 0) if str(doc.get("numero_piece") or "").isdigit() else 0
+    fallback_key = (1, numero_piece_rank, doc.get("fichier_source") or "")
+    if valid_expert_doc_id(expert_doc_id):
+        document_key = expert_doc_id_sort_key(expert_doc_id)
+    else:
+        document_key = fallback_key
+    return (
+        -parse_date_for_sort(document_state_date(doc)).toordinal(),
+        doc.get("deposant") or "",
+        document_key,
+    )
 
 def document_registry_fingerprint(doc: dict) -> str:
     return "|".join([
@@ -3743,6 +3792,9 @@ def is_real_non_piece_document(doc: dict) -> bool:
     ])
 
 def doc_dedupe_key(doc: dict) -> tuple:
+    expert_doc_id = compact_spaces(doc.get("expert_doc_id") or "")
+    if valid_expert_doc_id(expert_doc_id):
+        return ("expert_doc_id", expert_doc_id)
     date_key = str(doc.get("date_transmission_expert") or "").strip()
     deposant_key = compact_spaces(doc.get("deposant") or "").lower()
     numero = str(doc.get("numero_piece") or "").strip()
@@ -4063,12 +4115,7 @@ def build_document_states(records: list[dict], aff_id: str = "", aff_root_local:
     state3_columns = ["partie_deposant", "expert_doc_id", "date_transmission", "libelle"]
     etat2 = sorted(
         docs,
-        key=lambda d: (
-            -parse_date_for_sort(document_state_date(d)).toordinal(),
-            d.get("deposant") or "",
-            int(d.get("numero_piece") or 0) if str(d.get("numero_piece") or "").isdigit() else 0,
-            d.get("fichier_source") or "",
-        ),
+        key=etat2_document_sort_key,
     )
     state1_letter_or_dire_groups = {
         state1_group_key(doc)
@@ -5201,6 +5248,106 @@ def build_libelle_affichage(numero_piece, sous_piece: str, libelle_final: str) -
         return libelle
     ref = f"Piece {reference}"
     return f"{ref} - {libelle}" if libelle else ref
+
+INGESTION_DOCUMENT_SUBJECT_ORDER = (
+    "Introduction",
+    "Reserve 2521",
+    "Reserve 4226",
+    "Reserve 4908",
+    "Reserve 5431",
+    "Reserve 5584",
+    "Reserve 5951",
+    "Reserve 5959",
+)
+
+def _document_ingestion_sort_text(value: str) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    return compact_spaces(re.sub(r"[^a-zA-Z0-9]+", " ", text)).casefold()
+
+def _document_ingestion_subject_from_filename(filename: str) -> str:
+    stem = Path(filename or "").stem
+    parts = re.split(r"\s+-\s+", stem, maxsplit=2)
+    if len(parts) >= 3 and _document_ingestion_sort_text(parts[0]).startswith("piece"):
+        return compact_spaces(parts[1])
+    return ""
+
+def _document_ingestion_display_subject(subject: str) -> str:
+    normalized = _document_ingestion_sort_text(subject)
+    if normalized == "introduction":
+        return "Introduction"
+    reserve_match = re.fullmatch(r"reserve\s+(\d+)", normalized)
+    if reserve_match:
+        return f"Réserve {reserve_match.group(1)}"
+    return compact_spaces(subject)
+
+def _document_ingestion_display_reference(piece_ref: dict) -> str:
+    numero_piece = piece_ref.get("numero_piece")
+    if numero_piece is None:
+        return ""
+    reference = piece_reference_piece(
+        numero_piece,
+        piece_ref.get("sous_piece") or "",
+        piece_ref.get("piece_ref_style") or "",
+    )
+    return reference.lower() if reference else ""
+
+def document_ingestion_business_label_from_filename(filename: str, piece_ref: dict | None = None) -> str:
+    name = Path(str(filename or "")).name
+    stem = Path(name).stem
+    parts = re.split(r"\s+-\s+", stem, maxsplit=2)
+    if len(parts) < 3 or not _document_ingestion_sort_text(parts[0]).startswith("piece"):
+        return ""
+    subject = compact_spaces(parts[1])
+    subject_key = _document_ingestion_sort_text(subject)
+    known_subjects = {
+        _document_ingestion_sort_text(label)
+        for label in INGESTION_DOCUMENT_SUBJECT_ORDER
+    }
+    if subject_key not in known_subjects:
+        return ""
+    piece_ref = piece_ref or detect_piece_ref_details_from_filename(name)
+    reference = _document_ingestion_display_reference(piece_ref)
+    if not reference:
+        return ""
+    label = compact_spaces(parts[2])
+    return compact_spaces(f"{_document_ingestion_display_subject(subject)} - Pièce {reference} - {label}")
+
+def _document_ingestion_suffix_sort_key(sous_piece: str) -> tuple:
+    suffix = _normalize_piece_suffix(sous_piece or "")
+    if not suffix:
+        return (0, 0, "")
+    if suffix.isdigit():
+        return (1, int(suffix), "")
+    if len(suffix) == 1 and suffix.isalpha():
+        return (1, ord(suffix.upper()) - ord("A") + 1, "")
+    return (2, 0, _document_ingestion_sort_text(suffix))
+
+def document_ingestion_sort_key(filename: str) -> tuple:
+    name = Path(str(filename or "")).name
+    subject = _document_ingestion_subject_from_filename(name)
+    subject_order = {
+        _document_ingestion_sort_text(label): index
+        for index, label in enumerate(INGESTION_DOCUMENT_SUBJECT_ORDER)
+    }
+    subject_key = _document_ingestion_sort_text(subject)
+    subject_rank = subject_order.get(subject_key, len(INGESTION_DOCUMENT_SUBJECT_ORDER))
+    subject_missing_rank = 0 if subject else 1
+    piece_ref = detect_piece_ref_details_from_filename(name)
+    numero_piece = piece_ref.get("numero_piece")
+    numero_rank = int(numero_piece) if numero_piece is not None else 1_000_000
+    suffix_rank = _document_ingestion_suffix_sort_key(piece_ref.get("sous_piece") or "")
+    normalized_name = _document_ingestion_sort_text(name)
+    annexe_rank = 1 if re.search(r"(?i)(?:^|\s+-\s+|[\s_])annexe(?:[\s_]|$)", Path(name).stem) else 0
+    return (
+        subject_rank,
+        subject_missing_rank,
+        subject_key,
+        numero_rank,
+        suffix_rank,
+        annexe_rank,
+        normalized_name,
+    )
 
 def extract_piece_titles_from_deepseek_text(text: str) -> dict:
     lines = (text or "").splitlines()
@@ -18630,6 +18777,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
         for name in [dire_name, bcp_name, *piece_names, *other_names]:
             if name and name != "(aucun)" and name not in selected_names:
                 selected_names.append(name)
+        selected_names = sorted(selected_names, key=document_ingestion_sort_key)
         selected_document_roles = build_ingestion_document_roles(dire_name, bcp_name, piece_names, multi_pdf_name, other_names=other_names)
         if multi_pdf_name and multi_pdf_name != "(aucun)":
             selected_document_roles.pop(Path(multi_pdf_name).name, None)
@@ -18691,6 +18839,8 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 )
                 if numero_piece is not None else ""
             )
+            if role == "piece" and not libelle:
+                libelle = document_ingestion_business_label_from_filename(name, piece_ref)
             if role == "piece" and not libelle:
                 libelle = fallback_piece_title_from_filename(name, numero_piece, sous_piece, piece_ref_style)
             if role == "piece" and not libelle:
