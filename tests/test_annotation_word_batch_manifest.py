@@ -1040,6 +1040,10 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
         )
         self.assertTrue(preview["job"]["batch_nas_publish_succeeded"])
         self.assertTrue(preview["job"]["batch_output_verified"])
+        expected_context = self.paths["nas_trans_dir"] / "contexte_general_photos.json"
+        self.assertEqual(preview["job"]["contexte_general_photos_json"], str(expected_context))
+        self.assertIn("--contexte-general-photos-json", preview["command_preview"])
+        self.assertIn(str(expected_context), preview["command_preview"])
 
     def test_no_batch_preview_is_unavailable_without_valueerror(self):
         preview = self.ns["_photo_report_job_preview"](

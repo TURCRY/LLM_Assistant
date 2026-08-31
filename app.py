@@ -10042,16 +10042,60 @@ def submit_annotation_photos_batch_publish_retry_job(
     return result
 
 
-def _patch_infos_llm_backend(infos_path: Path, backend: str) -> tuple[str, str]:
+def _patch_captation_llm_backend(
+    *,
+    config_llm_path: Path,
+    backend: str,
+    infos_path: Path | None = None,
+) -> dict:
+    """Écrit le backend LLM du batch photos dans config_llm.json (source d'autorité).
+
+    Le batch PC fixe (batch_all_photos_pcfixe.py) lit exclusivement
+    config_llm.json["llm_backend"]. Le champ top-level infos_projet.json["llm_backend"]
+    est conservé uniquement pour compatibilité/affichage UI et est synchronisé en
+    best-effort : son échec ne bloque pas l'écriture autoritaire de config_llm.json.
+    """
     backend = _normalize_cr_llm_backend(backend)
-    data = load_json(str(infos_path), {})
-    if not isinstance(data, dict):
-        raise ValueError(f"infos_projet.json invalide : {infos_path}")
-    old = str(data.get("llm_backend") or "")
-    updated = json.loads(json.dumps(data))
-    updated["llm_backend"] = backend
-    _atomic_write_json(infos_path, updated)
-    return old, backend
+    config_data = load_json(str(config_llm_path), {})
+    if not isinstance(config_data, dict):
+        raise ValueError(f"config_llm.json invalide : {config_llm_path}")
+    config_old = str(config_data.get("llm_backend") or "")
+    config_written = str(config_old).strip().lower() != backend
+    if config_written:
+        config_updated = json.loads(json.dumps(config_data))
+        config_updated["llm_backend"] = backend
+        _atomic_write_json(config_llm_path, config_updated)
+
+    infos_old = ""
+    infos_written = False
+    infos_sync_error = ""
+    if infos_path is not None:
+        if not infos_path.is_file():
+            infos_sync_error = f"infos_projet.json absent : non synchronisé ({infos_path})"
+        else:
+            try:
+                infos_data = load_json(str(infos_path), {})
+                if isinstance(infos_data, dict):
+                    infos_old = str(infos_data.get("llm_backend") or "")
+                    if str(infos_old).strip().lower() != backend:
+                        infos_updated = json.loads(json.dumps(infos_data))
+                        infos_updated["llm_backend"] = backend
+                        _atomic_write_json(infos_path, infos_updated)
+                        infos_written = True
+                else:
+                    infos_sync_error = f"infos_projet.json invalide : {infos_path}"
+            except Exception as exc:
+                infos_sync_error = str(exc)
+
+    return {
+        "backend": backend,
+        "config_llm_path": str(config_llm_path),
+        "config_llm_old": config_old,
+        "config_llm_written": config_written,
+        "infos_old": infos_old,
+        "infos_written": infos_written,
+        "infos_sync_error": infos_sync_error,
+    }
 
 def _photo_report_job_preview(
     *,
@@ -10167,6 +10211,7 @@ def _photo_report_job_preview(
         if manifest_batch_hash and manifest_batch_hash != expected_batch_hash:
             raise ValueError("hash photos_batch.csv NAS différent du manifest batch moderne retenu.")
     infos_job_path = paths["nas_infos"]
+    contexte_general_photos_path = paths["nas_trans_dir"] / "contexte_general_photos.json"
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     job_id = (
         f"annotation_word_{_safe_job_token(id_affaire)}_"
@@ -10181,6 +10226,7 @@ def _photo_report_job_preview(
         "id_captation": id_captation,
         "infos_projet": str(infos_job_path),
         "infos_projet_json_nas": str(paths["nas_infos"]),
+        "contexte_general_photos_json": str(contexte_general_photos_path),
         "photos_csv_nas": str(paths["nas_photos"]),
         "photos_batch_csv_nas": str(paths["nas_photos_batch"]),
         "output_dir_nas": str(paths["nas_report_dir"]),
@@ -10216,6 +10262,7 @@ def _photo_report_job_preview(
         "job_path": str(queued_path),
         "batch_reference": (
             "generate_word_report.py --infos-projet <infos_projet_json_nas> "
+            "--contexte-general-photos-json <contexte_general_photos.json NAS> "
             "--photos-csv <photos.csv NAS> --photos-batch-csv <photos_batch.csv NAS> "
             "--output-dir <output_dir_nas> --batch-job-id <batch_job_id> "
             "--expected-photos-csv-sha256 <hash> --expected-photos-batch-csv-sha256 <hash> "
@@ -10227,6 +10274,7 @@ def _photo_report_job_preview(
         },
         "command_preview": (
             f'generate_word_report.py --infos-projet "{infos_job_path}" '
+            f'--contexte-general-photos-json "{contexte_general_photos_path}" '
             f'--photos-csv "{paths["nas_photos"]}" '
             f'--photos-batch-csv "{paths["nas_photos_batch"]}" '
             f'--output-dir "{paths["nas_report_dir"]}" '
@@ -15255,7 +15303,13 @@ elif page == "Annotation photos / Rapport Word":
 
         st.markdown("### 2. Batch des photos")
         st.markdown("#### Backend LLM")
-        current_backend = str((ann_infos or {}).get("llm_backend") or "").strip()
+        ann_config_llm_path = ann_paths["nas_trans_dir"] / "config_llm.json"
+        if ann_config_llm_path.is_file():
+            ann_config_llm = load_json(str(ann_config_llm_path), {})
+            current_backend = str((ann_config_llm or {}).get("llm_backend") or "local").strip()
+        else:
+            ann_config_llm = {}
+            current_backend = ""
         backend_default_idx = 0 if current_backend != "local" else 1
         new_backend = st.selectbox(
             "llm_backend",
@@ -15263,12 +15317,40 @@ elif page == "Annotation photos / Rapport Word":
             index=backend_default_idx,
             key="ann_photos_llm_backend",
         )
-        st.write("ancienne valeur :", current_backend or "(absente)")
+        st.write("ancienne valeur (config_llm.json) :", current_backend or "(absente)")
         st.write("nouvelle valeur :", new_backend)
-        if st.button("Écrire llm_backend dans infos_projet.json", key="ann_photos_write_llm_backend"):
+        st.caption(
+            "Source d'autorité du batch : config_llm.json (batch_all_photos_pcfixe.py lit "
+            "config_llm.json[\"llm_backend\"]). Le champ infos_projet.json[\"llm_backend\"] "
+            "est conservé pour compatibilité/affichage UI."
+        )
+        backend_write_ready = ann_config_llm_path.is_file()
+        if not backend_write_ready:
+            st.warning("config_llm.json absent : copiez d'abord la ressource, puis relancez l'écriture.")
+        if st.button(
+            "Écrire llm_backend dans config_llm.json",
+            key="ann_photos_write_llm_backend",
+            disabled=not backend_write_ready,
+        ):
             try:
-                old_backend, written_backend = _patch_infos_llm_backend(ann_infos_path, new_backend)
-                st.success(f"llm_backend mis à jour : {old_backend or '(absente)'} -> {written_backend}")
+                patch_result = _patch_captation_llm_backend(
+                    config_llm_path=ann_config_llm_path,
+                    backend=new_backend,
+                    infos_path=ann_paths["nas_infos"],
+                )
+                summary = (
+                    f"config_llm.json : {patch_result['config_llm_old'] or '(absente)'} "
+                    f"-> {patch_result['backend']}"
+                )
+                if patch_result["infos_written"]:
+                    summary += (
+                        f" ; infos_projet.json (compat) : {patch_result['infos_old'] or '(absente)'} "
+                        f"-> {patch_result['backend']}"
+                    )
+                if patch_result["infos_sync_error"]:
+                    summary += f" ; infos_projet.json non synchronisé : {patch_result['infos_sync_error']}"
+                st.success(summary)
+                _annotation_clear_runtime_caches(id_affaire=ann_id_affaire, id_captation=ann_id_captation)
                 st.rerun()
             except Exception as e:
                 st.error(f"Mise à jour impossible : {e}")
