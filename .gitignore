@@ -65,6 +65,14 @@ data/
 ########################################
 *.jsonl
 *_progress.json
+adaptation_pcfixe/spooler job/server_response/*spooler_test/
+adaptation_pcfixe/spooler job/server_response/*deepseek_spooler_test/
+requirements_complet.txt
+app_from_codex_checkpoint*.py
+app.py.INCIDENT_RESTORE*.py
+audit_app_after_restore*.patch
+diff_app_actuel.patch
+patch_lot1_parties*.diff
 
 ########################################
 # Caches Python dans sous-dossiers
