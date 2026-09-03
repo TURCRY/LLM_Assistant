@@ -2303,6 +2303,35 @@ def project_config_dir(project_config: dict) -> Path:
     laptop_root = (project_config.get("roots") or {}).get("laptop") or str(Path(AFFAIRES_ROOT) / project_id)
     return Path(pj(laptop_root, "_Config"))
 
+def authoritative_parties_config_dir(aff_root_local: str, project_config: dict | None, aff_id: str) -> tuple[str, dict]:
+    nas_root = effective_nas_affaire_root(project_config or {}, aff_id).rstrip("\\/ ")
+    local_cfg_dir = pj(aff_root_local, "_Config")
+    diagnostic = {
+        "source_autoritaire_attendue": "nas",
+        "aff_id": aff_id,
+        "nas_root": nas_root,
+        "local_cfg_dir": local_cfg_dir,
+        "selected_cfg_dir": local_cfg_dir,
+        "fallback": True,
+        "reason": "",
+    }
+    if nas_root and nas_root.startswith("\\\\"):
+        nas_cfg_dir = pj(nas_root, "_Config")
+        try:
+            if Path(nas_cfg_dir).exists() and Path(nas_cfg_dir).is_dir():
+                diagnostic.update({
+                    "selected_cfg_dir": nas_cfg_dir,
+                    "fallback": False,
+                    "reason": "parties.json charge depuis la racine NAS autoritaire",
+                })
+                return nas_cfg_dir, diagnostic
+            diagnostic["reason"] = "dossier _Config NAS absent ou inaccessible"
+        except Exception as exc:
+            diagnostic["reason"] = f"dossier _Config NAS inaccessible: {exc}"
+    else:
+        diagnostic["reason"] = "roots.nas absent ou non UNC"
+    return local_cfg_dir, diagnostic
+
 def save_parties(cfg_dir: str, parties: list[dict]) -> str:
     out = pj(cfg_dir, "parties.json")
     save_json(out, {"parties": parties})
@@ -2402,6 +2431,218 @@ def ensure_party_dirs_on_roots(
             except Exception as e:
                 result["errors"].append({"target": target, "folder_rel": folder_rel, "root": str(root), "error": str(e)})
     return result
+
+def _is_safe_party_folder_rel(folder_rel: str) -> tuple[bool, str]:
+    folder_rel = safe_text(folder_rel)
+    if not folder_rel:
+        return False, "folder_rel vide"
+    rel_path = Path(folder_rel)
+    if rel_path.is_absolute():
+        return False, "folder_rel absolu refuse"
+    if any(part == ".." for part in rel_path.parts):
+        return False, "folder_rel contenant '..' refuse"
+    return True, ""
+
+def party_delete_selection_signature(selected_codes) -> tuple[int, ...]:
+    codes = []
+    for value in selected_codes or []:
+        try:
+            codes.append(int(value))
+        except Exception:
+            continue
+    return tuple(sorted(set(codes)))
+
+def party_delete_confirmation_valid(selected_codes, checked: bool, confirmed_signature) -> bool:
+    signature = party_delete_selection_signature(selected_codes)
+    return bool(signature) and bool(checked) and tuple(confirmed_signature or ()) == signature
+
+def check_parties_json_folder_consistency(root: str, parties: list[dict]) -> dict:
+    root_path = Path(root or "")
+    result = {
+        "root": str(root_path) if root else "",
+        "ok": False,
+        "entries": [],
+        "orphan_folders": [],
+        "summary": {
+            "OK": 0,
+            "DOSSIER MANQUANT": 0,
+            "DOSSIER NON CANONIQUE": 0,
+            "PLUSIEURS DOSSIERS POUR LE MÊME CODE": 0,
+            "ENTRÉE JSON SANS DOSSIER": 0,
+            "DOSSIER SANS ENTRÉE JSON": 0,
+        },
+        "errors": [],
+    }
+    if not root or not root_path.exists() or not root_path.is_dir():
+        result["errors"].append({"root": root, "error": "racine absente ou inaccessible"})
+        return result
+
+    by_code = {}
+    for party in parties or []:
+        try:
+            code = int(party.get("code_partie"))
+        except Exception:
+            result["entries"].append({
+                "code_partie": "",
+                "nom": party.get("nom", ""),
+                "folder_rel": party.get("folder_rel", ""),
+                "expected_folder_rel": "",
+                "status": "ENTRÉE JSON SANS DOSSIER",
+                "details": "code_partie invalide",
+                "folders": [],
+            })
+            result["summary"]["ENTRÉE JSON SANS DOSSIER"] += 1
+            continue
+        by_code[code] = party
+
+    seen_folder_names = set()
+    for code, party in sorted(by_code.items()):
+        current_folder_rel = safe_text(party.get("folder_rel"))
+        expected_folder_rel = party_folder_name(code, party.get("nom") or f"Partie {code:02d}")
+        family = _party_family_dirs(root_path, code)
+        seen_folder_names.update(path.name for path in family)
+        current_exists = bool(current_folder_rel and (root_path / current_folder_rel).is_dir())
+        expected_exists = (root_path / expected_folder_rel).is_dir()
+        folders = []
+        for path in family:
+            try:
+                has_children = any(path.iterdir())
+            except Exception:
+                has_children = None
+            folders.append({
+                "folder_rel": path.name,
+                "path": str(path),
+                "canonical": path.name == expected_folder_rel,
+                "referenced": path.name == current_folder_rel,
+                "empty": None if has_children is None else not has_children,
+                "status": "inaccessible" if has_children is None else ("non_empty" if has_children else "empty"),
+            })
+
+        if not current_folder_rel:
+            status = "ENTRÉE JSON SANS DOSSIER"
+            details = "folder_rel vide"
+        elif not current_exists:
+            status = "DOSSIER MANQUANT"
+            details = "folder_rel ne pointe vers aucun dossier existant"
+        elif len(family) > 1:
+            status = "PLUSIEURS DOSSIERS POUR LE MÊME CODE"
+            details = "plusieurs dossiers physiques partagent le même code_partie"
+        elif current_folder_rel != expected_folder_rel or not expected_exists:
+            status = "DOSSIER NON CANONIQUE"
+            details = "folder_rel ne correspond pas au libellé canonique courant"
+        else:
+            status = "OK"
+            details = ""
+
+        result["summary"][status] += 1
+        result["entries"].append({
+            "code_partie": f"{code:02d}",
+            "nom": party.get("nom", ""),
+            "folder_rel": current_folder_rel,
+            "expected_folder_rel": expected_folder_rel,
+            "status": status,
+            "details": details,
+            "folders": folders,
+        })
+
+    party_codes = set(by_code)
+    for child in sorted(root_path.iterdir(), key=lambda item: item.name.lower()):
+        if not child.is_dir():
+            continue
+        code = _party_code_from_folder_rel(child.name)
+        if code is None or code in party_codes or child.name in seen_folder_names:
+            continue
+        try:
+            has_children = any(child.iterdir())
+        except Exception:
+            has_children = None
+        result["orphan_folders"].append({
+            "code_partie": f"{code:02d}",
+            "folder_rel": child.name,
+            "path": str(child),
+            "status": "DOSSIER SANS ENTRÉE JSON",
+            "empty": None if has_children is None else not has_children,
+        })
+        result["summary"]["DOSSIER SANS ENTRÉE JSON"] += 1
+
+    result["ok"] = not result["errors"] and all(
+        count == 0
+        for status, count in result["summary"].items()
+        if status != "OK"
+    )
+    return result
+
+def write_parties_delete_log(aff_root_local: str, event: dict) -> str:
+    log_dir = pj(aff_root_local, "AA_Expert_Admin", "_Logs")
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    p = Path(log_dir) / f"parties_delete_{ts}.json"
+    suffix = 2
+    while p.exists():
+        p = Path(log_dir) / f"parties_delete_{ts}__{suffix}.json"
+        suffix += 1
+    p.write_text(json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(p)
+
+def delete_parties_json_entries(
+    aff_root_local: str,
+    cfg_dir: str,
+    selected_codes,
+    *,
+    aff_id: str,
+    titre: str,
+    export_xlsx: bool = True,
+) -> dict:
+    selected = set()
+    for value in selected_codes or []:
+        try:
+            selected.add(int(value))
+        except Exception:
+            continue
+    if not selected:
+        raise ValueError("Aucune partie sélectionnée.")
+
+    existing = load_parties(cfg_dir)
+    existing_codes = set()
+    remaining = []
+    deleted = []
+    for party in existing:
+        try:
+            code = int(party.get("code_partie"))
+        except Exception:
+            remaining.append(party)
+            continue
+        existing_codes.add(code)
+        if code in selected:
+            deleted.append(dict(party))
+        else:
+            remaining.append(party)
+
+    missing = sorted(selected - existing_codes)
+    if missing:
+        raise ValueError(f"Parties absentes de parties.json: {missing}")
+
+    json_path = save_parties(cfg_dir, remaining)
+    xlsx_path = ""
+    if export_xlsx:
+        xlsx_path = pj(aff_root_local, "AB_Organisation_expertise", "Id_affaire_en_tete_dossier.xlsx")
+        export_parties_xlsx(xlsx_path, aff_id=aff_id, titre=titre, parties=remaining)
+
+    event = {
+        "ok": True,
+        "action": "delete_parties_json_entries",
+        "aff_id": aff_id,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "deleted_codes": sorted(selected),
+        "deleted_parties": deleted,
+        "json_path": json_path,
+        "xlsx_path": xlsx_path or None,
+        "physical_mutation": False,
+        "note": "Suppression logique uniquement: aucun dossier physique n'est supprime, deplace ou renomme.",
+        "count": len(remaining),
+    }
+    event["log_path"] = write_parties_delete_log(aff_root_local, event)
+    return event
 
 def write_parties_log(aff_root_local: str, event: dict) -> str:
     log_dir = pj(aff_root_local, "AA_Expert_Admin", "_Logs")
@@ -12560,8 +12801,15 @@ else:
 
     st.markdown("### 👥 Gestion des parties (création / ajout / renommage)")
 
-    cfg_dir = pj(aff_root_local, "_Config")
+    aff_id_parties = get_project_id(project_config, "")
+    cfg_dir, parties_cfg_diag = authoritative_parties_config_dir(aff_root_local, project_config, aff_id_parties)
     ensure_dir(cfg_dir)
+    st.caption(f"parties.json utilisé : {pj(cfg_dir, 'parties.json')}")
+    if parties_cfg_diag.get("fallback"):
+        st.warning(
+            "Racine NAS autoritaire indisponible pour parties.json : utilisation temporaire du _Config local. "
+            f"Motif : {parties_cfg_diag.get('reason')}"
+        )
 
     existing_parties = load_parties(cfg_dir)
 
@@ -12589,6 +12837,44 @@ else:
         "Mettre à jour aussi le fichier Excel de synthèse (AB_Organisation_expertise)",
         value=True
     )
+
+    if st.button("🔎 Vérifier la cohérence parties.json / dossiers physiques", key="parties_json_consistency_v1"):
+        try:
+            nas_root_check = effective_nas_affaire_root(project_config, aff_id_parties)
+            consistency = check_parties_json_folder_consistency(nas_root_check, existing_parties)
+            st.session_state["parties_json_consistency_v1"] = consistency
+        except Exception as e:
+            st.session_state.pop("parties_json_consistency_v1", None)
+            st.error(f"Vérification impossible : {e}")
+
+    consistency = st.session_state.get("parties_json_consistency_v1")
+    if consistency:
+        st.caption(f"Racine contrôlée : {consistency.get('root')}")
+        consistency_rows = []
+        for item in consistency.get("entries", []):
+            consistency_rows.append({
+                "code_partie": item.get("code_partie", ""),
+                "nom": item.get("nom", ""),
+                "folder_rel": item.get("folder_rel", ""),
+                "dossier canonique attendu": item.get("expected_folder_rel", ""),
+                "statut": item.get("status", ""),
+                "dossiers trouvés": ", ".join(folder.get("folder_rel", "") for folder in item.get("folders", [])),
+                "détail": item.get("details", ""),
+            })
+        for item in consistency.get("orphan_folders", []):
+            consistency_rows.append({
+                "code_partie": item.get("code_partie", ""),
+                "nom": "",
+                "folder_rel": item.get("folder_rel", ""),
+                "dossier canonique attendu": "",
+                "statut": item.get("status", ""),
+                "dossiers trouvés": item.get("folder_rel", ""),
+                "détail": "dossier physique sans entrée active dans parties.json",
+            })
+        if consistency_rows:
+            st.dataframe(prepare_df_for_streamlit_display(consistency_rows), width="stretch")
+        with st.expander("Synthèse cohérence parties.json / dossiers", expanded=False):
+            st.json(consistency)
 
     colp = st.columns(2)
     with colp[0]:
@@ -12622,6 +12908,56 @@ else:
     with colp[1]:
         if st.button("🔄 Recharger depuis parties.json"):
             st.rerun()
+
+    if existing_parties:
+        st.markdown("#### Suppression logique seule")
+        delete_by_code = {}
+        for party in existing_parties:
+            try:
+                delete_by_code[int(party.get("code_partie"))] = party
+            except Exception:
+                continue
+        delete_codes = st.multiselect(
+            "Parties existantes à retirer de parties.json",
+            options=sorted(delete_by_code.keys()),
+            format_func=lambda code: f"{int(code):02d} — {delete_by_code.get(code, {}).get('nom', '')}",
+            key="parties_delete_json_only_codes_v1",
+            help="Suppression logique uniquement : aucun dossier physique n'est supprimé.",
+        )
+        delete_signature = party_delete_selection_signature(delete_codes)
+        logical_confirm = st.checkbox(
+            "Je confirme la suppression logique des entrées parties sélectionnées, sans suppression de dossier.",
+            value=False,
+            key="parties_delete_json_only_confirm_v1",
+            disabled=not delete_codes,
+        )
+        logical_confirmation_valid = party_delete_confirmation_valid(
+            delete_codes,
+            logical_confirm,
+            delete_signature if logical_confirm else (),
+        )
+        if st.button(
+            "Retirer uniquement de parties.json",
+            disabled=not delete_codes or not logical_confirmation_valid,
+            key="parties_delete_json_only_apply_v1",
+        ):
+            try:
+                aff_id_ui = get_project_id(project_config, "")
+                titre_ui = (project_config.get("titre") or "").strip()
+                res = delete_parties_json_entries(
+                    aff_root_local,
+                    cfg_dir,
+                    delete_codes,
+                    aff_id=aff_id_ui,
+                    titre=titre_ui,
+                    export_xlsx=bool(export_xlsx_flag),
+                )
+                st.success(f"Entrées parties supprimées de parties.json : {len(res.get('deleted_codes', []))}. Aucun dossier physique modifié.")
+                with st.expander("Journal de suppression logique", expanded=False):
+                    st.json(res)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Suppression logique impossible : {e}")
 
     # Optionnel : affichage des correspondances dossier
     if existing_parties:

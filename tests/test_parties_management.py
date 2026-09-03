@@ -34,9 +34,16 @@ def _load_parties_helpers():
         "rename_party_dir",
         "load_parties",
         "save_parties",
+        "authoritative_parties_config_dir",
         "export_parties_xlsx",
         "ensure_party_dirs_on_roots",
+        "_is_safe_party_folder_rel",
+        "party_delete_selection_signature",
+        "party_delete_confirmation_valid",
+        "check_parties_json_folder_consistency",
+        "write_parties_delete_log",
         "write_parties_log",
+        "delete_parties_json_entries",
         "normalize_and_validate_parties",
         "apply_parties_update",
     }
@@ -128,6 +135,67 @@ class PartiesManagementTests(unittest.TestCase):
             "folder_rel": folder_rel,
             "history": [],
         }
+
+
+    def test_json_only_delete_removes_entry_without_touching_non_empty_folder(self):
+        parties = [self._party(1, "Alpha"), self._party(2, "Beta")]
+        self._write_parties(parties)
+        folder = self.root / parties[1]["folder_rel"]
+        folder.mkdir()
+        (folder / "piece.pdf").write_text("x", encoding="utf-8")
+
+        res = self.ns["delete_parties_json_entries"](
+            str(self.root),
+            str(self.cfg_dir),
+            [2],
+            aff_id="2099-J01",
+            titre="Test",
+            export_xlsx=False,
+        )
+
+        self.assertEqual([1], [p["code_partie"] for p in self._read_parties()])
+        self.assertTrue(folder.is_dir())
+        self.assertTrue((folder / "piece.pdf").is_file())
+        self.assertFalse(res["physical_mutation"])
+        self.assertEqual("delete_parties_json_entries", res["action"])
+        self.assertTrue(Path(res["log_path"]).is_file())
+
+    def test_parties_json_consistency_reports_missing_and_multiple_code_folders(self):
+        parties = [self._party(1, "Alpha"), self._party(2, "Beta")]
+        self._write_parties(parties)
+        (self.root / "01_Partie_01_Alpha").mkdir()
+        (self.root / "01_Partie_01_Ancien").mkdir()
+        (self.root / "03_Partie_03_Orphan").mkdir()
+
+        diag = self.ns["check_parties_json_folder_consistency"](str(self.root), parties)
+        by_code = {item["code_partie"]: item for item in diag["entries"]}
+
+        self.assertEqual("PLUSIEURS DOSSIERS POUR LE MÊME CODE", by_code["01"]["status"])
+        self.assertEqual("DOSSIER MANQUANT", by_code["02"]["status"])
+        self.assertEqual(["03_Partie_03_Orphan"], [item["folder_rel"] for item in diag["orphan_folders"]])
+
+    def test_parties_json_consistency_reports_non_canonical_folder_rel(self):
+        party = self._party(4, "Nouveau", "04_Partie_04_Ancien")
+        self._write_parties([party])
+        (self.root / party["folder_rel"]).mkdir()
+
+        diag = self.ns["check_parties_json_folder_consistency"](str(self.root), [party])
+
+        self.assertEqual("DOSSIER NON CANONIQUE", diag["entries"][0]["status"])
+        self.assertEqual("04_Partie_04_Nouveau", diag["entries"][0]["expected_folder_rel"])
+
+    def test_authoritative_parties_config_dir_falls_back_when_nas_is_not_unc(self):
+        nas_root = self.root / "nas"
+        (nas_root / "_Config").mkdir(parents=True)
+
+        cfg_dir, diag = self.ns["authoritative_parties_config_dir"](
+            str(self.root),
+            {"roots": {"nas": str(nas_root)}},
+            "2099-J01",
+        )
+
+        self.assertTrue(diag["fallback"])
+        self.assertEqual(str(self.cfg_dir), cfg_dir)
 
     def test_creation_and_rename_still_work(self):
         res_create = self.ns["apply_parties_update"](
