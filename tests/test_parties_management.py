@@ -37,18 +37,35 @@ def _load_parties_helpers():
         "authoritative_parties_config_dir",
         "export_parties_xlsx",
         "ensure_party_dirs_on_roots",
+        "party_roots_for_affaire",
+        "_path_dedup_key",
         "_is_safe_party_folder_rel",
+        "is_party_folder_candidate_name",
         "party_delete_selection_signature",
         "party_delete_confirmation_valid",
-        "check_parties_json_folder_consistency",
+        "preflight_delete_parties",
+        "authoritative_party_mutation_root",
         "write_parties_delete_log",
+        "check_parties_json_folder_consistency",
         "write_parties_log",
+        "delete_parties",
         "delete_parties_json_entries",
         "normalize_and_validate_parties",
         "apply_parties_update",
     }
+    wanted_constants = {
+        "PARTY_FOLDER_PATTERN",
+    }
     module = ast.Module(
-        body=[node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted],
+        body=[
+            node for node in tree.body
+            if (
+                isinstance(node, ast.FunctionDef) and node.name in wanted
+            ) or (
+                isinstance(node, ast.Assign)
+                and {target.id for target in node.targets if isinstance(target, ast.Name)} & wanted_constants
+            )
+        ],
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
@@ -136,6 +153,162 @@ class PartiesManagementTests(unittest.TestCase):
             "history": [],
         }
 
+    def test_delete_empty_party_updates_json_excel_log_and_folder(self):
+        parties = [self._party(1, "Alpha"), self._party(2, "Beta")]
+        self._write_parties(parties)
+        for party in parties:
+            (self.root / party["folder_rel"]).mkdir()
+
+        res = self.ns["delete_parties"](
+            str(self.root),
+            str(self.cfg_dir),
+            [2],
+            aff_id="2099-J01",
+            titre="Test",
+            project_config=self.project_config,
+            export_xlsx=True,
+        )
+
+        self.assertEqual([1], [p["code_partie"] for p in self._read_parties()])
+        self.assertFalse((self.root / parties[1]["folder_rel"]).exists())
+        self.assertTrue((self.root / parties[0]["folder_rel"]).is_dir())
+        self.assertTrue(Path(res["log_path"]).is_file())
+        self.assertTrue(Path(res["xlsx_path"]).is_file())
+        log_payload = json.loads(Path(res["log_path"]).read_text(encoding="utf-8"))
+        self.assertEqual("delete_parties", log_payload["action"])
+        self.assertEqual("2099-J01", log_payload["aff_id"])
+        self.assertEqual([2], log_payload["deleted_codes"])
+        self.assertEqual("Beta", log_payload["deleted_parties"][0]["nom"])
+        self.assertEqual(parties[1]["folder_rel"], log_payload["deleted_parties"][0]["folder_rel"])
+        self.assertTrue(log_payload["preflight"]["ok"])
+        self.assertTrue(log_payload["examined_paths"])
+        self.assertTrue(log_payload["removed_dirs"])
+        self.assertEqual(res["json_path"], log_payload["json_path"])
+        self.assertEqual(res["xlsx_path"], log_payload["xlsx_path"])
+        wb = load_workbook(res["xlsx_path"], read_only=True, data_only=True)
+        try:
+            codes = [row[0] for row in wb.active.iter_rows(min_row=5, values_only=True) if row[0]]
+        finally:
+            wb.close()
+        self.assertEqual(["01"], codes)
+
+    def test_delete_multiple_preserves_other_parties(self):
+        parties = [self._party(1, "A"), self._party(2, "B"), self._party(3, "C")]
+        self._write_parties(parties)
+        for party in parties:
+            (self.root / party["folder_rel"]).mkdir()
+
+        self.ns["delete_parties"](
+            str(self.root),
+            str(self.cfg_dir),
+            [1, 3],
+            aff_id="2099-J01",
+            titre="Test",
+            project_config=self.project_config,
+            export_xlsx=False,
+        )
+
+        remaining = self._read_parties()
+        self.assertEqual([2], [p["code_partie"] for p in remaining])
+        self.assertEqual("B", remaining[0]["nom"])
+
+    def test_non_empty_folder_blocks_before_any_mutation(self):
+        parties = [self._party(1, "A"), self._party(2, "B")]
+        self._write_parties(parties)
+        for party in parties:
+            (self.root / party["folder_rel"]).mkdir()
+        (self.root / parties[1]["folder_rel"] / "piece.pdf").write_text("x", encoding="utf-8")
+
+        before = (self.cfg_dir / "parties.json").read_text(encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.ns["delete_parties"](
+                str(self.root),
+                str(self.cfg_dir),
+                [1, 2],
+                aff_id="2099-J01",
+                titre="Test",
+                project_config=self.project_config,
+                export_xlsx=True,
+            )
+
+        self.assertEqual(before, (self.cfg_dir / "parties.json").read_text(encoding="utf-8"))
+        self.assertTrue((self.root / parties[0]["folder_rel"]).is_dir())
+        self.assertTrue((self.root / parties[1]["folder_rel"]).is_dir())
+
+    def test_malicious_absolute_and_parent_paths_are_refused(self):
+        parties = [self._party(1, "Abs", r"C:\Windows"), self._party(2, "Parent", r"..\outside")]
+        preflight = self.ns["preflight_delete_parties"](
+            str(self.root),
+            self.project_config,
+            "2099-J01",
+            parties,
+            [1, 2],
+        )
+
+        self.assertFalse(preflight["ok"])
+        errors = " ".join(str(b.get("error")) for b in preflight["blockers"])
+        self.assertIn("absolu", errors)
+        self.assertIn("..", errors)
+
+    def test_inaccessible_root_blocks(self):
+        party = self._party(1, "A")
+        self._write_parties([party])
+        (self.root / party["folder_rel"]).mkdir()
+        cfg = {"roots": {"nas": str(self.root / "missing_root"), "pcfixe": str(self.root)}}
+
+        preflight = self.ns["preflight_delete_parties"](
+            str(self.root),
+            cfg,
+            "2099-J01",
+            [party],
+            [1],
+        )
+
+        self.assertFalse(preflight["ok"])
+        self.assertTrue(any("inaccessible" in str(b.get("error") or "") for b in preflight["blockers"]))
+
+    def test_delete_confirmation_signature_tracks_exact_code_set(self):
+        signature = self.ns["party_delete_selection_signature"]
+        is_valid = self.ns["party_delete_confirmation_valid"]
+
+        self.assertEqual(signature([39, 40]), signature([40, 39]))
+        confirmed = signature([40])
+        self.assertTrue(is_valid([40], True, confirmed))
+        self.assertFalse(is_valid([39, 40], True, confirmed))
+        self.assertFalse(is_valid([40, 39], True, confirmed))
+
+        confirmed = signature([39, 40])
+        self.assertTrue(is_valid([40, 39], True, confirmed))
+        self.assertFalse(is_valid([40], True, confirmed))
+        self.assertFalse(is_valid([], True, confirmed))
+        self.assertFalse(is_valid([39, 40], False, confirmed))
+
+    def test_code_can_be_reused_after_delete(self):
+        party = self._party(10, "Old")
+        self._write_parties([party])
+        (self.root / party["folder_rel"]).mkdir()
+        self.ns["delete_parties"](
+            str(self.root),
+            str(self.cfg_dir),
+            [10],
+            aff_id="2099-J01",
+            titre="Test",
+            project_config=self.project_config,
+            export_xlsx=False,
+        )
+
+        res = self.ns["apply_parties_update"](
+            str(self.root),
+            str(self.cfg_dir),
+            [{"code_partie": 10, "nom": "New", "representant": "", "avocat": "", "notes": ""}],
+            aff_id="2099-J01",
+            titre="Test",
+            project_config=self.project_config,
+            export_xlsx=False,
+        )
+
+        self.assertEqual([10], res["created_codes"])
+        self.assertEqual("New", self._read_parties()[0]["nom"])
 
     def test_json_only_delete_removes_entry_without_touching_non_empty_folder(self):
         parties = [self._party(1, "Alpha"), self._party(2, "Beta")]
@@ -184,7 +357,7 @@ class PartiesManagementTests(unittest.TestCase):
         self.assertEqual("DOSSIER NON CANONIQUE", diag["entries"][0]["status"])
         self.assertEqual("04_Partie_04_Nouveau", diag["entries"][0]["expected_folder_rel"])
 
-    def test_authoritative_parties_config_dir_falls_back_when_nas_is_not_unc(self):
+    def test_authoritative_parties_config_dir_prefers_accessible_nas(self):
         nas_root = self.root / "nas"
         (nas_root / "_Config").mkdir(parents=True)
 
@@ -196,6 +369,29 @@ class PartiesManagementTests(unittest.TestCase):
 
         self.assertTrue(diag["fallback"])
         self.assertEqual(str(self.cfg_dir), cfg_dir)
+
+    def test_historical_suffix_folder_is_not_deleted_unless_folder_rel_points_to_it(self):
+        party = self._party(10, "Current", "10_Partie_10_Current")
+        self._write_parties([party])
+        (self.root / party["folder_rel"]).mkdir()
+        historical_dirs = []
+        for suffix in ("__2", "__4", "__27"):
+            historical = self.root / f"10_Partie_10_Current{suffix}"
+            historical.mkdir()
+            historical_dirs.append(historical)
+
+        self.ns["delete_parties"](
+            str(self.root),
+            str(self.cfg_dir),
+            [10],
+            aff_id="2099-J01",
+            titre="Test",
+            project_config=self.project_config,
+            export_xlsx=False,
+        )
+
+        self.assertFalse((self.root / party["folder_rel"]).exists())
+        self.assertTrue(all(path.is_dir() for path in historical_dirs))
 
     def test_creation_and_rename_still_work(self):
         res_create = self.ns["apply_parties_update"](
@@ -368,11 +564,11 @@ class PartiesManagementTests(unittest.TestCase):
         self.assertTrue(Path(res["xlsx_path"]).is_file())
         wb = load_workbook(res["xlsx_path"], read_only=True, data_only=True)
         try:
-            rows_out = list(wb.active.iter_rows(min_row=5, values_only=True))
+            excel_rows = [row for row in wb.active.iter_rows(min_row=5, values_only=True) if row[0]]
         finally:
             wb.close()
-        self.assertEqual("01", rows_out[0][0])
-        self.assertEqual("01_Partie_01_Alpha", rows_out[0][5])
+        self.assertEqual("01", excel_rows[0][0])
+        self.assertEqual("01_Partie_01_Alpha", excel_rows[0][5])
 
 
 if __name__ == "__main__":
