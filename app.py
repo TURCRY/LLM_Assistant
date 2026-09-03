@@ -2639,12 +2639,236 @@ def detect_party_folder_file_conflicts(inspections: list[dict]) -> dict:
             conflicts.append({"rel": rel, "reason": "contenus differents", "files": files})
     return {"conflicts": conflicts, "duplicates": duplicates}
 
+def _documentary_code_from_expert_id(value: str) -> str:
+    text = compact_spaces(value or "")
+    if not valid_expert_doc_id(text):
+        return ""
+    return text.split("-", 1)[0]
+
+def _normalized_documentary_code(value) -> str:
+    if value in (None, ""):
+        return ""
+    try:
+        return f"{int(value):02d}"
+    except Exception:
+        text = compact_spaces(str(value))
+        return text if re.match(r"^\d{2}$", text) else ""
+
+def _documentary_code_from_doc(doc: dict) -> tuple[str, str]:
+    explicit = _normalized_documentary_code((doc or {}).get("code_partie"))
+    if explicit:
+        return explicit, "code_partie_explicit"
+    expert_code = _documentary_code_from_expert_id((doc or {}).get("expert_doc_id") or (doc or {}).get("numero_expert") or "")
+    if expert_code:
+        return expert_code, "expert_doc_id_prefix"
+    structured = _normalized_documentary_code((doc or {}).get("code_source"))
+    if structured:
+        return structured, "code_source_structured"
+    source_type = str((doc or {}).get("source_type") or "").strip().lower()
+    if source_type == "juridiction":
+        return "00", "source_type_juridiction"
+    code_from_paths, reason = deduce_code_source_from_paths(
+        (doc or {}).get("chemin"),
+        (doc or {}).get("destination"),
+        (doc or {}).get("chemin_unc"),
+        (doc or {}).get("output_dir_pcfixe"),
+        (doc or {}).get("output_dir_unc"),
+    )
+    if code_from_paths:
+        return code_from_paths, reason
+    return "99", "fallback"
+
+def _documentary_identity_diagnostics(doc: dict, selected_code: str, selected_reason: str) -> None:
+    path_code, path_reason = deduce_code_source_from_paths(
+        doc.get("chemin"),
+        doc.get("destination"),
+        doc.get("chemin_unc"),
+        doc.get("output_dir_pcfixe"),
+        doc.get("output_dir_unc"),
+    )
+    expert_code = _documentary_code_from_expert_id(doc.get("expert_doc_id") or doc.get("numero_expert") or "")
+    doc["code_source_deduction_motif"] = doc.get("code_source_deduction_motif") or selected_reason
+    if path_code:
+        doc["code_source_chemin"] = path_code
+        doc["code_source_chemin_motif"] = path_reason
+    if expert_code:
+        doc["code_source_expert_doc_id"] = expert_code
+    anomalies = list(doc.get("code_source_anomalies") or [])
+    if selected_code and path_code and selected_code != path_code:
+        anomalies.append({
+            "type": "divergence_code_partie_chemin",
+            "code_retenu": selected_code,
+            "code_chemin": path_code,
+            "motif_code_retenu": selected_reason,
+            "motif_chemin": path_reason,
+        })
+    if selected_code and expert_code and selected_code != expert_code:
+        anomalies.append({
+            "type": "divergence_code_partie_expert_doc_id",
+            "code_retenu": selected_code,
+            "code_expert_doc_id": expert_code,
+            "motif_code_retenu": selected_reason,
+        })
+    if anomalies:
+        doc["code_source_anomalies"] = anomalies
+
+def _documentary_stable_party_key(doc: dict) -> tuple[str, str]:
+    expert_doc_id = compact_spaces(doc.get("expert_doc_id") or doc.get("numero_expert") or "")
+    if valid_expert_doc_id(expert_doc_id):
+        return _documentary_code_from_expert_id(expert_doc_id), "expert_doc_id_prefix"
+    for key, reason in (
+        ("code_partie", "code_partie_explicit"),
+        ("code_source", "code_source_structured"),
+    ):
+        code = _normalized_documentary_code(doc.get(key))
+        if code:
+            return code, reason
+    code_from_paths, path_reason = deduce_code_source_from_paths(
+        doc.get("chemin"),
+        doc.get("destination"),
+        doc.get("chemin_unc"),
+        doc.get("output_dir_pcfixe"),
+        doc.get("output_dir_unc"),
+    )
+    if code_from_paths:
+        return code_from_paths, path_reason
+    deposant = compact_spaces(doc.get("deposant") or doc.get("partie") or "").lower()
+    return deposant, "legacy_deposant_fallback"
+
+def _documentary_filename(doc: dict) -> str:
+    return Path(str(doc.get("fichier_source") or doc.get("nom_original") or doc.get("nom_cible") or doc.get("chemin") or doc.get("destination") or "").replace("\\", "/")).name
+
+def _documentary_path_values(doc: dict) -> list[str]:
+    values = []
+    for key in ("chemin", "destination", "chemin_unc", "chemin_nas", "chemin_local", "output_dir_pcfixe", "output_dir_unc"):
+        value = compact_spaces(str((doc or {}).get(key) or ""))
+        if value:
+            values.append(value)
+    return values
+
+def load_sqlite_documentary_rows(aff_root_local: str, cfg: dict | None = None) -> list[dict]:
+    db_path = affaire_sqlite_path_from_root(aff_root_local, cfg)
+    if not db_path.exists():
+        return []
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            "SELECT numero_expert, code_partie, chemin_nas, chemin_local, nom_original, nom_cible FROM Documents"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+    return [
+        {
+            "source_documentaire": "sqlite",
+            "expert_doc_id": row["numero_expert"],
+            "numero_expert": row["numero_expert"],
+            "code_partie": row["code_partie"],
+            "chemin_nas": row["chemin_nas"],
+            "chemin_local": row["chemin_local"],
+            "nom_original": row["nom_original"],
+            "nom_cible": row["nom_cible"],
+        }
+        for row in rows
+    ]
+
+def build_documentary_consistency_diagnostic(
+    aff_root_local: str,
+    cfg: dict | None,
+    records: list[dict] | None = None,
+) -> dict:
+    docs = load_sqlite_documentary_rows(aff_root_local, cfg)
+    try:
+        journal_records = records if records is not None else load_transmission_records(aff_root_local, cfg)
+        for doc in flatten_transmission_documents(journal_records or [], get_project_id(cfg or {}, ""), None):
+            enriched = dict(doc)
+            enriched["source_documentaire"] = "journal"
+            docs.append(enriched)
+    except Exception:
+        pass
+
+    by_code: dict[str, dict] = {}
+    expert_counts: dict[str, int] = {}
+    filename_codes: dict[str, dict[str, set[str]]] = {}
+    for doc in docs:
+        code, reason = _documentary_code_from_doc(doc)
+        _documentary_identity_diagnostics(doc, code, reason)
+        expert_doc_id = compact_spaces(doc.get("expert_doc_id") or doc.get("numero_expert") or "")
+        if valid_expert_doc_id(expert_doc_id):
+            expert_counts[expert_doc_id] = expert_counts.get(expert_doc_id, 0) + 1
+        entry = by_code.setdefault(code, {
+            "code_partie": code,
+            "sqlite_documents_count": 0,
+            "expert_doc_ids": set(),
+            "chemins_physiques_connus": set(),
+            "documents_chemin_autre_code": [],
+            "divergences_code_chemin": [],
+            "doublons_expert_doc_id": [],
+            "fichiers_homonymes_plusieurs_parties": [],
+            "statut_documentaire": "DOCUMENTAIRE OK",
+        })
+        if doc.get("source_documentaire") == "sqlite":
+            entry["sqlite_documents_count"] += 1
+        if valid_expert_doc_id(expert_doc_id):
+            entry["expert_doc_ids"].add(expert_doc_id)
+        for path_value in _documentary_path_values(doc):
+            entry["chemins_physiques_connus"].add(path_value)
+            path_code, _reason = deduce_code_source_from_paths(path_value)
+            if path_code and code and path_code != code:
+                anomaly = {
+                    "expert_doc_id": expert_doc_id,
+                    "fichier": _documentary_filename(doc),
+                    "chemin": path_value,
+                    "code_partie_retenu": code,
+                    "code_chemin": path_code,
+                }
+                entry["documents_chemin_autre_code"].append(anomaly)
+                entry["divergences_code_chemin"].append(anomaly)
+        filename = _documentary_filename(doc).lower()
+        if filename:
+            filename_codes.setdefault(filename, {}).setdefault(code, set()).update(_documentary_path_values(doc))
+
+    duplicates = {expert_doc_id: count for expert_doc_id, count in expert_counts.items() if count > 1}
+    homonyms = {
+        filename: codes
+        for filename, codes in filename_codes.items()
+        if len([code for code in codes if code]) > 1
+    }
+    for code, entry in by_code.items():
+        for expert_doc_id in sorted(entry["expert_doc_ids"]):
+            if expert_doc_id in duplicates:
+                entry["doublons_expert_doc_id"].append({"expert_doc_id": expert_doc_id, "occurrences": duplicates[expert_doc_id]})
+        for filename, codes in sorted(homonyms.items()):
+            if code in codes:
+                entry["fichiers_homonymes_plusieurs_parties"].append({
+                    "fichier": filename,
+                    "codes_partie": sorted(codes),
+                    "chemins": sorted(path for paths in codes.values() for path in paths),
+                })
+        if entry["documents_chemin_autre_code"] or entry["divergences_code_chemin"]:
+            entry["statut_documentaire"] = "INCOHÉRENCE"
+        elif entry["doublons_expert_doc_id"] or entry["fichiers_homonymes_plusieurs_parties"]:
+            entry["statut_documentaire"] = "AMBIGUÏTÉ"
+        entry["expert_doc_ids"] = sorted(entry["expert_doc_ids"], key=expert_doc_id_sort_key)
+        entry["chemins_physiques_connus"] = sorted(entry["chemins_physiques_connus"])
+
+    return {
+        "codes": dict(sorted(by_code.items())),
+        "doublons_expert_doc_id_globaux": duplicates,
+        "fichiers_homonymes_globaux": {
+            filename: sorted(codes)
+            for filename, codes in sorted(homonyms.items())
+        },
+    }
+
 def analyze_party_folder_duplicates(
     aff_root_local: str,
     cfg: dict | None,
     aff_id: str,
     parties: list[dict],
 ) -> dict:
+    documentary_diag = build_documentary_consistency_diagnostic(aff_root_local, cfg)
     raw_roots = party_roots_for_affaire(aff_root_local, cfg, aff_id)
     root_info = dedupe_party_roots(raw_roots)
     by_code = {}
@@ -2766,6 +2990,17 @@ def analyze_party_folder_duplicates(
             "folders": folders,
             "conflicts": conflict_info["conflicts"],
             "duplicates": conflict_info["duplicates"],
+            "documentaire": documentary_diag.get("codes", {}).get(f"{code:02d}", {
+                "code_partie": f"{code:02d}",
+                "sqlite_documents_count": 0,
+                "expert_doc_ids": [],
+                "chemins_physiques_connus": [],
+                "documents_chemin_autre_code": [],
+                "divergences_code_chemin": [],
+                "doublons_expert_doc_id": [],
+                "fichiers_homonymes_plusieurs_parties": [],
+                "statut_documentaire": "DOCUMENTAIRE OK",
+            }),
             "status": status,
             "repair_mutation_allowed": False,
             "mutation_blocker": "consolidation physique non implementee; seules les suppressions explicites sur NAS passent par preflight",
@@ -2778,6 +3013,7 @@ def analyze_party_folder_duplicates(
         "skipped_roots": root_info["skipped"],
         "root_blockers": root_blockers,
         "active_errors": active_errors,
+        "diagnostic_documentaire": documentary_diag,
         "codes": codes,
         "strategy": {
             "mode": "diagnostic_only",
@@ -2785,11 +3021,10 @@ def analyze_party_folder_duplicates(
             "points_to_decide": [
                 "implementer la consolidation physique uniquement sur la racine NAS autoritaire",
                 "laisser les mecanismes de synchronisation existants propager les changements",
-                "bloquer toute consolidation en cas de conflit metier ou physique",
+                "bloquer toute consolidation en cas de conflit documentaire ou physique",
             ],
         },
     }
-
 
 def load_party_folder_history(aff_root_local: str) -> dict:
     log_dir = Path(pj(aff_root_local, "AA_Expert_Admin", "_Logs"))
@@ -4474,29 +4709,9 @@ def sanitize_reference_label_fields(doc: dict) -> dict:
     return doc
 
 def normalize_source_code(doc: dict) -> str:
-    code_from_paths, _reason = deduce_code_source_from_paths(
-        doc.get("chemin"),
-        doc.get("destination"),
-        doc.get("chemin_unc"),
-        doc.get("output_dir_pcfixe"),
-        doc.get("output_dir_unc"),
-    )
-    if code_from_paths:
-        return code_from_paths
-    if doc.get("code_source"):
-        try:
-            return f"{int(doc.get('code_source')):02d}"
-        except Exception:
-            pass
-    source_type = str(doc.get("source_type") or "").strip().lower()
-    if source_type == "juridiction":
-        return "00"
-    if source_type == "partie":
-        try:
-            return f"{int(doc.get('code_partie') or 0):02d}"
-        except Exception:
-            return "99"
-    return "99"
+    code, reason = _documentary_code_from_doc(doc)
+    _documentary_identity_diagnostics(doc, code, reason)
+    return code
 
 def extract_numero_document_from_filename(doc: dict) -> str:
     for value in (doc.get("fichier_source"), Path(str(doc.get("chemin") or "")).name):
@@ -4567,7 +4782,8 @@ def attach_expert_doc_ids(docs: list[dict], aff_id: str = "") -> list[dict]:
             doc["numero_document"] = numero
             doc["expert_doc_id"] = existing
             doc["expert_doc_id_source"] = "existing"
-            used_by_code[code_source].add(int(numero))
+            used_code = _documentary_code_from_expert_id(existing) or code_source
+            used_by_code.setdefault(used_code, set()).add(int(numero))
             continue
         numero = extract_numero_document_from_filename(doc)
         if numero and int(numero) not in used_by_code[code_source]:
@@ -4950,12 +5166,14 @@ def doc_dedupe_key(doc: dict) -> tuple:
     if valid_expert_doc_id(expert_doc_id):
         return ("expert_doc_id", expert_doc_id)
     date_key = str(doc.get("date_transmission_expert") or "").strip()
+    party_key, party_key_source = _documentary_stable_party_key(doc)
     deposant_key = compact_spaces(doc.get("deposant") or "").lower()
+    dedupe_party_key = party_key if party_key_source != "legacy_deposant_fallback" else deposant_key
     numero = str(doc.get("numero_piece") or "").strip()
     sous_piece = str(doc.get("sous_piece") or "").strip().lower()
     if numero:
-        return ("piece", date_key, deposant_key, numero, sous_piece)
-    return ("document", date_key, deposant_key, clean_document_filename_label(doc.get("fichier_source")).lower())
+        return ("piece", date_key, dedupe_party_key, numero, sous_piece)
+    return ("document", date_key, dedupe_party_key, clean_document_filename_label(doc.get("fichier_source")).lower())
 
 def document_priority_score(doc: dict) -> tuple[int, int, int, int, int]:
     action = str(doc.get("source_log_action") or "")
@@ -4980,10 +5198,12 @@ def page_count_int(value) -> int | None:
         return None
 
 def split_child_dedupe_key(doc: dict) -> tuple:
+    party_key, party_key_source = _documentary_stable_party_key(doc)
+    if party_key_source == "legacy_deposant_fallback":
+        party_key = compact_spaces(doc.get("deposant") or "").lower()
     return (
-        str(doc.get("code_source") or normalize_source_code(doc)),
+        str(party_key),
         str(document_state_date(doc)),
-        compact_spaces(doc.get("deposant") or "").lower(),
         str(doc.get("numero_piece") or ""),
         str(doc.get("sous_piece") or "").lower(),
         str(doc.get("source_log_action") or ""),
@@ -5757,11 +5977,29 @@ def find_latest_transmission_destination(
     aff_root_local: str,
     filename: str,
     cfg: dict | None = None,
-) -> str:
+    *,
+    code_partie: str | int | None = None,
+    expert_doc_id: str = "",
+    transmission_id: str = "",
+    return_diagnostic: bool = False,
+) -> str | dict:
+    diagnostic = {
+        "ok": False,
+        "ambiguous": False,
+        "destination": "",
+        "candidates": [],
+        "filters": {
+            "code_partie": _normalized_documentary_code(code_partie),
+            "expert_doc_id": compact_spaces(expert_doc_id or ""),
+            "transmission_id": compact_spaces(transmission_id or ""),
+        },
+        "reason": "",
+    }
     try:
         p = transmission_journal_path(aff_root_local, cfg)
         if not p.exists():
-            return ""
+            diagnostic["reason"] = "journal_absent"
+            return diagnostic if return_diagnostic else ""
         matches = []
         with p.open("r", encoding="utf-8") as f:
             for line in f:
@@ -5772,15 +6010,50 @@ def find_latest_transmission_destination(
                     record = json.loads(line)
                 except Exception:
                     continue
+                record_party = record.get("party") or {}
+                record_code = _normalized_documentary_code(record_party.get("code_partie"))
+                record_transmission_id = compact_spaces(record.get("transmission_id") or "")
                 for key in ("copied", "files"):
                     for item in record.get(key, []) or []:
                         destination = str(item.get("destination") or "")
                         source_name = str(item.get("source_name") or item.get("name") or Path(destination).name)
                         if source_name == filename or Path(destination).name == filename:
-                            matches.append(destination)
-        return matches[-1] if matches else ""
+                            item_expert_doc_id = compact_spaces(item.get("expert_doc_id") or item.get("numero_expert") or "")
+                            item_code = _documentary_code_from_expert_id(item_expert_doc_id) or _normalized_documentary_code(item.get("code_partie")) or record_code
+                            matches.append({
+                                "destination": destination,
+                                "source_name": source_name,
+                                "record_code_partie": record_code,
+                                "code_partie": item_code,
+                                "expert_doc_id": item_expert_doc_id,
+                                "transmission_id": record_transmission_id,
+                            })
+        for filter_key in ("transmission_id", "expert_doc_id", "code_partie"):
+            wanted = diagnostic["filters"].get(filter_key) or ""
+            if wanted:
+                matches = [item for item in matches if compact_spaces(item.get(filter_key) or "") == wanted]
+        diagnostic["candidates"] = matches
+        if not matches:
+            diagnostic["reason"] = "aucun_candidat"
+            return diagnostic if return_diagnostic else ""
+        destinations = []
+        seen_destinations = set()
+        for item in matches:
+            destination = item.get("destination") or ""
+            if destination not in seen_destinations:
+                seen_destinations.add(destination)
+                destinations.append(destination)
+        if len(destinations) == 1:
+            diagnostic["ok"] = True
+            diagnostic["destination"] = destinations[0]
+            diagnostic["reason"] = "candidat_unique"
+            return diagnostic if return_diagnostic else destinations[0]
+        diagnostic["ambiguous"] = True
+        diagnostic["reason"] = "plusieurs_destinations_possibles"
+        return diagnostic if return_diagnostic else ""
     except Exception:
-        return ""
+        diagnostic["reason"] = "erreur_lecture_journal"
+        return diagnostic if return_diagnostic else ""
 
 def resolve_ingestion_local_source(
     aff_root_local: str,
@@ -5788,10 +6061,22 @@ def resolve_ingestion_local_source(
     filename: str,
     cfg: dict | None = None,
     session_paths: dict | None = None,
+    code_partie: str | int | None = None,
+    expert_doc_id: str = "",
+    transmission_id: str = "",
 ) -> dict:
     session_paths = session_paths or {}
     candidate_1 = pj(aff_root_local, folder_rel, filename) if aff_root_local and folder_rel and filename else ""
-    candidate_2 = find_latest_transmission_destination(aff_root_local, filename, cfg)
+    candidate_2_diag = find_latest_transmission_destination(
+        aff_root_local,
+        filename,
+        cfg,
+        code_partie=code_partie,
+        expert_doc_id=expert_doc_id,
+        transmission_id=transmission_id,
+        return_diagnostic=True,
+    )
+    candidate_2 = candidate_2_diag.get("destination") if candidate_2_diag.get("ok") else ""
     candidate_3 = str(session_paths.get(filename) or "")
 
     candidates = [
@@ -5813,6 +6098,7 @@ def resolve_ingestion_local_source(
         if exists and not selected:
             selected = raw
 
+    details["source_candidate_2_diagnostic"] = candidate_2_diag
     details["selected_source"] = selected
     return details
 
@@ -20242,8 +20528,11 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
 
             found_files = []
             selected_by_number = {}
+            ambiguous_by_number = {}
+            split_context_code = _normalized_documentary_code((ingestion_party or {}).get("code_partie"))
             try:
                 found_files = [path for path in Path(split_dir_unc).glob("*.pdf") if path.is_file()]
+                candidates_by_number = {}
                 for path in found_files:
                     piece_ref = detect_piece_ref_details_from_filename(path.name)
                     numero_piece = piece_ref.get("numero_piece")
@@ -20251,12 +20540,16 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                     if numero_piece is None or (expected_numbers and numero_piece not in expected_numbers):
                         continue
                     selected_key = (numero_piece, sous_piece.lower())
-                    current = selected_by_number.get(selected_key)
-                    if current is None or path.stat().st_mtime > current.stat().st_mtime:
-                        selected_by_number[selected_key] = path
+                    candidates_by_number.setdefault(selected_key, []).append(path)
+                for selected_key, candidates in candidates_by_number.items():
+                    if len(candidates) == 1:
+                        selected_by_number[selected_key] = candidates[0]
+                    else:
+                        ambiguous_by_number[selected_key] = sorted(str(path) for path in candidates)
             except Exception:
                 found_files = []
                 selected_by_number = {}
+                ambiguous_by_number = {}
 
             rows = []
             for (numero_piece, sous_piece_key), path in sorted(selected_by_number.items()):
@@ -20291,6 +20584,19 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 "nombre_fichiers_trouvés": len(found_files),
                 "fichiers_enfants_retenus": [row["fichier_source"] for row in rows],
                 "parent_pdf_associé": multi_pdf_name if multi_pdf_name != "(aucun)" else "",
+                "statut_identification": "AMBIGUÏTÉ" if ambiguous_by_number else "DOCUMENTAIRE OK",
+                "code_partie_contexte": split_context_code,
+                "cle_actuelle": "numero_piece + sous_piece",
+                "cle_recommandee": "code_partie + expert_doc_id ou code_partie + numero_piece + sous_piece",
+                "ambiguities": [
+                    {
+                        "numero_piece": key[0],
+                        "sous_piece": key[1],
+                        "candidats": candidates,
+                        "motif": "plusieurs enfants _Splits pour la meme cle numerique globale",
+                    }
+                    for key, candidates in sorted(ambiguous_by_number.items())
+                ],
                 "rows": rows,
             }
 
@@ -20824,6 +21130,8 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                         name,
                         project_config,
                         local_original_paths,
+                        code_partie=(ingestion_party or {}).get("code_partie"),
+                        transmission_id=st.session_state.get("last_transmission_id") or "",
                     )
                     local_src_raw = source_resolution.get("selected_source") or ""
                     local_src = Path(local_src_raw) if local_src_raw else None
@@ -21259,6 +21567,8 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             multi_pdf_name if multi_pdf_selected else "",
             project_config,
             st.session_state.get("ingestion_local_original_paths", {}),
+            code_partie=(ingestion_party or {}).get("code_partie"),
+            transmission_id=st.session_state.get("last_transmission_id") or "",
         )
         multi_pdf_local = multi_pdf_source.get("selected_source") or ""
         multi_pdf_pages_meta = file_page_count_record(Path(multi_pdf_local)) if multi_pdf_local else {"page_count": None}

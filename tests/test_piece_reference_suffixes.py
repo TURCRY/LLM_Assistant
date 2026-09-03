@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import io
+import json
 import shutil
 import tempfile
 import unittest
@@ -45,12 +46,24 @@ def _load_piece_helpers():
         "document_display_label",
         "parse_date_for_sort",
         "valid_expert_doc_id",
+        "_documentary_code_from_expert_id",
+        "_normalized_documentary_code",
+        "_documentary_code_from_doc",
+        "_documentary_identity_diagnostics",
+        "_documentary_stable_party_key",
+        "_documentary_filename",
+        "_documentary_path_values",
+        "deduce_code_source_from_paths",
+        "normalize_source_code",
+        "extract_numero_document_from_filename",
         "expert_doc_id_sort_key",
         "etat2_document_sort_key",
+        "attach_expert_doc_ids",
         "document_registry_fingerprint",
         "document_state_date",
         "is_real_non_piece_document",
         "doc_dedupe_key",
+        "split_child_dedupe_key",
         "document_priority_score",
         "dedupe_documents_prefer_validated_rows",
         "_document_ingestion_sort_text",
@@ -65,6 +78,7 @@ def _load_piece_helpers():
         "selected_document_labels_from_rows",
         "document_registry_fingerprint",
         "copy_ingestion_uploaded_originals",
+        "find_latest_transmission_destination",
     }
     body = []
     for node in tree.body:
@@ -82,6 +96,7 @@ def _load_piece_helpers():
         "re": __import__("re"),
         "unicodedata": __import__("unicodedata"),
         "hashlib": __import__("hashlib"),
+        "json": json,
         "date": date,
         "datetime": datetime,
         "pj": lambda *parts: str(Path(str(parts[0])).joinpath(*[str(p) for p in parts[1:] if str(p)])),
@@ -106,6 +121,7 @@ def _load_piece_helpers():
         "append_transmission_record": lambda root, event, cfg=None: str(Path(root) / "journal.json"),
         "user_machine_label": lambda: "test",
         "make_transmission_id": lambda aff_id: f"{aff_id}-T",
+        "transmission_journal_path": lambda root, cfg=None: Path(root) / "AA_Expert_Admin" / "_Logs" / "transmissions.jsonl",
         "JURIDICTION_FOLDER_REL": "_Juridiction",
     }
     exec(compile(module, str(APP_PATH), "exec"), ns)
@@ -411,6 +427,116 @@ class PieceReferenceSuffixTests(unittest.TestCase):
         ]
         ordered = sorted(docs, key=self.ns["etat2_document_sort_key"])
         self.assertEqual([doc["fichier_source"] for doc in ordered], ["Piece 2.pdf", "Piece 10.pdf"])
+
+    def test_explicit_code_partie_has_priority_over_path(self):
+        doc = {
+            "code_partie": 17,
+            "expert_doc_id": "17-001",
+            "chemin": r"C:\Affaires\A\18_Partie_18_Ancien_Nom\piece.pdf",
+        }
+
+        code = self.ns["normalize_source_code"](doc)
+
+        self.assertEqual(code, "17")
+        self.assertEqual(doc["code_source_chemin"], "18")
+        self.assertIn("divergence_code_partie_chemin", {item["type"] for item in doc["code_source_anomalies"]})
+
+    def test_path_is_fallback_when_explicit_code_absent(self):
+        doc = {"chemin": r"C:\Affaires\A\04_Partie_04_SEBIA\piece.pdf"}
+
+        self.assertEqual(self.ns["normalize_source_code"](doc), "04")
+        self.assertEqual(doc["code_source_deduction_motif"], "chemin_nn_partie")
+
+    def test_existing_expert_doc_id_survives_folder_rename(self):
+        docs = [
+            {
+                "code_partie": 17,
+                "expert_doc_id": "17-001",
+                "chemin": r"C:\Affaires\A\17_Partie_17_Ancien_Nom\piece.pdf",
+                "fichier_source": "piece.pdf",
+            },
+            {
+                "code_partie": 17,
+                "expert_doc_id": "17-001",
+                "chemin": r"C:\Affaires\A\17_Partie_17_Nouveau_Nom\piece.pdf",
+                "fichier_source": "piece.pdf",
+            },
+        ]
+
+        attached = self.ns["attach_expert_doc_ids"](docs)
+
+        self.assertEqual([doc["expert_doc_id"] for doc in attached], ["17-001", "17-001"])
+        self.assertEqual([doc["expert_doc_id_source"] for doc in attached], ["existing", "existing"])
+
+    def test_homonymous_file_in_two_parties_is_ambiguous_without_stable_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_dir = root / "AA_Expert_Admin" / "_Logs"
+            log_dir.mkdir(parents=True)
+            journal = log_dir / "transmissions.jsonl"
+            records = [
+                {
+                    "transmission_id": "T-01",
+                    "party": {"code_partie": 1},
+                    "copied": [{"source_name": "piece.pdf", "destination": str(root / "01_Partie_01_A" / "piece.pdf"), "expert_doc_id": "01-001"}],
+                },
+                {
+                    "transmission_id": "T-02",
+                    "party": {"code_partie": 2},
+                    "copied": [{"source_name": "piece.pdf", "destination": str(root / "02_Partie_02_B" / "piece.pdf"), "expert_doc_id": "02-001"}],
+                },
+            ]
+            journal.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+
+            diag = self.ns["find_latest_transmission_destination"](str(root), "piece.pdf", return_diagnostic=True)
+            filtered = self.ns["find_latest_transmission_destination"](str(root), "piece.pdf", code_partie=2, return_diagnostic=True)
+
+        self.assertTrue(diag["ambiguous"])
+        self.assertEqual(diag["destination"], "")
+        self.assertTrue(filtered["ok"])
+        self.assertIn("02_Partie_02_B", filtered["destination"])
+
+    def test_deposant_dedupe_fallback_only_when_stable_identifier_absent(self):
+        same_party_old_name = {
+            "code_partie": 7,
+            "deposant": "Ancien Nom",
+            "date_transmission_expert": "2026-07-03",
+            "numero_piece": 1,
+            "fichier_source": "Piece 1.pdf",
+        }
+        same_party_new_name = {**same_party_old_name, "deposant": "Nouveau Nom"}
+        legacy_a = {k: v for k, v in same_party_old_name.items() if k != "code_partie"}
+        legacy_b = {**legacy_a, "deposant": "Nouveau Nom"}
+
+        self.assertEqual(self.ns["doc_dedupe_key"](same_party_old_name), self.ns["doc_dedupe_key"](same_party_new_name))
+        self.assertNotEqual(self.ns["doc_dedupe_key"](legacy_a), self.ns["doc_dedupe_key"](legacy_b))
+
+    def test_state2_and_state4_identity_fields_do_not_change_for_identified_docs(self):
+        old_folder = {
+            "code_partie": 4,
+            "expert_doc_id": "04-001",
+            "deposant": "Ancien Nom",
+            "date_transmission_expert": "2026-07-03",
+            "fichier_source": "piece.pdf",
+            "chemin": r"C:\Affaires\A\04_Partie_04_Ancien_Nom\piece.pdf",
+        }
+        new_folder = {**old_folder, "deposant": "Nouveau Nom", "chemin": r"C:\Affaires\A\04_Partie_04_Nouveau_Nom\piece.pdf"}
+
+        old_attached = self.ns["attach_expert_doc_ids"]([dict(old_folder)])[0]
+        new_attached = self.ns["attach_expert_doc_ids"]([dict(new_folder)])[0]
+
+        self.assertEqual(old_attached["expert_doc_id"], new_attached["expert_doc_id"])
+        self.assertEqual(old_attached["code_source"], new_attached["code_source"])
+        self.assertEqual(self.ns["etat2_document_sort_key"](old_attached)[2], self.ns["etat2_document_sort_key"](new_attached)[2])
+
+    def test_legacy_document_without_code_partie_still_uses_path_fallback(self):
+        doc = {
+            "deposant": "Legacy",
+            "fichier_source": "piece.pdf",
+            "chemin": r"C:\Affaires\A\03_Partie_03_Legacy\piece.pdf",
+        }
+
+        self.assertEqual(self.ns["normalize_source_code"](doc), "03")
 
     def test_argumentation_transmission_etat2_orders_by_expert_doc_id(self):
         transmissions = Path(r"C:\Affaires\2026-A60\AA_Expert_Admin\_Logs\transmissions.jsonl")

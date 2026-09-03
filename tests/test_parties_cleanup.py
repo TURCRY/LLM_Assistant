@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 import unicodedata
@@ -53,6 +54,19 @@ def _load_cleanup_helpers():
         "inspect_party_folder_tree",
         "sha256_file",
         "detect_party_folder_file_conflicts",
+        "valid_expert_doc_id",
+        "expert_doc_id_sort_key",
+        "_documentary_code_from_expert_id",
+        "_normalized_documentary_code",
+        "_documentary_code_from_doc",
+        "_documentary_identity_diagnostics",
+        "_documentary_stable_party_key",
+        "_documentary_filename",
+        "_documentary_path_values",
+        "deduce_code_source_from_paths",
+        "normalize_source_code",
+        "load_sqlite_documentary_rows",
+        "build_documentary_consistency_diagnostic",
         "analyze_party_folder_duplicates",
         "load_party_folder_history",
         "analyze_residual_party_folders",
@@ -113,6 +127,7 @@ def _load_cleanup_helpers():
         "get_column_letter": get_column_letter,
         "datetime": datetime,
         "hashlib": hashlib,
+        "sqlite3": sqlite3,
         "json": json,
         "os": os,
         "re": __import__("re"),
@@ -122,6 +137,7 @@ def _load_cleanup_helpers():
         "sanitize_filename": sanitize_filename,
         "effective_nas_affaire_root": lambda cfg, aff_id: ((cfg or {}).get("roots") or {}).get("nas") or "",
         "pcfixe_unc_root_for_laptop": lambda cfg, aff_id: ((cfg or {}).get("roots") or {}).get("pcfixe") or "",
+        "affaire_sqlite_path_from_root": lambda root, cfg=None: Path(root) / "Documents.db",
     }
     exec(compile(module, str(APP_PATH), "exec"), ns)
     return ns
@@ -530,6 +546,49 @@ class PartiesCleanupTests(unittest.TestCase):
 
         self.assertEqual(self.ns["PARTY_REPAIR_CONFLICT"], item["status"])
         self.assertEqual("Sous/piece.pdf", item["conflicts"][0]["rel"])
+
+    def test_repair_diagnostic_reports_documentary_code_path_divergence(self):
+        party = self._party(1, "Alpha")
+        self._write_parties([party])
+        self._make_folder_all_roots(party["folder_rel"])
+        conn = sqlite3.connect(str(self.laptop / "Documents.db"))
+        conn.execute(
+            """
+            CREATE TABLE Documents (
+                id_document INTEGER PRIMARY KEY,
+                numero_expert TEXT NOT NULL,
+                code_partie TEXT NOT NULL,
+                nom_original TEXT,
+                nom_cible TEXT,
+                chemin_nas TEXT,
+                chemin_local TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO Documents (numero_expert, code_partie, nom_original, nom_cible, chemin_nas, chemin_local)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "01-001",
+                "01",
+                "piece.pdf",
+                "piece.pdf",
+                str(self.nas / "02_Partie_02_Beta" / "piece.pdf"),
+                str(self.laptop / "01_Partie_01_Alpha" / "piece.pdf"),
+            ),
+        )
+        conn.commit()
+        conn.close()
+
+        analysis = self._repair_analysis()
+        item = self._repair_code(analysis, 1)
+
+        self.assertEqual(1, item["documentaire"]["sqlite_documents_count"])
+        self.assertEqual(["01-001"], item["documentaire"]["expert_doc_ids"])
+        self.assertEqual("INCOHÉRENCE", item["documentaire"]["statut_documentaire"])
+        self.assertEqual("02", item["documentaire"]["documents_chemin_autre_code"][0]["code_chemin"])
 
     def test_repair_diagnostic_inaccessible_root_blocks_mutation(self):
         party = self._party(1, "Alpha")
