@@ -2220,12 +2220,11 @@ def _party_family_dirs(root: str | Path, code: int) -> list[Path]:
     return sorted(found, key=lambda p: p.name.lower())
 
 def _party_code_from_folder_rel(folder_rel: str) -> int | None:
-    name = Path(safe_text(folder_rel)).name
-    match = re.fullmatch(r"(?P<code_a>\d{2})_Partie_(?P<code_b>\d{2})_.+", name)
-    if not match or match.group("code_a") != match.group("code_b"):
+    ok, code, _error = is_party_folder_candidate_name(Path(safe_text(folder_rel)).name)
+    if not ok:
         return None
     try:
-        return int(match.group("code_a"))
+        return int(code)
     except Exception:
         return None
 
@@ -2431,6 +2430,821 @@ def ensure_party_dirs_on_roots(
             except Exception as e:
                 result["errors"].append({"target": target, "folder_rel": folder_rel, "root": str(root), "error": str(e)})
     return result
+
+PARTY_FOLDER_PATTERN = re.compile(r"^(?P<code_a>\d{2})_Partie_(?P<code_b>\d{2})_.+$")
+PARTY_CLEANUP_ACTIVE = "ACTIF"
+PARTY_CLEANUP_RESIDUAL_EMPTY = "RÉSIDUEL VIDE"
+PARTY_CLEANUP_NON_EMPTY = "ANOMALIE NON VIDE"
+PARTY_CLEANUP_INCONSISTENT = "INCOHÉRENT"
+PARTY_REPAIR_OK = "OK"
+PARTY_REPAIR_EMPTY_RESIDUES = "RÉSIDUS VIDES"
+PARTY_REPAIR_TO_CONSOLIDATE = "À CONSOLIDER"
+PARTY_REPAIR_CONFLICT = "CONFLIT"
+PARTY_REPAIR_INCONSISTENT = "INCOHÉRENT"
+
+def party_roots_for_affaire(aff_root_local: str, cfg: dict | None, aff_id: str) -> dict:
+    return {
+        "laptop": aff_root_local,
+        "nas": effective_nas_affaire_root(cfg, aff_id),
+        "pcfixe": pcfixe_unc_root_for_laptop(cfg or {}, aff_id),
+    }
+
+def _path_dedup_key(path: Path) -> str:
+    return os.path.normcase(os.path.realpath(os.path.abspath(str(path))))
+
+def party_cleanup_selection_signature(selected_folder_rels) -> tuple[str, ...]:
+    folders = [safe_text(value) for value in (selected_folder_rels or [])]
+    return tuple(sorted({folder for folder in folders if folder}))
+
+def party_cleanup_confirmation_valid(selected_folder_rels, checked: bool, confirmed_signature) -> bool:
+    signature = party_cleanup_selection_signature(selected_folder_rels)
+    return bool(signature) and bool(checked) and tuple(confirmed_signature or ()) == signature
+
+def is_party_folder_candidate_name(name: str) -> tuple[bool, str, str]:
+    folder_name = safe_text(name)
+    match = PARTY_FOLDER_PATTERN.fullmatch(folder_name)
+    if not match:
+        return False, "", "format attendu XX_Partie_XX_*"
+    code_a = match.group("code_a")
+    code_b = match.group("code_b")
+    if code_a != code_b:
+        return False, code_a, "numeros de partie incoherents"
+    return True, code_a, ""
+
+def is_safe_party_cleanup_folder_rel(folder_rel: str) -> tuple[bool, str]:
+    safe_rel, rel_error = _is_safe_party_folder_rel(folder_rel)
+    if not safe_rel:
+        return False, rel_error
+    rel_path = Path(folder_rel)
+    if len(rel_path.parts) != 1:
+        return False, "le nettoyage accepte uniquement un dossier enfant direct"
+    ok_name, _code, name_error = is_party_folder_candidate_name(folder_rel)
+    if not ok_name:
+        return False, name_error
+    return True, ""
+
+def dedupe_party_roots(roots: dict) -> dict:
+    deduped = []
+    skipped = []
+    seen = {}
+    for label, root in (roots or {}).items():
+        root_text = safe_text(root)
+        if not root_text:
+            skipped.append({"target": label, "root": root_text, "reason": "racine absente"})
+            continue
+        root_path = Path(root_text)
+        try:
+            dedup_key = _path_dedup_key(root_path)
+        except Exception as exc:
+            dedup_key = f"unresolved:{label}:{root_text}"
+            skipped.append({"target": label, "root": root_text, "reason": f"resolution impossible: {exc}"})
+        if dedup_key in seen:
+            seen[dedup_key]["targets"].append(label)
+            continue
+        item = {
+            "target": label,
+            "targets": [label],
+            "root": root_text,
+            "dedup_key": dedup_key,
+            "accessible": root_path.exists() and root_path.is_dir(),
+            "path": str(root_path),
+        }
+        if item["accessible"]:
+            try:
+                item["resolved"] = str(root_path.resolve(strict=False))
+            except Exception:
+                item["resolved"] = str(root_path)
+        else:
+            item["resolved"] = str(root_path)
+        seen[dedup_key] = item
+        deduped.append(item)
+    return {"roots": deduped, "skipped": skipped}
+
+def build_active_party_folder_index(parties: list[dict]) -> dict:
+    active = {}
+    errors = []
+    for party in parties or []:
+        folder_rel = safe_text((party or {}).get("folder_rel"))
+        if not folder_rel:
+            continue
+        safe_rel, rel_error = _is_safe_party_folder_rel(folder_rel)
+        if not safe_rel:
+            errors.append({"folder_rel": folder_rel, "error": rel_error, "party": party})
+            continue
+        active[folder_rel] = {
+            "code_partie": party.get("code_partie"),
+            "nom": party.get("nom", ""),
+            "folder_rel": folder_rel,
+        }
+    return {"active": active, "errors": errors}
+
+def inspect_party_folder_path(root: Path, folder_rel: str) -> dict:
+    try:
+        root_resolved = root.resolve(strict=False)
+        target_path = (root_resolved / folder_rel).resolve(strict=False)
+        target_path.relative_to(root_resolved)
+    except Exception as exc:
+        return {
+            "folder_rel": folder_rel,
+            "root": str(root),
+            "path": "",
+            "exists": False,
+            "status": "unsafe",
+            "files": 0,
+            "dirs": 0,
+            "items": 0,
+            "error": f"chemin hors racine: {exc}",
+        }
+
+    item = {
+        "folder_rel": folder_rel,
+        "root": str(root_resolved),
+        "path": str(target_path),
+        "exists": target_path.exists(),
+        "status": "absent",
+        "files": 0,
+        "dirs": 0,
+        "items": 0,
+        "error": "",
+    }
+    if not target_path.exists():
+        return item
+    if not target_path.is_dir():
+        item["status"] = "not_directory"
+        item["error"] = "chemin cible existant mais non dossier"
+        return item
+    try:
+        children = list(target_path.iterdir())
+    except Exception as exc:
+        item["status"] = "access_error"
+        item["error"] = f"contenu non verifiable: {exc}"
+        return item
+    item["files"] = sum(1 for child in children if child.is_file())
+    item["dirs"] = sum(1 for child in children if child.is_dir())
+    item["items"] = len(children)
+    item["status"] = "empty" if not children else "non_empty"
+    return item
+
+def inspect_party_folder_tree(root: Path, folder_rel: str) -> dict:
+    item = inspect_party_folder_path(root, folder_rel)
+    item["size"] = 0
+    item["files_detail"] = []
+    if item.get("status") != "non_empty":
+        return item
+    folder = Path(item["path"])
+    try:
+        for child in folder.rglob("*"):
+            if not child.is_file():
+                continue
+            rel = child.relative_to(folder).as_posix()
+            size = child.stat().st_size
+            item["size"] += size
+            item["files_detail"].append({"rel": rel, "path": str(child), "size": size})
+    except Exception as exc:
+        item["status"] = "access_error"
+        item["error"] = f"inventaire recursif impossible: {exc}"
+    return item
+
+def detect_party_folder_file_conflicts(inspections: list[dict]) -> dict:
+    by_rel = {}
+    for inspected in inspections or []:
+        folder_rel = inspected.get("folder_rel")
+        target = inspected.get("target")
+        for file_item in inspected.get("files_detail") or []:
+            by_rel.setdefault(file_item["rel"], []).append({
+                **file_item,
+                "folder_rel": folder_rel,
+                "target": target,
+            })
+
+    conflicts = []
+    duplicates = []
+    for rel, files in sorted(by_rel.items()):
+        if len(files) < 2:
+            continue
+        sizes = {int(item.get("size") or 0) for item in files}
+        if len(sizes) > 1:
+            conflicts.append({"rel": rel, "reason": "tailles differentes", "files": files})
+            continue
+        try:
+            hashes = {}
+            for item in files:
+                hashes.setdefault(sha256_file(item["path"]), []).append(item)
+        except Exception as exc:
+            conflicts.append({"rel": rel, "reason": f"hash impossible: {exc}", "files": files})
+            continue
+        if len(hashes) == 1:
+            duplicates.append({"rel": rel, "sha256": next(iter(hashes.keys())), "files": files})
+        else:
+            conflicts.append({"rel": rel, "reason": "contenus differents", "files": files})
+    return {"conflicts": conflicts, "duplicates": duplicates}
+
+def analyze_party_folder_duplicates(
+    aff_root_local: str,
+    cfg: dict | None,
+    aff_id: str,
+    parties: list[dict],
+) -> dict:
+    raw_roots = party_roots_for_affaire(aff_root_local, cfg, aff_id)
+    root_info = dedupe_party_roots(raw_roots)
+    by_code = {}
+    active_errors = []
+    for party in parties or []:
+        try:
+            code = int(party.get("code_partie"))
+        except Exception:
+            active_errors.append({"party": party, "error": "code_partie invalide"})
+            continue
+        by_code[code] = dict(party)
+
+    root_blockers = [
+        {"target": root.get("target"), "targets": root.get("targets"), "root": root.get("root"), "error": "racine inaccessible"}
+        for root in root_info["roots"]
+        if not root.get("accessible")
+    ]
+    codes = []
+    for code in sorted(by_code):
+        party = by_code[code]
+        nom = safe_text(party.get("nom"))
+        try:
+            canonical = party_folder_name(code, nom)
+        except Exception as exc:
+            canonical = ""
+            active_errors.append({"code_partie": code, "error": str(exc)})
+        referenced = safe_text(party.get("folder_rel"))
+        folder_names = set()
+        if canonical:
+            folder_names.add(canonical)
+        if referenced:
+            folder_names.add(referenced)
+        for root in root_info["roots"]:
+            if not root.get("accessible"):
+                continue
+            for found in _party_family_dirs(root["root"], code):
+                folder_names.add(found.name)
+
+        folders = []
+        all_inspections = []
+        for folder_rel in sorted(folder_names):
+            inspections = []
+            for root in root_info["roots"]:
+                if not root.get("accessible"):
+                    inspections.append({
+                        "target": root.get("target"),
+                        "targets": root.get("targets"),
+                        "root": root.get("root"),
+                        "folder_rel": folder_rel,
+                        "path": "",
+                        "exists": False,
+                        "status": "root_inaccessible",
+                        "files": 0,
+                        "dirs": 0,
+                        "items": 0,
+                        "size": 0,
+                        "files_detail": [],
+                        "error": "racine inaccessible",
+                    })
+                    continue
+                inspected = inspect_party_folder_tree(Path(root["root"]), folder_rel)
+                inspected["target"] = root.get("target")
+                inspected["targets"] = root.get("targets")
+                inspections.append(inspected)
+                all_inspections.append(inspected)
+            exists_any = any(item.get("exists") for item in inspections)
+            non_empty_any = any(item.get("status") == "non_empty" for item in inspections)
+            empty_any = any(item.get("status") == "empty" for item in inspections)
+            folders.append({
+                "folder_rel": folder_rel,
+                "is_canonical": folder_rel == canonical,
+                "is_referenced": folder_rel == referenced,
+                "exists_any": exists_any,
+                "empty": bool(empty_any and not non_empty_any),
+                "non_empty": bool(non_empty_any),
+                "files": sum(int(item.get("files") or 0) for item in inspections),
+                "dirs": sum(int(item.get("dirs") or 0) for item in inspections),
+                "size": sum(int(item.get("size") or 0) for item in inspections),
+                "roots": sorted({label for item in inspections if item.get("exists") for label in (item.get("targets") or [item.get("target")])}),
+                "inspections": inspections,
+            })
+
+        comparable = [
+            item for item in all_inspections
+            if item.get("exists") and item.get("folder_rel") != canonical and item.get("status") in {"empty", "non_empty"}
+        ]
+        comparable.extend([
+            item for item in all_inspections
+            if item.get("exists") and item.get("folder_rel") == canonical and item.get("status") in {"empty", "non_empty"}
+        ])
+        conflict_info = detect_party_folder_file_conflicts(comparable)
+        existing_folders = [folder for folder in folders if folder["exists_any"]]
+        other_existing = [folder for folder in existing_folders if not folder["is_canonical"]]
+        non_empty_other = [folder for folder in other_existing if folder["non_empty"]]
+        empty_other = [folder for folder in other_existing if folder["empty"]]
+        canonical_present = any(folder["is_canonical"] and folder["exists_any"] for folder in folders)
+
+        if root_blockers or any(folder for folder in folders for item in folder["inspections"] if item.get("status") in {"unsafe", "not_directory", "access_error"}):
+            status = PARTY_REPAIR_INCONSISTENT
+        elif conflict_info["conflicts"]:
+            status = PARTY_REPAIR_CONFLICT
+        elif not existing_folders:
+            status = PARTY_REPAIR_INCONSISTENT
+        elif canonical_present and not other_existing:
+            status = PARTY_REPAIR_OK
+        elif non_empty_other or not canonical_present:
+            status = PARTY_REPAIR_TO_CONSOLIDATE
+        elif empty_other:
+            status = PARTY_REPAIR_EMPTY_RESIDUES
+        else:
+            status = PARTY_REPAIR_INCONSISTENT
+
+        codes.append({
+            "code_partie": code,
+            "nom_actuel": nom,
+            "canonical_folder_rel": canonical,
+            "referenced_folder_rel": referenced,
+            "other_folder_rels": [folder["folder_rel"] for folder in other_existing],
+            "folders": folders,
+            "conflicts": conflict_info["conflicts"],
+            "duplicates": conflict_info["duplicates"],
+            "status": status,
+            "repair_mutation_allowed": False,
+            "mutation_blocker": "consolidation physique non implementee; seules les suppressions explicites sur NAS passent par preflight",
+        })
+
+    return {
+        "ok": not root_blockers and not active_errors,
+        "aff_id": aff_id,
+        "roots": root_info["roots"],
+        "skipped_roots": root_info["skipped"],
+        "root_blockers": root_blockers,
+        "active_errors": active_errors,
+        "codes": codes,
+        "strategy": {
+            "mode": "diagnostic_only",
+            "reason": "NAS autoritaire pour les mutations; laptop et PC fixe restent diagnostiques comme miroirs/fallbacks",
+            "points_to_decide": [
+                "implementer la consolidation physique uniquement sur la racine NAS autoritaire",
+                "laisser les mecanismes de synchronisation existants propager les changements",
+                "bloquer toute consolidation en cas de conflit metier ou physique",
+            ],
+        },
+    }
+
+
+def load_party_folder_history(aff_root_local: str) -> dict:
+    log_dir = Path(pj(aff_root_local, "AA_Expert_Admin", "_Logs"))
+    history = {}
+    if not log_dir.exists() or not log_dir.is_dir():
+        return history
+    for path in sorted(log_dir.glob("parties_update_*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        ts = safe_text(data.get("ts") or data.get("timestamp") or path.stem.replace("parties_update_", ""))
+        for entry in data.get("renamed", []) or []:
+            for role in ("from", "to"):
+                folder_rel = safe_text((entry or {}).get(role))
+                if folder_rel:
+                    history.setdefault(folder_rel, []).append({
+                        "log": str(path),
+                        "ts": ts,
+                        "role": role,
+                        "code_partie": (entry or {}).get("code_partie"),
+                        "from": (entry or {}).get("from"),
+                        "to": (entry or {}).get("to"),
+                    })
+    return history
+
+def analyze_residual_party_folders(
+    aff_root_local: str,
+    cfg: dict | None,
+    aff_id: str,
+    parties: list[dict],
+) -> dict:
+    raw_roots = party_roots_for_affaire(aff_root_local, cfg, aff_id)
+    root_info = dedupe_party_roots(raw_roots)
+    active_info = build_active_party_folder_index(parties)
+    active = active_info["active"]
+    history = load_party_folder_history(aff_root_local)
+    root_blockers = []
+    candidate_names = set()
+
+    for root in root_info["roots"]:
+        if not root.get("accessible"):
+            root_blockers.append({"target": root.get("target"), "targets": root.get("targets"), "root": root.get("root"), "error": "racine inaccessible"})
+            continue
+        root_path = Path(root["root"])
+        try:
+            children = list(root_path.iterdir())
+        except Exception as exc:
+            root_blockers.append({"target": root.get("target"), "targets": root.get("targets"), "root": root.get("root"), "error": f"inventaire impossible: {exc}"})
+            continue
+        for child in children:
+            if not child.is_dir():
+                continue
+            ok, _code, _error = is_party_folder_candidate_name(child.name)
+            if ok:
+                candidate_names.add(child.name)
+
+    folders = []
+    for folder_rel in sorted(candidate_names):
+        ok_name, code, name_error = is_party_folder_candidate_name(folder_rel)
+        inspections = []
+        blockers = []
+        total_files = 0
+        total_dirs = 0
+        present_targets = []
+        non_empty_targets = []
+        empty_targets = []
+        absent_targets = []
+        for root in root_info["roots"]:
+            if not root.get("accessible"):
+                inspections.append({
+                    "target": root.get("target"),
+                    "targets": root.get("targets"),
+                    "root": root.get("root"),
+                    "path": "",
+                    "exists": False,
+                    "status": "root_inaccessible",
+                    "files": 0,
+                    "dirs": 0,
+                    "items": 0,
+                    "error": "racine inaccessible",
+                })
+                blockers.append({"folder_rel": folder_rel, "target": root.get("target"), "root": root.get("root"), "error": "racine inaccessible"})
+                continue
+            inspected = inspect_party_folder_path(Path(root["root"]), folder_rel)
+            inspected["target"] = root.get("target")
+            inspected["targets"] = root.get("targets")
+            inspections.append(inspected)
+            total_files += int(inspected.get("files") or 0)
+            total_dirs += int(inspected.get("dirs") or 0)
+            status = inspected.get("status")
+            if inspected.get("exists"):
+                present_targets.extend(root.get("targets") or [root.get("target")])
+            if status == "empty":
+                empty_targets.extend(root.get("targets") or [root.get("target")])
+            elif status == "non_empty":
+                non_empty_targets.extend(root.get("targets") or [root.get("target")])
+            elif status == "absent":
+                absent_targets.extend(root.get("targets") or [root.get("target")])
+            elif status != "empty":
+                blockers.append({"folder_rel": folder_rel, "target": root.get("target"), "root": root.get("root"), "error": inspected.get("error") or status})
+
+        active_party = active.get(folder_rel)
+        state = PARTY_CLEANUP_INCONSISTENT
+        reason = ""
+        selectable = False
+        if not ok_name:
+            reason = name_error
+        elif active_party:
+            state = PARTY_CLEANUP_ACTIVE
+            reason = "folder_rel actif dans parties.json"
+        elif blockers:
+            reason = "; ".join(sorted({safe_text(b.get("error")) for b in blockers if b.get("error")}))
+        elif absent_targets:
+            reason = "present sur certaines racines et absent sur d'autres"
+        elif non_empty_targets and empty_targets:
+            reason = "vide sur certaines racines et non vide sur d'autres"
+        elif non_empty_targets:
+            state = PARTY_CLEANUP_NON_EMPTY
+            reason = "dossier non actif contenant des elements"
+        elif empty_targets and not absent_targets:
+            state = PARTY_CLEANUP_RESIDUAL_EMPTY
+            reason = "dossier non actif vide sur toutes les racines controlees"
+            selectable = True
+        else:
+            reason = "aucune racine controlee"
+
+        folders.append({
+            "folder_rel": folder_rel,
+            "code_partie": code,
+            "state": state,
+            "selectable": selectable,
+            "active_party": active_party,
+            "present_targets": sorted(set(present_targets)),
+            "absent_targets": sorted(set(absent_targets)),
+            "non_empty_targets": sorted(set(non_empty_targets)),
+            "empty_targets": sorted(set(empty_targets)),
+            "files": total_files,
+            "dirs": total_dirs,
+            "items": total_files + total_dirs,
+            "history": history.get(folder_rel, []),
+            "reason": reason,
+            "blockers": blockers,
+            "inspections": inspections,
+        })
+
+    return {
+        "ok": not root_blockers and not active_info["errors"],
+        "aff_id": aff_id,
+        "roots": root_info["roots"],
+        "skipped_roots": root_info["skipped"],
+        "active_folders": active,
+        "active_errors": active_info["errors"],
+        "root_blockers": root_blockers,
+        "folders": folders,
+    }
+
+def authoritative_party_mutation_root(aff_root_local: str, cfg: dict | None, aff_id: str) -> dict:
+    root_text = safe_text(effective_nas_affaire_root(cfg or {}, aff_id))
+    if not root_text:
+        return {"ok": False, "target": "nas", "root": "", "error": "racine NAS autoritaire absente"}
+    root_path = Path(root_text)
+    if not root_path.exists() or not root_path.is_dir():
+        return {"ok": False, "target": "nas", "root": root_text, "error": "racine NAS autoritaire inaccessible"}
+    try:
+        resolved = root_path.resolve(strict=False)
+    except Exception:
+        resolved = root_path
+    return {"ok": True, "target": "nas", "root": root_text, "resolved": str(resolved), "path": root_path}
+
+def preflight_cleanup_residual_party_folders(
+    aff_root_local: str,
+    cfg: dict | None,
+    aff_id: str,
+    parties: list[dict],
+    selected_folder_rels,
+) -> dict:
+    selected = party_cleanup_selection_signature(selected_folder_rels)
+    analysis = analyze_residual_party_folders(aff_root_local, cfg, aff_id, parties)
+    by_folder = {item["folder_rel"]: item for item in analysis.get("folders", [])}
+    blockers = []
+    targets = []
+    nas_root = authoritative_party_mutation_root(aff_root_local, cfg, aff_id)
+    if not nas_root.get("ok"):
+        blockers.append(nas_root)
+
+    for folder_rel in selected:
+        safe_rel, rel_error = is_safe_party_cleanup_folder_rel(folder_rel)
+        if not safe_rel:
+            blockers.append({"folder_rel": folder_rel, "error": rel_error})
+            continue
+        item = by_folder.get(folder_rel)
+        if not item:
+            blockers.append({"folder_rel": folder_rel, "error": "dossier non retrouve dans l'analyse courante"})
+            continue
+        if item.get("state") != PARTY_CLEANUP_RESIDUAL_EMPTY or not item.get("selectable"):
+            blockers.append({"folder_rel": folder_rel, "state": item.get("state"), "error": "dossier non eligible au nettoyage"})
+            continue
+        if not nas_root.get("ok"):
+            continue
+        try:
+            target_path = _safe_child_path(nas_root["path"], folder_rel)
+        except Exception as exc:
+            blockers.append({"folder_rel": folder_rel, "target": "nas", "root": nas_root.get("root"), "error": f"chemin hors racine NAS: {exc}"})
+            continue
+        inspected = inspect_party_folder_path(Path(nas_root["path"]), folder_rel)
+        if inspected.get("status") != "empty":
+            blockers.append({"folder_rel": folder_rel, "target": "nas", "root": nas_root.get("root"), "error": inspected.get("error") or inspected.get("status")})
+            continue
+        targets.append({
+            "folder_rel": folder_rel,
+            "target": "nas",
+            "targets": ["nas"],
+            "root": nas_root.get("resolved") or nas_root.get("root"),
+            "path": str(target_path),
+            "status": inspected.get("status"),
+        })
+    blockers.extend(analysis.get("root_blockers") or [])
+    blockers.extend(analysis.get("active_errors") or [])
+    return {
+        "ok": bool(selected) and not blockers,
+        "aff_id": aff_id,
+        "selected_folder_rels": list(selected),
+        "mutation_root": {k: str(v) for k, v in nas_root.items() if k != "path"},
+        "analysis": analysis,
+        "targets": targets,
+        "blockers": blockers,
+    }
+
+def write_parties_cleanup_log(aff_root_local: str, event: dict) -> str:
+    log_dir = pj(aff_root_local, "AA_Expert_Admin", "_Logs")
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    p = Path(log_dir) / f"parties_cleanup_{ts}.json"
+    suffix = 2
+    while p.exists():
+        p = Path(log_dir) / f"parties_cleanup_{ts}__{suffix}.json"
+        suffix += 1
+    p.write_text(json.dumps(event, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(p)
+
+def cleanup_residual_party_folders(
+    aff_root_local: str,
+    cfg_dir: str,
+    selected_folder_rels,
+    *,
+    aff_id: str,
+    project_config: dict | None = None,
+) -> dict:
+    parties = load_parties(cfg_dir)
+    preflight = preflight_cleanup_residual_party_folders(
+        aff_root_local,
+        project_config,
+        aff_id,
+        parties,
+        selected_folder_rels,
+    )
+    if not preflight["ok"]:
+        raise ValueError(f"Nettoyage de dossiers residuels bloque: {preflight['blockers']}")
+
+    seen_paths = set()
+    for target in preflight["targets"]:
+        path = Path(target["path"])
+        dedup_key = _path_dedup_key(path)
+        if dedup_key in seen_paths:
+            continue
+        seen_paths.add(dedup_key)
+        if not path.is_dir() or any(path.iterdir()):
+            raise ValueError(f"Dossier devenu non vide ou inaccessible avant suppression: {path}")
+
+    removed_dirs = []
+    for target in preflight["targets"]:
+        path = Path(target["path"])
+        dedup_key = _path_dedup_key(path)
+        if any(existing.get("dedup_key") == dedup_key for existing in removed_dirs):
+            continue
+        if not path.is_dir() or any(path.iterdir()):
+            raise ValueError(f"Dossier devenu non vide ou inaccessible avant suppression: {path}")
+        path.rmdir()
+        removed_dirs.append({**target, "dedup_key": dedup_key})
+
+    event = {
+        "ok": True,
+        "action": "cleanup_residual_party_folders",
+        "aff_id": aff_id,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "requested_selection": list(preflight["selected_folder_rels"]),
+        "roots": preflight["analysis"].get("roots", []),
+        "preflight": preflight,
+        "removed_dirs": removed_dirs,
+        "absent_dirs": [],
+        "blockers": [],
+        "classification": [
+            item for item in preflight["analysis"].get("folders", [])
+            if item.get("folder_rel") in set(preflight["selected_folder_rels"])
+        ],
+    }
+    event["log_path"] = write_parties_cleanup_log(aff_root_local, event)
+    return event
+
+def preflight_delete_parties(
+    aff_root_local: str,
+    cfg: dict | None,
+    aff_id: str,
+    parties: list[dict],
+    selected_codes,
+) -> dict:
+    selected = set()
+    for value in selected_codes or []:
+        try:
+            selected.add(int(value))
+        except Exception:
+            continue
+
+    by_code = {}
+    for party in parties or []:
+        try:
+            by_code[int(party.get("code_partie"))] = dict(party)
+        except Exception:
+            continue
+
+    nas_root = authoritative_party_mutation_root(aff_root_local, cfg, aff_id)
+    targets = []
+    blockers = []
+    if not nas_root.get("ok"):
+        blockers.append(nas_root)
+
+    for code in sorted(selected):
+        party = by_code.get(code)
+        if not party:
+            blockers.append({"code_partie": code, "error": "partie absente de parties.json"})
+            continue
+
+        folder_rel = safe_text(party.get("folder_rel"))
+        safe_rel, rel_error = _is_safe_party_folder_rel(folder_rel)
+        if not safe_rel:
+            blockers.append({"code_partie": code, "folder_rel": folder_rel, "error": rel_error})
+            continue
+        if not nas_root.get("ok"):
+            continue
+
+        try:
+            target_path = _safe_child_path(nas_root["path"], folder_rel)
+        except Exception as exc:
+            blockers.append({"code_partie": code, "target": "nas", "root": nas_root.get("root"), "folder_rel": folder_rel, "error": f"chemin hors racine NAS: {exc}"})
+            continue
+
+        item = {
+            "code_partie": code,
+            "nom": party.get("nom", ""),
+            "folder_rel": folder_rel,
+            "target": "nas",
+            "root": nas_root.get("resolved") or nas_root.get("root"),
+            "path": str(target_path),
+            "exists": target_path.exists(),
+            "empty": None,
+            "status": "absent",
+        }
+        if target_path.exists():
+            if not target_path.is_dir():
+                item["status"] = "not_directory"
+                blockers.append({**item, "error": "chemin cible existant mais non dossier"})
+            else:
+                try:
+                    has_children = any(target_path.iterdir())
+                except Exception as exc:
+                    item["status"] = "access_error"
+                    blockers.append({**item, "error": f"contenu non verifiable: {exc}"})
+                else:
+                    item["empty"] = not has_children
+                    item["status"] = "empty" if not has_children else "non_empty"
+                    if has_children:
+                        blockers.append({**item, "error": "dossier non vide"})
+        targets.append(item)
+
+    return {
+        "ok": bool(selected) and not blockers,
+        "aff_id": aff_id,
+        "selected_codes": sorted(selected),
+        "parties": [by_code[c] for c in sorted(selected) if c in by_code],
+        "mutation_root": {k: str(v) for k, v in nas_root.items() if k != "path"},
+        "targets": targets,
+        "blockers": blockers,
+    }
+
+def delete_parties(
+    aff_root_local: str,
+    cfg_dir: str,
+    selected_codes,
+    *,
+    aff_id: str,
+    titre: str,
+    project_config: dict | None = None,
+    export_xlsx: bool = True,
+) -> dict:
+    existing = load_parties(cfg_dir)
+    preflight = preflight_delete_parties(aff_root_local, project_config, aff_id, existing, selected_codes)
+    if not preflight["ok"]:
+        raise ValueError(f"Suppression de parties bloquee: {preflight['blockers']}")
+
+    for target in preflight["targets"]:
+        if target["status"] != "empty":
+            continue
+        path = Path(target["path"])
+        if not path.is_dir() or any(path.iterdir()):
+            raise ValueError(f"Dossier non vide ou inaccessible avant suppression: {path}")
+
+    removed_dirs = []
+    absent_dirs = []
+    for target in preflight["targets"]:
+        path = Path(target["path"])
+        if target["status"] == "absent":
+            absent_dirs.append(target)
+            continue
+        if target["status"] != "empty":
+            raise ValueError(f"Preflight incoherent avant suppression: {target}")
+        if any(path.iterdir()):
+            raise ValueError(f"Dossier devenu non vide avant suppression: {path}")
+        path.rmdir()
+        removed_dirs.append(target)
+
+    selected = set(preflight["selected_codes"])
+    remaining = []
+    for party in existing:
+        try:
+            code = int(party.get("code_partie"))
+        except Exception:
+            remaining.append(party)
+            continue
+        if code not in selected:
+            remaining.append(party)
+    json_path = save_parties(cfg_dir, remaining)
+
+    xlsx_path = ""
+    if export_xlsx:
+        xlsx_path = pj(aff_root_local, "AB_Organisation_expertise", "Id_affaire_en_tete_dossier.xlsx")
+        export_parties_xlsx(xlsx_path, aff_id=aff_id, titre=titre, parties=remaining)
+
+    event = {
+        "ok": True,
+        "action": "delete_parties",
+        "aff_id": aff_id,
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "deleted_codes": sorted(selected),
+        "deleted_parties": preflight["parties"],
+        "preflight": preflight,
+        "examined_paths": preflight["targets"],
+        "removed_dirs": removed_dirs,
+        "absent_dirs": absent_dirs,
+        "json_path": json_path,
+        "xlsx_path": xlsx_path or None,
+        "count": len(remaining),
+    }
+    event["log_path"] = write_parties_delete_log(aff_root_local, event)
+    return event
 
 def _is_safe_party_folder_rel(folder_rel: str) -> tuple[bool, str]:
     folder_rel = safe_text(folder_rel)
@@ -12910,6 +13724,92 @@ else:
             st.rerun()
 
     if existing_parties:
+        st.markdown("#### Suppression sûre de parties")
+        delete_by_code = {}
+        for party in existing_parties:
+            try:
+                delete_by_code[int(party.get("code_partie"))] = party
+            except Exception:
+                continue
+        delete_codes = st.multiselect(
+            "Parties existantes à supprimer",
+            options=sorted(delete_by_code.keys()),
+            format_func=lambda code: f"{int(code):02d} — {delete_by_code.get(code, {}).get('nom', '')}",
+            key="parties_delete_codes_v1",
+            help="Sélection séparée de l'éditeur : supprimer une ligne du tableau ne supprime pas une partie.",
+        )
+        delete_signature = party_delete_selection_signature(delete_codes)
+        if st.session_state.get("parties_delete_selection_signature_v1") != delete_signature:
+            st.session_state["parties_delete_selection_signature_v1"] = delete_signature
+            st.session_state["parties_delete_confirmed_signature_v1"] = ()
+            st.session_state["parties_delete_confirm_v1"] = False
+
+        delete_preflight = None
+        if delete_codes:
+            aff_id_ui = get_project_id(project_config, "")
+            delete_preflight = preflight_delete_parties(
+                aff_root_local,
+                project_config,
+                aff_id_ui,
+                existing_parties,
+                delete_codes,
+            )
+            preview_rows = [{
+                "code_partie": f"{int(p['code_partie']):02d}",
+                "nom": p.get("nom", ""),
+                "folder_rel": p.get("folder_rel", ""),
+            } for p in delete_preflight.get("parties", [])]
+            st.warning("Vérifiez les parties et dossiers ci-dessous avant confirmation.")
+            st.dataframe(prepare_df_for_streamlit_display(preview_rows), width="stretch")
+            with st.expander("Préflight suppression parties", expanded=not delete_preflight.get("ok")):
+                st.json(delete_preflight)
+            if delete_preflight.get("blockers"):
+                st.error("Suppression bloquée : au moins un dossier est non vide, inaccessible ou non sûr.")
+
+        confirm_delete = st.checkbox(
+            "Je confirme la suppression des entrées parties sélectionnées et des seuls dossiers vides listés par le préflight.",
+            value=False,
+            key="parties_delete_confirm_v1",
+            disabled=not delete_codes or not (delete_preflight or {}).get("ok"),
+        )
+        if confirm_delete:
+            st.session_state["parties_delete_confirmed_signature_v1"] = delete_signature
+        else:
+            st.session_state["parties_delete_confirmed_signature_v1"] = ()
+        confirmation_valid = party_delete_confirmation_valid(
+            delete_codes,
+            confirm_delete,
+            st.session_state.get("parties_delete_confirmed_signature_v1"),
+        )
+        if st.button(
+            "🗑️ Supprimer les parties sélectionnées",
+            disabled=not delete_codes or not confirmation_valid or not (delete_preflight or {}).get("ok"),
+            key="parties_delete_apply_v1",
+        ):
+            try:
+                aff_id_ui = get_project_id(project_config, "")
+                titre_ui = (project_config.get("titre") or "").strip()
+                res = delete_parties(
+                    aff_root_local,
+                    cfg_dir,
+                    delete_codes,
+                    aff_id=aff_id_ui,
+                    titre=titre_ui,
+                    project_config=project_config,
+                    export_xlsx=bool(export_xlsx_flag),
+                )
+                st.success(
+                    f"Parties supprimées : {len(res.get('deleted_codes', []))} · "
+                    f"Dossiers vides supprimés : {len(res.get('removed_dirs', []))} · "
+                    f"Dossiers absents : {len(res.get('absent_dirs', []))}"
+                )
+                with st.expander("Journal de suppression", expanded=False):
+                    st.json(res)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Suppression impossible : {e}")
+
+    if existing_parties:
         st.markdown("#### Suppression logique seule")
         delete_by_code = {}
         for party in existing_parties:
@@ -12958,6 +13858,197 @@ else:
                 st.rerun()
             except Exception as e:
                 st.error(f"Suppression logique impossible : {e}")
+
+    st.markdown("#### 🛠️ Réparer les dossiers de parties")
+    st.caption("Diagnostic par code_partie. Toute future consolidation physique devra viser la racine NAS autoritaire.")
+    aff_id_repair = get_project_id(project_config, "")
+    if st.button("🔎 Diagnostiquer les doublons de dossiers", key="parties_repair_diagnose_v1"):
+        try:
+            repair_analysis = analyze_party_folder_duplicates(
+                aff_root_local,
+                project_config,
+                aff_id_repair,
+                existing_parties,
+            )
+            st.session_state["parties_repair_analysis_v1"] = repair_analysis
+        except Exception as e:
+            st.session_state.pop("parties_repair_analysis_v1", None)
+            st.error(f"Diagnostic impossible : {e}")
+
+    repair_analysis = st.session_state.get("parties_repair_analysis_v1")
+    if repair_analysis:
+        repair_rows = []
+        for item in repair_analysis.get("codes", []):
+            folders = item.get("folders") or []
+            repair_rows.append({
+                "code": f"{int(item.get('code_partie')):02d}",
+                "nom actuel": item.get("nom_actuel", ""),
+                "dossier canonique attendu": item.get("canonical_folder_rel", ""),
+                "dossier actuellement référencé": item.get("referenced_folder_rel", ""),
+                "autres dossiers du même code": ", ".join(item.get("other_folder_rels") or []),
+                "vide/non vide": ", ".join(
+                    f"{folder.get('folder_rel')}: {'non vide' if folder.get('non_empty') else 'vide' if folder.get('empty') else 'absent'}"
+                    for folder in folders
+                    if folder.get("exists_any")
+                ),
+                "nombre de fichiers": sum(int(folder.get("files") or 0) for folder in folders),
+                "taille": sum(int(folder.get("size") or 0) for folder in folders),
+                "racines": ", ".join(sorted({root for folder in folders for root in (folder.get("roots") or [])})),
+                "conflits éventuels": len(item.get("conflicts") or []),
+                "statut": item.get("status", ""),
+            })
+        if repair_rows:
+            st.dataframe(prepare_df_for_streamlit_display(repair_rows), width="stretch")
+        else:
+            st.info("Aucune partie active à diagnostiquer dans parties.json.")
+        if repair_analysis.get("root_blockers") or repair_analysis.get("active_errors"):
+            st.error("Diagnostic incomplet : au moins une racine ou une entrée parties.json ne peut pas être contrôlée sûrement.")
+        st.warning(
+            "Réparation physique désactivée : le NAS est la racine autoritaire ; "
+            "les miroirs locaux restent des copies/fallbacks opérationnels."
+        )
+        with st.expander("Points à trancher avant mutation", expanded=True):
+            st.json(repair_analysis.get("strategy", {}))
+        with st.expander("Détail technique du diagnostic par code_partie", expanded=False):
+            st.json(repair_analysis)
+        st.button("🔧 Réparer les dossiers sélectionnés", disabled=True, key="parties_repair_apply_v1")
+
+    st.markdown("#### 🧹 Nettoyage des dossiers résiduels de parties")
+    st.caption("Cet outil ne modifie ni parties.json ni l'Excel : il supprime uniquement des dossiers non actifs, vides et explicitement confirmés.")
+    aff_id_cleanup = get_project_id(project_config, "")
+    if st.button("🔎 Analyser les dossiers de parties", key="parties_cleanup_analyze_v1"):
+        try:
+            cleanup_analysis = analyze_residual_party_folders(
+                aff_root_local,
+                project_config,
+                aff_id_cleanup,
+                existing_parties,
+            )
+            st.session_state["parties_cleanup_analysis_v1"] = cleanup_analysis
+            st.session_state["parties_cleanup_selected_signature_v1"] = ()
+            st.session_state["parties_cleanup_confirmed_signature_v1"] = ()
+            st.session_state["parties_cleanup_confirm_v1"] = False
+        except Exception as e:
+            st.session_state.pop("parties_cleanup_analysis_v1", None)
+            st.error(f"Analyse impossible : {e}")
+
+    cleanup_analysis = st.session_state.get("parties_cleanup_analysis_v1")
+    if cleanup_analysis:
+        cleanup_rows = []
+        for item in cleanup_analysis.get("folders", []):
+            active_party = item.get("active_party") or {}
+            inspections = {safe_text(i.get("target")): i for i in item.get("inspections", [])}
+            def _root_presence(label):
+                inspected = inspections.get(label)
+                if not inspected:
+                    return "non contrôlé"
+                if inspected.get("status") == "root_inaccessible":
+                    return "racine inaccessible"
+                if not inspected.get("exists"):
+                    return "absent"
+                return inspected.get("status") or "présent"
+            history = item.get("history") or []
+            cleanup_rows.append({
+                "dossier": item.get("folder_rel", ""),
+                "code détecté": item.get("code_partie", ""),
+                "état": item.get("state", ""),
+                "partie active éventuelle": (
+                    f"{int(active_party.get('code_partie')):02d} — {active_party.get('nom', '')}"
+                    if active_party.get("code_partie") else ""
+                ),
+                "présence laptop": _root_presence("laptop"),
+                "présence NAS": _root_presence("nas"),
+                "présence PC fixe": _root_presence("pcfixe"),
+                "nombre de fichiers": item.get("files", 0),
+                "nombre de sous-dossiers": item.get("dirs", 0),
+                "historique identifié": (
+                    f"{len(history)} entrée(s), dernier: {Path(history[-1].get('log', '')).name}"
+                    if history else ""
+                ),
+                "motif si bloqué": "" if item.get("selectable") else item.get("reason", ""),
+            })
+        if cleanup_rows:
+            st.dataframe(prepare_df_for_streamlit_display(cleanup_rows), width="stretch")
+        else:
+            st.info("Aucun dossier de partie physique correspondant à XX_Partie_XX_* n'a été trouvé.")
+
+        if cleanup_analysis.get("root_blockers") or cleanup_analysis.get("active_errors"):
+            st.error("Nettoyage bloqué : au moins une racine ou un folder_rel actif ne peut pas être contrôlé sûrement.")
+        with st.expander("Détail technique de l'analyse des dossiers", expanded=False):
+            st.json(cleanup_analysis)
+
+        cleanup_eligible = [
+            item.get("folder_rel") for item in cleanup_analysis.get("folders", [])
+            if item.get("state") == PARTY_CLEANUP_RESIDUAL_EMPTY and item.get("selectable")
+        ]
+        cleanup_selected = st.multiselect(
+            "Dossiers résiduels vides à supprimer",
+            options=cleanup_eligible,
+            key="parties_cleanup_selected_v1",
+            help="Seuls les dossiers non actifs, vides sur toutes les racines contrôlées et cohérents sont proposés.",
+        )
+        cleanup_signature = party_cleanup_selection_signature(cleanup_selected)
+        if st.session_state.get("parties_cleanup_selected_signature_v1") != cleanup_signature:
+            st.session_state["parties_cleanup_selected_signature_v1"] = cleanup_signature
+            st.session_state["parties_cleanup_confirmed_signature_v1"] = ()
+            st.session_state["parties_cleanup_confirm_v1"] = False
+
+        cleanup_preflight = None
+        if cleanup_selected:
+            cleanup_preflight = preflight_cleanup_residual_party_folders(
+                aff_root_local,
+                project_config,
+                aff_id_cleanup,
+                existing_parties,
+                cleanup_selected,
+            )
+            selected_paths = [{
+                "dossier": target.get("folder_rel", ""),
+                "racine": target.get("target", ""),
+                "chemin": target.get("path", ""),
+            } for target in cleanup_preflight.get("targets", [])]
+            st.warning("Vérifiez les chemins ci-dessous avant confirmation.")
+            st.dataframe(prepare_df_for_streamlit_display(selected_paths), width="stretch")
+            with st.expander("Préflight nettoyage dossiers résiduels", expanded=not cleanup_preflight.get("ok")):
+                st.json(cleanup_preflight)
+            if cleanup_preflight.get("blockers"):
+                st.error("Nettoyage bloqué : au moins une cible n'est plus éligible.")
+
+        confirm_cleanup = st.checkbox(
+            "Je confirme la suppression des seuls dossiers résiduels vides sélectionnés, après nouveau préflight.",
+            value=False,
+            key="parties_cleanup_confirm_v1",
+            disabled=not cleanup_selected or not (cleanup_preflight or {}).get("ok"),
+        )
+        if confirm_cleanup:
+            st.session_state["parties_cleanup_confirmed_signature_v1"] = cleanup_signature
+        else:
+            st.session_state["parties_cleanup_confirmed_signature_v1"] = ()
+        cleanup_confirmation_valid = party_cleanup_confirmation_valid(
+            cleanup_selected,
+            confirm_cleanup,
+            st.session_state.get("parties_cleanup_confirmed_signature_v1"),
+        )
+        if st.button(
+            "🗑️ Supprimer les dossiers résiduels vides sélectionnés",
+            disabled=not cleanup_selected or not cleanup_confirmation_valid or not (cleanup_preflight or {}).get("ok"),
+            key="parties_cleanup_apply_v1",
+        ):
+            try:
+                res = cleanup_residual_party_folders(
+                    aff_root_local,
+                    cfg_dir,
+                    cleanup_selected,
+                    aff_id=aff_id_cleanup,
+                    project_config=project_config,
+                )
+                st.success(f"Dossiers résiduels supprimés : {len(res.get('removed_dirs', []))}.")
+                with st.expander("Journal de nettoyage", expanded=False):
+                    st.json(res)
+                st.session_state.pop("parties_cleanup_analysis_v1", None)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Nettoyage impossible : {e}")
 
     # Optionnel : affichage des correspondances dossier
     if existing_parties:
