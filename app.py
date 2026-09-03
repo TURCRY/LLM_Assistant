@@ -2197,24 +2197,70 @@ def unique_folder_path(root_local: str, folder_name: str) -> str:
             return candidate
         i += 1
 
+def _same_physical_path(a: str | Path, b: str | Path) -> bool:
+    try:
+        left = os.path.normcase(os.path.realpath(os.path.abspath(str(Path(a)))))
+        right = os.path.normcase(os.path.realpath(os.path.abspath(str(Path(b)))))
+        return left == right
+    except Exception:
+        return str(a) == str(b)
+
+def _party_family_prefix(code: int) -> str:
+    return f"{int(code):02d}_Partie_{int(code):02d}_"
+
+def _party_family_dirs(root: str | Path, code: int) -> list[Path]:
+    root_path = Path(root)
+    if not root_path.exists() or not root_path.is_dir():
+        return []
+    prefix = _party_family_prefix(code)
+    found = []
+    for child in root_path.iterdir():
+        if child.is_dir() and child.name.startswith(prefix):
+            found.append(child)
+    return sorted(found, key=lambda p: p.name.lower())
+
+def _party_code_from_folder_rel(folder_rel: str) -> int | None:
+    name = Path(safe_text(folder_rel)).name
+    match = re.fullmatch(r"(?P<code_a>\d{2})_Partie_(?P<code_b>\d{2})_.+", name)
+    if not match or match.group("code_a") != match.group("code_b"):
+        return None
+    try:
+        return int(match.group("code_a"))
+    except Exception:
+        return None
+
+def _is_party_suffix_variant(folder_rel: str) -> bool:
+    return bool(re.search(r"__\d+$", Path(safe_text(folder_rel)).name))
+
+def _safe_child_path(root: str | Path, folder_rel: str) -> Path:
+    root_resolved = Path(root).resolve(strict=False)
+    target = (root_resolved / folder_rel).resolve(strict=False)
+    target.relative_to(root_resolved)
+    return target
+
 def rename_party_dir(root_local: str, old_folder_rel: str, new_folder_rel: str) -> tuple[str, bool]:
     if old_folder_rel == new_folder_rel:
         return old_folder_rel, False
 
-    old_abs = pj(root_local, old_folder_rel)
-    if not Path(old_abs).exists():
-        # ancien dossier absent → créer nouveau
-        new_abs = unique_folder_path(root_local, new_folder_rel)
-        Path(new_abs).mkdir(parents=True, exist_ok=True)
-        return Path(new_abs).name, True
+    old_abs = _safe_child_path(root_local, old_folder_rel)
+    new_abs = _safe_child_path(root_local, new_folder_rel)
+    if not old_abs.exists():
+        raise ValueError(
+            f"Renommage partie bloque: dossier source introuvable pour '{old_folder_rel}'. "
+            "Utiliser l'outil de diagnostic/reparation avant de renommer cette partie."
+        )
+    if not old_abs.is_dir():
+        raise ValueError(f"Renommage partie bloque: source existante non dossier: {old_abs}")
+    if new_abs.exists() and not _same_physical_path(old_abs, new_abs):
+        raise ValueError(
+            f"Renommage partie bloque: destination canonique deja occupee par un autre dossier: {new_abs}. "
+            "Aucun dossier suffixe __N ne sera cree."
+        )
+    if _same_physical_path(old_abs, new_abs):
+        return new_folder_rel, False
 
-    new_abs = pj(root_local, new_folder_rel)
-    if Path(new_abs).exists():
-        # collision → nom unique
-        new_abs = unique_folder_path(root_local, new_folder_rel)
-
-    Path(old_abs).rename(new_abs)
-    return Path(new_abs).name, True
+    old_abs.rename(new_abs)
+    return new_folder_rel, True
 
 def safe_text(value) -> str:
     if value is None:
@@ -2307,13 +2353,46 @@ def ensure_party_dirs_on_roots(
         folder_rel = safe_text((party or {}).get("folder_rel"))
         if not folder_rel:
             continue
+        code = _party_code_from_folder_rel(folder_rel)
+        if code is None:
+            result["errors"].append({"folder_rel": folder_rel, "error": "format de dossier de partie invalide"})
+            continue
+        if _is_party_suffix_variant(folder_rel):
+            result["errors"].append({
+                "folder_rel": folder_rel,
+                "code_partie": code,
+                "error": "folder_rel suffixe __N non cree; lancer le diagnostic/reparation des dossiers de parties",
+            })
+            continue
         for target, root in roots.items():
             if not root:
                 result["errors"].append({"target": target, "folder_rel": folder_rel, "error": "racine absente"})
                 continue
             try:
-                path = Path(pj(root, folder_rel))
+                root_path = Path(root)
+                if not root_path.exists() or not root_path.is_dir():
+                    result["errors"].append({"target": target, "folder_rel": folder_rel, "root": str(root), "error": "racine inaccessible"})
+                    continue
+                path = _safe_child_path(root, folder_rel)
+                family_conflicts = [
+                    str(existing)
+                    for existing in _party_family_dirs(root, code)
+                    if not _same_physical_path(existing, path)
+                ]
+                if family_conflicts:
+                    result["errors"].append({
+                        "target": target,
+                        "folder_rel": folder_rel,
+                        "code_partie": code,
+                        "root": str(root),
+                        "existing_family_dirs": family_conflicts,
+                        "error": "creation bloquee: un autre dossier physique existe deja pour ce code_partie",
+                    })
+                    continue
                 existed = path.exists()
+                if existed and not path.is_dir():
+                    result["errors"].append({"target": target, "folder_rel": folder_rel, "path": str(path), "error": "chemin cible existant mais non dossier"})
+                    continue
                 path.mkdir(parents=True, exist_ok=True)
                 item = {"target": target, "folder_rel": folder_rel, "path": str(path)}
                 if existed:
@@ -6524,11 +6603,23 @@ def apply_parties_update(aff_root_local: str, cfg_dir: str, edited_rows: list[di
 
         if not cur:
             # création
-            folder_abs = unique_folder_path(aff_root_local, new_folder_rel)
-            Path(folder_abs).mkdir(parents=True, exist_ok=True)
+            family_conflicts = [
+                str(existing)
+                for existing in _party_family_dirs(aff_root_local, code)
+                if existing.name != new_folder_rel
+            ]
+            if family_conflicts:
+                raise ValueError(
+                    f"Creation partie {code:02d} bloquee: un dossier de la meme famille existe deja "
+                    f"({family_conflicts}). Lancer le diagnostic/reparation des dossiers de parties."
+                )
+            folder_abs = _safe_child_path(aff_root_local, new_folder_rel)
+            if folder_abs.exists() and not folder_abs.is_dir():
+                raise ValueError(f"Creation partie {code:02d} bloquee: destination existante non dossier: {folder_abs}")
+            folder_abs.mkdir(parents=True, exist_ok=True)
             by_code[code] = {
                 **row,
-                "folder_rel": Path(folder_abs).name,
+                "folder_rel": new_folder_rel,
                 "history": [],
             }
             created_codes.append(code)
@@ -6540,7 +6631,10 @@ def apply_parties_update(aff_root_local: str, cfg_dir: str, edited_rows: list[di
                 old_folder_rel = party_folder_name(code, cur.get("nom", f"Partie_{code:02d}"))
 
             old_nom = (cur.get("nom") or "").strip()
-            folder_rel_effectif, did_rename = rename_party_dir(aff_root_local, old_folder_rel, new_folder_rel)
+            if old_nom != new_nom:
+                folder_rel_effectif, did_rename = rename_party_dir(aff_root_local, old_folder_rel, new_folder_rel)
+            else:
+                folder_rel_effectif, did_rename = old_folder_rel, False
 
             if did_rename:
                 renamed_items.append({"code_partie": code, "from": old_folder_rel, "to": folder_rel_effectif})
