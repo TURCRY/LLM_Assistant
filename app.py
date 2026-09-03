@@ -49,6 +49,26 @@ try:
 except Exception:
     Document = None
 
+# --- Lot 1 : affectation manuelle des photos aux sujets ---
+ANNOTATION_PHOTOS_APP_DIR_CANDIDATES = [
+    Path(r"C:\AnnotationPhotosGPT\app"),
+    Path(r"C:\CodexWorkspace\AnnotationPhotosGPT\app"),
+]
+photo_subject_interface = None
+PHOTO_SUBJECT_IMPORT_ERROR = ""
+for _photo_subject_app_dir in ANNOTATION_PHOTOS_APP_DIR_CANDIDATES:
+    if not _photo_subject_app_dir.is_dir():
+        continue
+    if str(_photo_subject_app_dir) not in sys.path:
+        sys.path.insert(0, str(_photo_subject_app_dir))
+    try:
+        import photo_subject_interface as _photo_subject_module
+        photo_subject_interface = _photo_subject_module
+        break
+    except Exception as _photo_subject_exc:
+        PHOTO_SUBJECT_IMPORT_ERROR = f"{type(_photo_subject_exc).__name__}: {_photo_subject_exc}"
+        continue
+
 STREAMLIT_DISPLAY_STRING_COLUMNS = {
     "code_partie",
     "numero_piece",
@@ -15677,6 +15697,33 @@ elif page == "Annotation photos / Rapport Word":
         st.caption(
             "Le rapport Word est exécuté par le spooler PC fixe ; aucun traitement long n'est lancé depuis Streamlit."
         )
+
+        # --- Lot 1 : affectation manuelle des photos aux sujets ---
+        st.divider()
+        if photo_subject_interface is None:
+            st.error(
+                "Module photo_subject_interface indisponible : "
+                + (PHOTO_SUBJECT_IMPORT_ERROR or "module introuvable.")
+            )
+        else:
+            try:
+                photo_subject_interface.render_photo_subject_section(
+                    id_affaire=ann_id_affaire,
+                    id_captation=ann_id_captation,
+                    sujets_path=ann_paths["nas_trans_dir"] / "Sujets.xlsx",
+                    photos_batch_path=ann_paths["nas_photos_batch"],
+                    global_final_path=(
+                        NAS_AFFAIRES_ROOT
+                        / ann_id_affaire
+                        / "BE_Traitement_captations"
+                        / ann_id_captation
+                        / "compte_rendu_LLM"
+                        / "global_final.json"
+                    ),
+                    photos_dir=ann_paths["nas_photos_dir"],
+                )
+            except Exception as exc:
+                st.error(f"Section contextualisation indisponible : {exc}")
 
 elif page == "Prompts & Bibliothèque":
     st.subheader("🧰 Prompts structurés (par projet)")
