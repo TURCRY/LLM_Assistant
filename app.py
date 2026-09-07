@@ -1923,7 +1923,9 @@ def aff_path(cfg, *rel):  # construit un chemin "vu par le PC/NAS"
 
 def load_json(path, default=None):
     try:
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        # Les manifests produits par le runner peuvent porter un BOM UTF-8 :
+        # utf-8-sig le tolere, la ou utf-8 echoue silencieusement.
+        return json.loads(Path(path).read_text(encoding="utf-8-sig"))
     except Exception:
         return default if default is not None else {}
 
@@ -9690,20 +9692,33 @@ def _annotation_resolve_batch_submission_notice(
         return None
     action_key = str(notice.get("action_key") or "")
     expected_job_id = str(notice.get("job_id") or "")
+    # Le job soumis est suivi par son job_id exact, quel que soit l etat
+    # atteint (queued -> running -> done/failed) et quelle que soit la cle
+    # d action sous laquelle il a ete range. On ne retombe jamais sur un
+    # ancien job sous pretexte que le job courant a atteint un etat terminal.
     actual_detail = None
     if expected_job_id:
+        # rang d autorite : terminal (done/failed) > running > queued
+        state_ranks = {"completed": 4, "failed": 4, "running": 3, "queued": 2}
+        best_rank = -1
         for detail in (job_details or {}).values():
-            if str(detail.get("job_id") or "") == expected_job_id:
-                actual_detail = detail
-                break
+            if not isinstance(detail, dict):
+                continue
+            if str(detail.get("job_id") or "") != expected_job_id:
+                continue
+            state = str(detail.get("status") or "").strip().lower()
+            rank = state_ranks.get(state, 0)
+            if rank > best_rank:
+                best_rank, actual_detail = rank, detail
     if actual_detail is None and action_key and isinstance(job_details, dict):
+        # Repli : la cle d action ne doit pas faire retomber sur un AUTRE job.
         candidate = job_details.get(action_key, {})
-        if isinstance(candidate, dict) and candidate.get("job_id"):
+        if isinstance(candidate, dict) and str(candidate.get("job_id") or "") == expected_job_id:
             actual_detail = candidate
     if actual_detail is None:
-        current_status = str(((job_details or {}).get(action_key, {}) or {}).get("status") or "")
-        if current_status in {"failed", "completed", "absent"} and str(notice.get("status") or "") in {"queued", "running"}:
-            return None
+        # Le job n est plus visible dans le registre. On conserve le notice
+        # tel quel (etat connu) au lieu de le supprimer : le supprimer ferait
+        # retomber l affichage sur un ancien job failed.
         return notice
     merged = dict(notice)
     merged["status"] = str(actual_detail.get("status") or merged.get("status") or "")
@@ -9711,6 +9726,9 @@ def _annotation_resolve_batch_submission_notice(
     merged["job_path"] = str(actual_detail.get("job_path") or merged.get("job_path") or "")
     merged["exit_code"] = str(actual_detail.get("exit_code") or "")
     merged["stderr_excerpt"] = str(actual_detail.get("stderr_excerpt") or "")
+    merged["no_op"] = str(actual_detail.get("no_op") or "")
+    merged["no_op_reason"] = str(actual_detail.get("no_op_reason") or "")
+    merged["rerun_weak"] = str(actual_detail.get("rerun_weak") or "")
     return merged
 
 def _annotation_resource_paths(infos_path: Path, infos: dict) -> dict[str, Path | None]:
@@ -10029,7 +10047,7 @@ def _annotation_job_details(
 
     def _normal_status(raw_status: str, folder: str) -> str:
         value = str(raw_status or "").strip().lower()
-        if folder == "done" or value in {"done", "completed", "success", "succeeded", "ok"}:
+        if folder in {"done", "logs"} or value in {"done", "completed", "success", "succeeded", "ok"}:
             return "completed"
         if folder == "failed" or value in {"failed", "error", "ko"}:
             return "failed"
@@ -10445,6 +10463,7 @@ def _annotation_job_details(
                     "source_manifest": source_manifest,
                     "no_op": "true" if no_op_valid else "",
                     "no_op_reason": no_op_reason,
+                    "rerun_weak": "true" if _annotation_batch_has_option(options, "--rerun-weak") else "false",
                     "batch_manifest_kind": "modern" if is_modern else "legacy",
                     "profile": str(job.get("profile") or PHOTO_BATCH_ACTIONS.get(action_key, {}).get("profile") or action_key),
                     "options": list(options),
@@ -10874,7 +10893,10 @@ def _annotation_verified_batch_from_stamp(
         detail_time = _annotation_detail_sort_time(detail)
         if detail_time <= stamp_mtime + ANNOTATION_RESOURCE_MTIME_TOLERANCE_SECONDS:
             continue
-        if detail.get("status") == "failed":
+        # Un echec de RELANCE WEAK n invalide pas un stamp de traitement
+        # initial : on ne compare que des etats metier de meme nature.
+        is_weak_rerun = str(detail.get("rerun_weak") or "").strip().lower() == "true"
+        if detail.get("status") == "failed" and not is_weak_rerun:
             reasons.append(f"stamp contredit : manifest failed plus récent ({detail.get('job_id')})")
         if str(detail.get("publish_pending") or "").strip().lower() == "true":
             reasons.append(f"stamp contredit : publish_pending plus récent ({detail.get('job_id')})")
@@ -11082,6 +11104,282 @@ def _annotation_resource_audit(
         (resources.get("photos_batch.csv") or {}).get("paths", {}).get("nas"),
     )
     return {"resources": resources, "rows": rows, "join_audit": join_audit}
+
+
+JOB_STATE_RANK = {"completed": 4, "failed": 4, "running": 3, "queued": 2, "absent": 1, "unknown": 1}
+
+# Sous-ensemble des statuts consideres comme terminaux et autoritaires.
+JOB_TERMINAL_STATES = {"completed", "failed"}
+
+WEAK_NO_OP_REASON = "NO_WEAK_ROWS"
+
+
+def _annotation_job_recency_key(job: dict) -> tuple[int, float]:
+    """Cle de recence d un job, par priorite decroissante.
+
+    1. horodatage extrait du ``job_id`` (``_YYYYMMDD_HHMMSS_``) ;
+    2. ``finished_at`` / ``started_at`` / ``timestamp`` du manifeste ;
+    3. ``mtime`` du fichier, en tout dernier recours.
+
+    Le premier element du tuple indique la source : plus il est grand, moins
+    la source est fiable. On ne depend jamais de l ordre physique des fichiers.
+    """
+    job_id = str(job.get("job_id") or "")
+    match = re.search(r"_(\d{8})_(\d{6})_", job_id)
+    if match:
+        try:
+            stamp = datetime.strptime(f"{match.group(1)}{match.group(2)}", "%Y%m%d%H%M%S").timestamp()
+            return (0, stamp)
+        except ValueError:
+            pass
+
+    for field in ("finished_at", "completed_at", "ended_at", "started_at", "timestamp", "created_at"):
+        parsed = _annotation_parse_time_value(str(job.get(field) or ""))
+        if parsed:
+            return (1, parsed)
+
+    try:
+        mtime = float(job.get("sort_mtime") or 0)
+    except (TypeError, ValueError):
+        mtime = 0.0
+    return (2, mtime)
+
+
+def _boolish_annotation_value(value: object) -> bool | None:
+    """Retourne True/False, ou None si la valeur est absente/indeterminable."""
+    if value is None or value == "":
+        return None
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "oui", "ok"}:
+        return True
+    if text in {"0", "false", "no", "non"}:
+        return False
+    return None
+
+
+def _annotation_classify_jobs(job_details: dict[str, dict]) -> list[dict]:
+    """Vue logique par ``job_id`` : un job_id = une seule entree.
+
+    ``job_details`` contient des cles d action (``initial``, ``run_standard``,
+    ``weak_rerun``...) et des cles de diagnostic (``<action>_<status>_<job_id>``)
+    ou un meme ``job_id`` peut apparaitre plusieurs fois et ou des jobs de
+    nature differente partagent une meme cle d action. On reconstruit ici une
+    liste plate, dedupliquee par ``job_id``.
+    """
+    merged: dict[str, dict] = {}
+    for detail in (job_details or {}).values():
+        if not isinstance(detail, dict):
+            continue
+        job_id = str(detail.get("job_id") or "").strip()
+        if not job_id:
+            continue
+        status = str(detail.get("status") or "").strip().lower()
+        rerun_weak = _boolish_annotation_value(
+            detail.get("rerun_weak", detail.get("_rerun_weak"))
+        )
+        if rerun_weak is None:
+            options = detail.get("options")
+            if isinstance(options, (list, tuple)):
+                rerun_weak = any(
+                    str(options[i]) == "--rerun-weak" and i + 1 < len(options)
+                    and str(options[i + 1]).strip().lower() not in {"0", "false", "no", "non"}
+                    for i in range(0, len(options), 2)
+                )
+        no_op = _boolish_annotation_value(detail.get("no_op"))
+        no_op_reason = str(detail.get("no_op_reason") or "").strip().upper()
+        dry_run = _boolish_annotation_value(detail.get("dry_run"))
+        entry = {
+            "job_id": job_id,
+            "status": status,
+            "profile": str(detail.get("profile") or ""),
+            "rerun_weak": bool(rerun_weak),
+            "no_op": bool(no_op),
+            "no_op_reason": no_op_reason,
+            "exit_code": str(detail.get("exit_code") or ""),
+            "started_at": str(detail.get("started_at") or ""),
+            "finished_at": str(detail.get("completed_at") or detail.get("finished_at") or ""),
+            "dry_run": bool(dry_run),
+            "output_verified": _boolish_annotation_value(detail.get("output_verified")),
+            "nas_publish_succeeded": _boolish_annotation_value(detail.get("nas_publish_succeeded")),
+            "publish_pending": _boolish_annotation_value(detail.get("publish_pending")),
+            "source_detail": detail,
+        }
+        entry["sort_timestamp"] = _annotation_job_recency_key(detail)[1]
+        entry["_recency"] = _annotation_job_recency_key(detail)
+
+        previous = merged.get(job_id)
+        if previous is None:
+            merged[job_id] = entry
+            continue
+        # Un meme job_id peut etre lu depuis plusieurs emplacements/etats :
+        # on garde l etat terminal le plus autoritaire (done/failed > running > queued).
+        previous_rank = JOB_STATE_RANK.get(previous.get("status", ""), 0)
+        current_rank = JOB_STATE_RANK.get(status, 0)
+        if (current_rank, entry["_recency"]) > (previous_rank, previous["_recency"]):
+            # on conserve les metadonnees deja connues si le nouvel etat en manque
+            for field in ("started_at", "finished_at", "exit_code", "profile"):
+                if not entry.get(field) and previous.get(field):
+                    entry[field] = previous[field]
+            merged[job_id] = entry
+        else:
+            for field in ("started_at", "finished_at", "exit_code", "profile"):
+                if not previous.get(field) and entry.get(field):
+                    previous[field] = entry[field]
+
+    jobs = list(merged.values())
+    jobs.sort(key=lambda item: item["_recency"])
+    return jobs
+
+
+def _annotation_job_sort_value(job: dict) -> tuple:
+    recency = job.get("_recency")
+    if isinstance(recency, tuple):
+        return recency
+    return (2, float(job.get("sort_timestamp") or 0.0))
+
+
+def resolve_annotation_batch_state(
+    id_affaire: str,
+    id_captation: str,
+    *,
+    job_details: dict[str, dict] | None = None,
+    stamp_detail: dict | None = None,
+    last_submission_job_id: str = "",
+) -> dict[str, object]:
+    """VUE UNIQUE de l etat des jobs ``annotation_photos_batch``.
+
+    Travaille par ``job_id`` et non par cle d action, afin d eviter plusieurs
+    verites contradictoires dans l UI (dernier job, initial, weak, echec,
+    disponibilite du rapport Word).
+
+    Retourne notamment :
+        ``jobs``                 vue dedupliquee triee par recence croissante
+        ``initial_success``      dernier traitement initial reussi
+        ``latest_weak``          derniere relance WEAK
+        ``latest_failure``       dernier echec (historique, non bloquant)
+        ``latest_job``           job le plus recent
+        ``latest_submission``    job suivi (session) s il est connu
+        ``word_report_ready``    booleen
+        ``word_report_block_reason``
+    """
+    details = job_details if isinstance(job_details, dict) else {}
+    jobs = _annotation_classify_jobs(details)
+
+    completed_ok = [j for j in jobs if j["status"] == "completed"]
+    weak_jobs = [j for j in jobs if j["rerun_weak"]]
+    failed_jobs = [j for j in jobs if j["status"] == "failed"]
+
+    def _is_initial_success(job: dict) -> bool:
+        if job["status"] != "completed" or job["rerun_weak"] or job["dry_run"]:
+            return False
+        if str(job["exit_code"]).strip() not in {"0", ""}:
+            return False
+        detail = job.get("source_detail") or {}
+        # Un no-op n est jamais un traitement initial.
+        if job["no_op"]:
+            return False
+        # Sortie validee : soit verifiee explicitement, soit confirmee par le stamp.
+        output_verified = job["output_verified"]
+        publish_succeeded = job["nas_publish_succeeded"]
+        if output_verified is False:
+            return False
+        if publish_succeeded is False and output_verified is not True:
+            return False
+        del detail
+        return True
+
+    initial_candidates = [j for j in completed_ok if _is_initial_success(j)]
+    if stamp_detail and isinstance(stamp_detail, dict) and str(stamp_detail.get("job_id") or ""):
+        stamp_job_id = str(stamp_detail.get("job_id") or "")
+        if not any(j["job_id"] == stamp_job_id for j in initial_candidates):
+            stamp_entry = {
+                "job_id": stamp_job_id,
+                "status": "completed",
+                "profile": str(stamp_detail.get("profile") or ""),
+                "rerun_weak": False,
+                "no_op": False,
+                "no_op_reason": "",
+                "exit_code": "0",
+                "started_at": "",
+                "finished_at": str(stamp_detail.get("completed_at") or ""),
+                "dry_run": False,
+                "output_verified": True,
+                "nas_publish_succeeded": True,
+                "publish_pending": False,
+                "source_detail": stamp_detail,
+            }
+            stamp_recency = _annotation_job_recency_key(
+                {"job_id": stamp_job_id, "completed_at": stamp_detail.get("completed_at")}
+            )
+            stamp_entry["sort_timestamp"] = stamp_recency[1]
+            # Le stamp reste prioritaire sur mtime, mais ne doit pas primer sur
+            # le stamp du job_id quand celui-ci est exploitable.
+            stamp_entry["_recency"] = stamp_recency
+            initial_candidates.append(stamp_entry)
+            jobs = jobs + [stamp_entry]
+            jobs.sort(key=_annotation_job_sort_value)
+
+    initial_candidates.sort(key=_annotation_job_sort_value)
+    weak_jobs.sort(key=_annotation_job_sort_value)
+    failed_jobs.sort(key=_annotation_job_sort_value)
+
+    initial_success = initial_candidates[-1] if initial_candidates else None
+    latest_weak = weak_jobs[-1] if weak_jobs else None
+    latest_failure = failed_jobs[-1] if failed_jobs else None
+    latest_job = jobs[-1] if jobs else None
+
+    # --- Etat de la derniere soumission suivie en session -----------------
+    followed_job_id = str(last_submission_job_id or "").strip()
+    latest_submission = None
+    if followed_job_id:
+        for job in jobs:
+            if job["job_id"] == followed_job_id:
+                latest_submission = job
+                break
+
+    # --- Disponibilite du rapport Word ------------------------------------
+    word_block_reason = ""
+    if not initial_success:
+        word_block_reason = "aucun traitement initial reussi pour cette affaire/captation"
+    elif latest_weak is not None:
+        weak_status = latest_weak["status"]
+        if weak_status == "completed":
+            word_block_reason = ""
+        elif weak_status == "failed":
+            # Un WEAK en echec plus recent que tout WEAK reussi est bloquant.
+            word_block_reason = f"dernière relance WEAK échouée ({latest_weak['job_id']})"
+        else:
+            word_block_reason = f"relance WEAK en cours ({latest_weak['job_id']}) : attendre la fin"
+
+    # Un echec HISTORIQUE (relance WEAK anterieure remplacee par un done plus
+    # recent) ne doit jamais bloquer : seul latest_weak est pris en compte.
+    if not word_block_reason and latest_failure is not None and initial_success is None:
+        word_block_reason = f"job batch échoué ({latest_failure['job_id']})"
+
+    def _public(job: dict | None) -> dict | None:
+        if job is None:
+            return None
+        return {k: v for k, v in job.items() if k not in {"_recency", "source_detail"}}
+
+    return {
+        "id_affaire": id_affaire,
+        "id_captation": id_captation,
+        "jobs": [_public(j) for j in jobs],
+        "initial_success": _public(initial_success),
+        "latest_weak": _public(latest_weak),
+        "latest_failure": _public(latest_failure),
+        "latest_job": _public(latest_job),
+        "latest_submission": _public(latest_submission),
+        "followed_job_id": followed_job_id,
+        "word_report_ready": not word_block_reason,
+        "word_report_block_reason": word_block_reason,
+        "weak_no_op": bool(
+            latest_weak
+            and latest_weak["status"] == "completed"
+            and latest_weak["no_op"]
+            and latest_weak["no_op_reason"] == WEAK_NO_OP_REASON
+        ),
+    }
 
 
 def _annotation_latest_completed_batch(details: dict[str, dict]) -> tuple[str, dict]:
@@ -16822,6 +17120,38 @@ elif page == "Annotation photos / Rapport Word":
         ann_latest_batch_key, ann_latest_batch = _annotation_latest_completed_batch(ann_job_details)
         report_preflight_started = time.perf_counter()
         ann_report_preflight = _annotation_report_preflight(ann_resource_audit, ann_job_details, ann_paths)
+        # Etat batch unifie (par job_id) : source unique pour la soumission,
+        # l'initial, la relance WEAK et la disponibilite du rapport Word.
+        ann_batch_state = resolve_annotation_batch_state(
+            ann_id_affaire,
+            ann_id_captation,
+            job_details=ann_job_details,
+            last_submission_job_id=str(
+                (st.session_state.get("ann_photos_last_batch_submission") or {}).get("job_id") or ""
+            ),
+        )
+        # Le stamp confirme le traitement initial valide : on l injecte
+        # explicitement, car _annotation_job_details ne le resout que si
+        # aucun batch completed n existe deja.
+        ann_stamp_detail, _ann_stamp_reasons = _annotation_verified_batch_from_stamp(
+            id_affaire=ann_id_affaire,
+            id_captation=ann_id_captation,
+            paths=ann_paths,
+            existing_details=ann_job_details,
+        )
+        ann_batch_state = resolve_annotation_batch_state(
+            ann_id_affaire,
+            ann_id_captation,
+            job_details=ann_job_details,
+            stamp_detail=ann_stamp_detail,
+            last_submission_job_id=str(
+                (st.session_state.get("ann_photos_last_batch_submission") or {}).get("job_id") or ""
+            ),
+        )
+        ann_initial_job_id = str((ann_batch_state.get("initial_success") or {}).get("job_id") or "")
+        ann_latest_weak_job_id = str((ann_batch_state.get("latest_weak") or {}).get("job_id") or "")
+        ann_latest_failure_job_id = str((ann_batch_state.get("latest_failure") or {}).get("job_id") or "")
+
         _ann_mark("construction état Word", report_preflight_started)
         ann_detailed_diag_requested = bool(st.session_state.get(ann_detailed_diag_key))
         ann_report_files: list[Path] = []
@@ -17211,6 +17541,11 @@ elif page == "Annotation photos / Rapport Word":
                 st.info(pending_message)
             if pending_batch_notice.get("job_path"):
                 st.caption(f"JSON déposé : {pending_batch_notice.get('job_path')}")
+            if (
+                pending_status in {"done", "completed"}
+                and str(pending_batch_notice.get("no_op_reason") or "").strip().upper() == WEAK_NO_OP_REASON
+            ):
+                st.caption("Aucune photo WEAK à retraiter")
         publish_pending_batch = ann_report_preflight.get("latest_batch", {}) if isinstance(ann_report_preflight, dict) else {}
         publish_retry_state = _annotation_batch_action_state(ann_job_details, PHOTO_BATCH_PUBLISH_RETRY_KEY)
         if publish_pending_batch.get("publish_pending") == "true":
@@ -17431,21 +17766,36 @@ elif page == "Annotation photos / Rapport Word":
         report_resource_rows = ann_resource_audit["rows"]
         st.dataframe(report_resource_rows, width="stretch")
         missing_report_resources = []
+        # Etats issus du resolveur central (par job_id), plus les statuts
+        # d action historiques conserves pour l affichage.
         initial_status = ann_job_statuses.get("initial", "absent")
         weak_analysis_status = ann_job_statuses.get("weak_dry_run", "absent")
         weak_rerun_status = ann_job_statuses.get("weak_rerun", "absent")
-        initial_job_id = ann_job_details.get("initial", {}).get("job_id", "")
         weak_analysis_job_id = ann_job_details.get("weak_dry_run", {}).get("job_id", "")
-        weak_rerun_job_id = ann_job_details.get("weak_rerun", {}).get("job_id", "")
+        publish_retry_status = ann_job_statuses.get(PHOTO_BATCH_PUBLISH_RETRY_KEY, "absent")
+        publish_retry_job_id = ann_job_details.get(PHOTO_BATCH_PUBLISH_RETRY_KEY, {}).get("job_id", "")
+
+        initial_job_id = ann_initial_job_id
+        weak_rerun_job_id = ann_latest_weak_job_id
+        initial_detail = ann_batch_state.get("initial_success") or {}
+        weak_detail = ann_batch_state.get("latest_weak") or {}
+        if initial_job_id:
+            initial_status = str(initial_detail.get("status") or "completed")
+        if weak_rerun_job_id:
+            weak_rerun_status = str(weak_detail.get("status") or "completed")
+
         st.caption(f"Traitement initial retenu : {initial_job_id or '(aucun)'} — {initial_status}")
         st.caption(f"Analyse weak retenue : {weak_analysis_job_id or '(aucun)'} — {weak_analysis_status}")
         st.caption(f"Reprise WEAK retenue : {weak_rerun_job_id or '(aucun)'} — {weak_rerun_status}")
-        publish_retry_status = ann_job_statuses.get(PHOTO_BATCH_PUBLISH_RETRY_KEY, "absent")
-        publish_retry_job_id = ann_job_details.get(PHOTO_BATCH_PUBLISH_RETRY_KEY, {}).get("job_id", "")
         st.caption(f"Reprise publication NAS retenue : {publish_retry_job_id or '(aucune)'} — {publish_retry_status}")
+        if ann_latest_failure_job_id:
+            st.caption(f"Échec historique (non bloquant) : {ann_latest_failure_job_id}")
         report_block_reasons: list[str] = []
-        if not ann_report_preflight.get("latest_batch") and initial_status in {"queued", "running", "failed", "absent"}:
-            report_block_reasons.append(f"traitement initial {initial_status} ({initial_job_id or 'sans job_id'})")
+        # Le blocage Word est decide par l etat metier consolide, jamais par
+        # la simple existence d un vieux job failed.
+        if not ann_report_preflight.get("latest_batch") and not ann_batch_state.get("word_report_ready"):
+            reason = str(ann_batch_state.get("word_report_block_reason") or "")
+            report_block_reasons.append(reason or f"traitement initial {initial_status} ({initial_job_id or 'sans job_id'})")
         if not report_ui_state.get("available") and weak_rerun_status in {"queued", "running"}:
             report_block_reasons.append(f"reprise WEAK {weak_rerun_status} ({weak_rerun_job_id or 'sans job_id'})")
         elif not report_ui_state.get("available") and report_mode == "valide" and weak_rerun_status == "failed":
