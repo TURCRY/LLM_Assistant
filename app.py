@@ -10078,8 +10078,14 @@ def _annotation_job_details(
                 continue
         return 0.0
 
-    def _matching_log_manifests(root: Path, job_id: str) -> list[Path]:
-        if detail_level != "detailed":
+    def _matching_log_manifests(root: Path, job_id: str, *, targeted: bool = False) -> list[Path]:
+        """Manifests terminaux d un job.
+
+        ``targeted=True`` autorise un lookup ponctuel, par job_id deja connu,
+        y compris en mode leger. Sinon logs/ n est consulte qu en mode
+        detailed, pour ne pas reintroduire un scan couteux a chaque rerun.
+        """
+        if not targeted and detail_level != "detailed":
             return []
         logs = root / "logs"
         log_probe_started = time.perf_counter()
@@ -10088,7 +10094,7 @@ def _annotation_job_details(
         if not ok:
             return []
         safe = _safe_job_token(job_id)
-        limit = 4 if detail_level != "detailed" else 10
+        limit = 2 if targeted else (4 if detail_level != "detailed" else 10)
         matches = _annotation_list_json_candidates(
             logs,
             name_terms=[safe, "manifest"],
@@ -10202,6 +10208,8 @@ def _annotation_job_details(
             "job_scan_ms": 0,
             "manifest_read_ms": 0,
             "json_files_seen": 0,
+            "targeted_manifest_lookups": 0,
+            "targeted_manifest_reads": 0,
             "total_ms": 0,
         },
     }
@@ -10281,6 +10289,44 @@ def _annotation_job_details(
                     continue
                 state = _normal_status(_value(job, "status"), folder)
                 exit_code = _value(result, "exit_code", "returncode", "return_code") or _value(job, "exit_code", "returncode", "return_code")
+                # Enrichissement cible : les JSON de queued/running/done/failed
+                # ne portent pas l etat terminal (status, exit_code, no_op...),
+                # qui n existe que dans logs/<...>_<job_id>.manifest.json. On ne
+                # parcourt donc logs/ QUE pour ce job_id deja connu, jamais en
+                # scan global, et uniquement si l etat reste indetermine.
+                _terminal_fields_missing = (
+                    not str(_value(job, "status")).strip()
+                    or not str(exit_code).strip()
+                    or (
+                        job.get("output_verified") in (None, "")
+                        and job.get("nas_publish_attempted") in (None, "")
+                        and job.get("no_op") in (None, "")
+                        and result.get("output_verified") in (None, "")
+                        and result.get("nas_publish_attempted") in (None, "")
+                        and result.get("no_op") in (None, "")
+                    )
+                )
+                if _terminal_fields_missing and folder != "logs":
+                    for _manifest_path in _matching_log_manifests(root, job_id or initial_job_id, targeted=True)[:1]:
+                        _t_started = time.monotonic()
+                        _manifest = load_json(str(_manifest_path), {})
+                        diagnostics["timings"]["manifest_read_ms"] += int((time.monotonic() - _t_started) * 1000)
+                        diagnostics["timings"]["targeted_manifest_lookups"] += 1
+                        if isinstance(_manifest, dict) and _manifest:
+                            diagnostics["timings"]["targeted_manifest_reads"] += 1
+                            _m_job = _manifest.get("job") if isinstance(_manifest.get("job"), dict) else {}
+                            _m_result = _manifest.get("result") if isinstance(_manifest.get("result"), dict) else {}
+                            # Fusion additive : on complete sans ecraser les
+                            # champs metier portes par le JSON de soumission.
+                            job = _nested(job, _m_job, _manifest)
+                            result = _nested(result, _m_result)
+                            raw = _nested(raw, _manifest)
+                            state = _normal_status(_value(job, "status"), folder)
+                            exit_code = (
+                                _value(result, "exit_code", "returncode", "return_code")
+                                or _value(job, "exit_code", "returncode", "return_code")
+                            )
+                        break
                 output_verified_raw = job.get("output_verified", result.get("output_verified"))
                 output_verified = _bool_value(output_verified_raw)
                 output_verified_local_raw = job.get("output_verified_local", result.get("output_verified_local"))
@@ -11200,8 +11246,14 @@ def _annotation_classify_jobs(job_details: dict[str, dict]) -> list[dict]:
             "finished_at": str(detail.get("completed_at") or detail.get("finished_at") or ""),
             "dry_run": bool(dry_run),
             "output_verified": _boolish_annotation_value(detail.get("output_verified")),
+            "output_verified_local": _boolish_annotation_value(detail.get("output_verified_local")),
+            "nas_publish_attempted": _boolish_annotation_value(detail.get("nas_publish_attempted")),
             "nas_publish_succeeded": _boolish_annotation_value(detail.get("nas_publish_succeeded")),
+            "nas_publish_error": str(detail.get("nas_publish_error") or "").strip(),
             "publish_pending": _boolish_annotation_value(detail.get("publish_pending")),
+            "photos_batch_nas_sha256": str(detail.get("photos_batch_nas_sha256") or "").strip(),
+            "photos_batch_sha256": str(detail.get("photos_batch_sha256") or "").strip(),
+            "photos_csv_sha256": str(detail.get("photos_csv_sha256") or "").strip(),
             "source_detail": detail,
         }
         entry["sort_timestamp"] = _annotation_job_recency_key(detail)[1]
@@ -11304,14 +11356,32 @@ def resolve_annotation_batch_state(
                 "finished_at": str(stamp_detail.get("completed_at") or ""),
                 "dry_run": False,
                 "output_verified": True,
+                "output_verified_local": True,
+                "nas_publish_attempted": True,
                 "nas_publish_succeeded": True,
+                "nas_publish_error": "",
                 "publish_pending": False,
+                "photos_batch_nas_sha256": str(stamp_detail.get("photos_batch_nas_sha256") or "").strip(),
+                "photos_batch_sha256": str(stamp_detail.get("photos_batch_sha256") or "").strip(),
+                "photos_csv_sha256": str(stamp_detail.get("photos_csv_sha256") or "").strip(),
                 "source_detail": stamp_detail,
             }
             stamp_recency = _annotation_job_recency_key(
                 {"job_id": stamp_job_id, "completed_at": stamp_detail.get("completed_at")}
             )
             stamp_entry["sort_timestamp"] = stamp_recency[1]
+            # La preview Word lit des champs textes ("true"/"false") : on les
+            # expose aussi sous forme canonique pour ne pas perdre la preuve de
+            # publication portee par le stamp.
+            for key, value in (
+                ("output_verified", "true"),
+                ("output_verified_local", "true"),
+                ("nas_publish_attempted", "true"),
+                ("nas_publish_succeeded", "true"),
+                ("publish_pending", "false"),
+                ("batch_manifest_kind", "modern"),
+            ):
+                stamp_entry.setdefault(key, value)
             # Le stamp reste prioritaire sur mtime, mais ne doit pas primer sur
             # le stamp du job_id quand celui-ci est exploitable.
             stamp_entry["_recency"] = stamp_recency
@@ -11328,6 +11398,46 @@ def resolve_annotation_batch_state(
     latest_failure = failed_jobs[-1] if failed_jobs else None
     latest_job = jobs[-1] if jobs else None
 
+    # --- Producteur effectif de photos_batch.csv -------------------------
+    # Un no-op WEAK (NO_WEAK_ROWS) ne reecrit rien et ne publie rien : il ne
+    # doit jamais devenir la reference de contenu du rapport Word. A l inverse,
+    # une relance WEAK reelle (selection > 0, sortie verifiee et publiee) peut
+    # legitinement devenir le nouveau producteur.
+    def _is_output_producer(job: dict) -> bool:
+        """Producteur valide de photos_batch.csv.
+
+        Les preuves doivent etre POSITIVES et explicites, exactement comme les
+        garde-fous de _photo_report_job_preview : un champ absent (None) n est
+        pas une preuve. Le cas legacy/stamp reste accepte uniquement parce que
+        _annotation_verified_batch_from_stamp reconstruit ces preuves apres
+        validation des hashes NAS/stamp.
+        """
+        if job["status"] != "completed":
+            return False
+        if job["no_op"]:
+            return False
+        if job["dry_run"]:
+            return False
+        if job["output_verified"] is not True:
+            return False
+        if job["output_verified_local"] is not True:
+            return False
+        if job["nas_publish_attempted"] is not True:
+            return False
+        if job["nas_publish_succeeded"] is not True:
+            return False
+        if job["publish_pending"] is True:
+            return False
+        return True
+
+    producer_candidates = [j for j in jobs if _is_output_producer(j)]
+    producer_candidates.sort(key=_annotation_job_sort_value)
+    output_producer = producer_candidates[-1] if producer_candidates else None
+    # Securite : un producteur n est retenu que si un traitement initial a
+    # effectivement eu lieu (un WEAK seul ne cree pas le CSV de reference).
+    if output_producer is not None and output_producer.get("rerun_weak") and initial_success is None:
+        output_producer = None
+
     # --- Etat de la derniere soumission suivie en session -----------------
     followed_job_id = str(last_submission_job_id or "").strip()
     latest_submission = None
@@ -11338,9 +11448,14 @@ def resolve_annotation_batch_state(
                 break
 
     # --- Disponibilite du rapport Word ------------------------------------
+    # Le rapport s appuie sur le PRODUCTEUR effectif de photos_batch.csv : un
+    # initial en echec de publication ne peut pas alimenter le .docx, meme si
+    # une relance WEAK no-op est ensuite passée en done.
     word_block_reason = ""
     if not initial_success:
         word_block_reason = "aucun traitement initial reussi pour cette affaire/captation"
+    elif output_producer is None:
+        word_block_reason = "aucun batch producteur valide de photos_batch.csv (publication NAS ou sortie non verifiee)"
     elif latest_weak is not None:
         weak_status = latest_weak["status"]
         if weak_status == "completed":
@@ -11370,6 +11485,8 @@ def resolve_annotation_batch_state(
         "latest_failure": _public(latest_failure),
         "latest_job": _public(latest_job),
         "latest_submission": _public(latest_submission),
+        "output_producer": _public(output_producer),
+        "report_batch": _public(output_producer),
         "followed_job_id": followed_job_id,
         "word_report_ready": not word_block_reason,
         "word_report_block_reason": word_block_reason,
@@ -11383,13 +11500,22 @@ def resolve_annotation_batch_state(
 
 
 def _annotation_latest_completed_batch(details: dict[str, dict]) -> tuple[str, dict]:
-    candidates = [
+    def _is_no_op(detail: dict) -> bool:
+        return str(detail.get("no_op") or "").strip().lower() in {"1", "true", "yes", "oui"}
+
+    all_completed = [
         (key, detail)
         for key, detail in details.items()
         if detail.get("status") == "completed" and detail.get("job_id")
     ]
-    if not candidates:
+    if not all_completed:
         return "", {}
+    # Un no-op WEAK (NO_WEAK_ROWS) confirme seulement qu il ne reste aucune
+    # WEAK a retraiter : il ne publie rien et ne peut donc pas servir de
+    # reference de contenu pour le rapport Word. On l ecarte au profit du
+    # dernier batch ayant reellement produit/valide photos_batch.csv.
+    real = [item for item in all_completed if not _is_no_op(item[1])]
+    candidates = real or all_completed
     return max(
         candidates,
         key=lambda item: (
@@ -11440,7 +11566,15 @@ def _annotation_report_preflight(
     audit: dict,
     job_details: dict[str, dict],
     paths: dict[str, Path],
+    producer_override: dict | None = None,
 ) -> dict:
+    """Pre-vol du rapport Word.
+
+    ``producer_override`` permet d imposer le batch producteur effectif de
+    photos_batch.csv (issu du resolveur central) au lieu du dernier job
+    completed, afin qu un no-op WEAK ne devienne jamais la reference de
+    contenu du rapport.
+    """
     resources = audit.get("resources", {})
     join_audit = audit.get("join_audit", {}) if isinstance(audit, dict) else {}
     photos = resources.get("photos.csv", {})
@@ -11450,6 +11584,31 @@ def _annotation_report_preflight(
     reasons: list[str] = []
     warnings: list[str] = []
     latest_key, latest_batch = _annotation_latest_completed_batch(job_details)
+    if isinstance(producer_override, dict) and producer_override.get("job_id"):
+        override_detail = job_details.get("initial") if isinstance(job_details, dict) else None
+        merged_producer = dict(producer_override)
+        # La preview Word compare des chaines ("true"/"false") : on normalise
+        # les booleens du resolveur pour ne pas perdre la preuve de publication.
+        for _key in ("output_verified", "output_verified_local", "nas_publish_attempted",
+                     "nas_publish_succeeded", "publish_pending"):
+            _value = merged_producer.get(_key)
+            if isinstance(_value, bool):
+                merged_producer[_key] = "true" if _value else "false"
+        # Le producteur conserve le detail complet du job d origine quand il
+        # est disponible (hashes, publication, kind...).
+        for candidate in (job_details or {}).values():
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("job_id") == producer_override.get("job_id"):
+                for field, value in candidate.items():
+                    if merged_producer.get(field) in (None, "", False) and value not in (None, ""):
+                        merged_producer[field] = value
+                break
+        if override_detail and str(override_detail.get("job_id") or "") == str(producer_override.get("job_id")):
+            for field, value in override_detail.items():
+                if merged_producer.get(field) in (None, "", False) and value not in (None, ""):
+                    merged_producer[field] = value
+        latest_batch = merged_producer
     latest_photos_hash_for_state = str(latest_batch.get("photos_csv_sha256") or "").strip()
     latest_batch_hash_for_state = str(latest_batch.get("photos_batch_nas_sha256") or latest_batch.get("photos_batch_sha256") or "").strip()
 
@@ -11487,10 +11646,17 @@ def _annotation_report_preflight(
     if join_audit:
         warnings.extend(str(warning) for warning in (join_audit.get("warnings") or []))
 
+    # Un no-op WEAK ne republie rien sur le NAS : les controles de publication
+    # ne doivent donc pas s y appliquer. Le profil peut etre weak_rerun OU un
+    # run_standard porte par l option --rerun-weak (cas des relances J48).
     latest_is_no_op_weak = (
-        latest_batch.get("action_key") == "weak_rerun"
-        and str(latest_batch.get("no_op") or "").strip().lower() == "true"
+        str(latest_batch.get("no_op") or "").strip().lower() == "true"
         and str(latest_batch.get("no_op_reason") or "").strip().upper() == "NO_WEAK_ROWS"
+        and (
+            latest_batch.get("action_key") == "weak_rerun"
+            or str(latest_batch.get("rerun_weak") or "").strip().lower() == "true"
+            or "--rerun-weak" in (latest_batch.get("options") or [])
+        )
     )
     latest_publish_pending = str(latest_batch.get("publish_pending") or "").strip().lower() == "true"
     latest_publish_retry_success = (
@@ -11511,6 +11677,27 @@ def _annotation_report_preflight(
             reasons.append(f"job batch échoué ({pending_job_id}) : relance possible")
     else:
         blocking_state, blocking_detail = _annotation_has_newer_blocking_batch(job_details, latest_batch)
+        # Un echec WEAK anterieur a une relance WEAK reussie plus recente est
+        # historique : il ne doit plus bloquer le rapport Word.
+        if blocking_state == "failed":
+            completed = [
+                detail for detail in (job_details or {}).values()
+                if isinstance(detail, dict)
+                and detail.get("status") == "completed"
+                and str(detail.get("rerun_weak") or "").strip().lower() in {"1", "true", "yes", "oui"}
+            ]
+            blocking_key = (
+                str(blocking_detail.get("sort_stamp") or ""),
+                float(blocking_detail.get("sort_mtime", "0") or 0),
+            )
+            for candidate in completed:
+                candidate_key = (
+                    str(candidate.get("sort_stamp") or ""),
+                    float(candidate.get("sort_mtime", "0") or 0),
+                )
+                if candidate_key > blocking_key:
+                    blocking_state, blocking_detail = "", {}
+                    break
         blocking_job_id = str(blocking_detail.get("job_id") or "sans job_id") if blocking_detail else "sans job_id"
         if blocking_state == "failed":
             reasons.append(f"job batch plus récent échoué ({blocking_job_id}) : relance possible")
@@ -17148,6 +17335,17 @@ elif page == "Annotation photos / Rapport Word":
                 (st.session_state.get("ann_photos_last_batch_submission") or {}).get("job_id") or ""
             ),
         )
+        # Le pre-vol est recalcule sur le producteur effectif de
+        # photos_batch.csv : sinon un no-op WEAK (qui ne publie rien) serait
+        # retenu comme reference et ferait echouer les garde-fous NAS.
+        ann_producer = ann_batch_state.get("output_producer") or ann_batch_state.get("initial_success") or {}
+        if ann_producer.get("job_id"):
+            ann_report_preflight = _annotation_report_preflight(
+                ann_resource_audit,
+                ann_job_details,
+                ann_paths,
+                producer_override=ann_producer,
+            )
         ann_initial_job_id = str((ann_batch_state.get("initial_success") or {}).get("job_id") or "")
         ann_latest_weak_job_id = str((ann_batch_state.get("latest_weak") or {}).get("job_id") or "")
         ann_latest_failure_job_id = str((ann_batch_state.get("latest_failure") or {}).get("job_id") or "")
