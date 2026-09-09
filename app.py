@@ -9578,6 +9578,409 @@ def submit_compte_rendu_job(
     result["patched_infos"] = patched_infos
     return result
 
+
+# ---------------------------------------------------------------------------
+# COMPTE RENDU REFERE PREVENTIF (second type de job, contrat spooler fige) :
+# l UI prepare uniquement le JSON du job et le depose atomiquement dans la
+# queue PC fixe. Aucun SSH/Docker/PowerShell/pipeline NAS depuis app.py.
+# ---------------------------------------------------------------------------
+
+
+def _compte_rendu_nas_context_path(id_affaire: str, id_captation: str) -> str:
+    return (
+        f"/volume1/Affaires/{id_affaire}/AF_Expert_ASR/"
+        f"transcriptions/{id_captation}/contexte_general_compte_rendu.json"
+    )
+
+
+def _compte_rendu_mirror_affaire_bases() -> list:
+    bases = []
+    seen = set()
+    for base in (NAS_AFFAIRES_ROOT, AFFAIRES_ROOT, PCFIXE_AFFAIRES_ROOT):
+        if not base:
+            continue
+        b = Path(str(base).rstrip("\\/"))
+        key = str(b).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        bases.append(b)
+    return bases
+
+
+def _compte_rendu_out_dir_candidates(id_affaire: str, id_captation: str) -> list:
+    rel = Path("BE_Traitement_captations") / id_captation / "compte_rendu_LLM" / "out"
+    return [base / id_affaire / rel for base in _compte_rendu_mirror_affaire_bases()]
+
+
+def _compte_rendu_trans_file_candidates(id_affaire: str, id_captation: str, filename: str) -> list:
+    rel = Path("AF_Expert_ASR") / "transcriptions" / id_captation / filename
+    return [base / id_affaire / rel for base in _compte_rendu_mirror_affaire_bases()]
+
+
+def _compte_rendu_any_path_to_volume1(path_value) -> str:
+    raw = str(path_value or "").strip().strip('"').replace("\\", "/").rstrip("/")
+    if raw == "/volume1/Affaires" or raw.startswith("/volume1/Affaires/"):
+        return raw
+    for base in _compte_rendu_mirror_affaire_bases():
+        nb = str(base).replace("\\", "/").rstrip("/")
+        if nb and raw.casefold().startswith(nb.casefold() + "/"):
+            rel = raw[len(nb) + 1:].lstrip("/")
+            return "/volume1/Affaires" + ("/" + rel if rel else "")
+    return raw
+
+
+def _compte_rendu_path_is_dir(path_value) -> bool:
+    try:
+        return Path(str(path_value or "")).is_dir()
+    except Exception:
+        return False
+
+
+def _compte_rendu_path_has_entries(directory) -> bool:
+    try:
+        p = Path(str(directory or ""))
+        if not p.is_dir():
+            return False
+        return next(p.iterdir(), None) is not None
+    except Exception:
+        return False
+
+
+def _compte_rendu_read_json_file(path_value) -> dict:
+    try:
+        p = Path(str(path_value or ""))
+        if not p.is_file():
+            return {}
+        data = json.loads(p.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _compte_rendu_any_file_exists(candidates) -> bool:
+    for candidate in candidates or []:
+        try:
+            p = Path(str(candidate or ""))
+            if p.is_file() and p.stat().st_size > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def inspect_compte_rendu_refere_source_run(run_dir_value, *, id_affaire: str, id_captation: str) -> dict:
+    """Profil d un run generaliste job_* candidat comme source du refere preventif."""
+    raw_run = str(run_dir_value or "").strip().strip('"').strip("'")
+    run_path = Path(raw_run) if raw_run else Path("")
+    run_name = _compte_rendu_existing_run_basename(raw_run)
+    reasons = []
+    if not run_name.startswith("job_"):
+        reasons.append("le run source doit commencer par job_")
+    segments_dir = run_path / "segments"
+    compacts_dir = run_path / "pass2E_sujets_compact"
+    segments_ok = _compte_rendu_path_is_dir(segments_dir) and _compte_rendu_path_has_entries(segments_dir)
+    compacts_ok = _compte_rendu_path_is_dir(compacts_dir) and _compte_rendu_path_has_entries(compacts_dir)
+    if not segments_ok:
+        reasons.append("segments/ absent ou vide dans le run")
+    if not compacts_ok:
+        reasons.append("pass2E_sujets_compact/ absent ou vide dans le run")
+    qa_path = run_path / "pipeline_qa_status.json"
+    qa_ok = None
+    if qa_path.is_file():
+        qa = _compte_rendu_read_json_file(qa_path)
+        if isinstance(qa, dict):
+            if qa.get("ok") is False:
+                qa_ok = False
+                reasons.append("pipeline_qa_status.json interdit ce run (ok=false)")
+            elif qa.get("ok") is True:
+                qa_ok = True
+    metadata_ok = None
+    logs_dir = run_path / "logs"
+    meta_file = None
+    if _compte_rendu_path_is_dir(logs_dir):
+        try:
+            meta_candidates = sorted(
+                logs_dir.glob("run_metadata_*.json"),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+                reverse=True,
+            )
+            meta_file = meta_candidates[0] if meta_candidates else None
+        except Exception:
+            meta_file = None
+    if meta_file is not None:
+        meta = _compte_rendu_read_json_file(meta_file)
+        meta_aff = str(meta.get("id_affaire") or "").strip()
+        meta_cap = str(meta.get("id_captation") or "").strip()
+        if (meta_aff and meta_aff != id_affaire) or (meta_cap and meta_cap != id_captation):
+            metadata_ok = False
+            reasons.append("run_metadata signale une autre affaire/captation")
+        else:
+            metadata_ok = True
+    valid = bool(
+        run_name.startswith("job_")
+        and segments_ok
+        and compacts_ok
+        and qa_ok is not False
+        and metadata_ok is not False
+    )
+    return {
+        "valid": valid,
+        "run_name": run_name,
+        "run_path": str(run_path),
+        "run_nas": _compte_rendu_any_path_to_volume1(run_path),
+        "segments_dir": str(segments_dir),
+        "segments_nas": _compte_rendu_any_path_to_volume1(segments_dir),
+        "pass2e_compacts_dir": str(compacts_dir),
+        "pass2e_compacts_nas": _compte_rendu_any_path_to_volume1(compacts_dir),
+        "segments_ok": segments_ok,
+        "compacts_ok": compacts_ok,
+        "qa_ok": qa_ok,
+        "metadata_ok": metadata_ok,
+        "reasons": reasons,
+    }
+
+
+def discover_compte_rendu_refere_source_runs(out_dir_value, *, id_affaire: str, id_captation: str) -> list:
+    """Runs job_* valides, tries par date decroissante (deterministe)."""
+    out_dir = Path(str(out_dir_value or ""))
+    if not _compte_rendu_path_is_dir(out_dir):
+        return []
+    run_dirs = [
+        p for p in discover_compte_rendu_run_dirs(out_dir)
+        if p.name.startswith("job_") and p.is_dir()
+    ]
+    profiles = [
+        inspect_compte_rendu_refere_source_run(p, id_affaire=id_affaire, id_captation=id_captation)
+        for p in run_dirs
+    ]
+    return [profile for profile in profiles if profile["valid"]]
+
+
+def resolve_compte_rendu_refere_source_run(id_affaire: str, id_captation: str) -> dict:
+    """Dernier run generaliste valide : NAS d abord, puis miroir laptop."""
+    roots_tried = []
+    profile = None
+    for out_dir in _compte_rendu_out_dir_candidates(id_affaire, id_captation):
+        reachable = _compte_rendu_path_is_dir(out_dir)
+        valid_profiles = (
+            discover_compte_rendu_refere_source_runs(out_dir, id_affaire=id_affaire, id_captation=id_captation)
+            if reachable
+            else []
+        )
+        roots_tried.append({
+            "out_dir": str(out_dir),
+            "reachable": reachable,
+            "valid_profiles": valid_profiles,
+        })
+        if valid_profiles:
+            profile = valid_profiles[0]
+            break
+    if profile is not None:
+        return {"ok": True, "profile": profile, "roots_tried": roots_tried}
+    return {"ok": False, "profile": None, "roots_tried": roots_tried}
+
+
+def preflight_compte_rendu_refere_preventif(id_affaire: str, id_captation: str) -> dict:
+    """Preflight : infos, contexte, run generaliste valide (NAS ou miroir equivalent)."""
+    missing = []
+    infos_candidates = _compte_rendu_trans_file_candidates(id_affaire, id_captation, "infos_projet.json")
+    context_candidates = _compte_rendu_trans_file_candidates(
+        id_affaire, id_captation, "contexte_general_compte_rendu.json"
+    )
+    if not _compte_rendu_any_file_exists(infos_candidates):
+        missing.append("infos_projet.json introuvable (NAS ou miroir laptop)")
+    if not _compte_rendu_any_file_exists(context_candidates):
+        missing.append("contexte_general_compte_rendu.json introuvable (NAS ou miroir laptop)")
+    resolved = resolve_compte_rendu_refere_source_run(id_affaire, id_captation)
+    if not resolved["ok"]:
+        missing.append("aucun run generaliste valide (segments/ + pass2E_sujets_compact/ requis)")
+    return {
+        "ok": not missing,
+        "missing": missing,
+        "infos_projet_candidates": [str(p) for p in infos_candidates],
+        "contexte_candidates": [str(p) for p in context_candidates],
+        "resolved": resolved,
+    }
+
+
+def build_compte_rendu_refere_preventif_job(
+    *,
+    id_affaire: str,
+    id_captation: str,
+    run_profile: dict,
+    model_pass2f: str = "pass2f_remote",
+    job_id: str = "",
+) -> dict:
+    """Construit le JSON exact du contrat valide par le spooler (9 cles)."""
+    id_affaire = (id_affaire or "").strip()
+    id_captation = (id_captation or "").strip()
+    if not id_affaire or not id_captation:
+        raise ValueError("id_affaire/id_captation obligatoires.")
+    if any(ch in id_affaire + id_captation for ch in '\\/:*?"<>|'):
+        raise ValueError("id_affaire/id_captation invalides.")
+    if not isinstance(run_profile, dict) or not run_profile.get("valid"):
+        raise ValueError("run generaliste source invalide pour le compte rendu refere preventif.")
+    model_pass2f = (model_pass2f or "").strip() or "pass2f_remote"
+    if model_pass2f != "pass2f_remote":
+        raise ValueError("model_pass2f doit etre pass2f_remote (contrat spooler fige).")
+    run_nas = str(run_profile.get("run_nas") or "").strip().rstrip("/")
+    segments_nas = str(run_profile.get("segments_nas") or "").strip().rstrip("/") or (run_nas + "/segments")
+    compacts_nas = str(run_profile.get("pass2e_compacts_nas") or "").strip().rstrip("/") or (run_nas + "/pass2E_sujets_compact")
+    job_id = (job_id or "").strip()
+    if not job_id:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        job_id = _safe_job_token(f"cr_refere_{id_affaire}_{id_captation}_{stamp}_{uuid.uuid4().hex[:8]}")
+    return {
+        "job_id": job_id,
+        "type": "compte_rendu_refere_preventif",
+        "id_affaire": id_affaire,
+        "id_captation": id_captation,
+        "infos_projet_path": _compte_rendu_nas_infos_path(id_affaire, id_captation),
+        "generalist_segments_dir": segments_nas,
+        "pass2e_compacts_dir": compacts_nas,
+        "contexte_general_compte_rendu_path": _compte_rendu_nas_context_path(id_affaire, id_captation),
+        "model_pass2f": model_pass2f,
+    }
+
+
+def submit_compte_rendu_refere_preventif_job(job: dict, *, dry_run: bool = False) -> dict:
+    """Depot atomique du job refere dans la queue PC fixe existante."""
+    if not isinstance(job, dict):
+        raise ValueError("job invalide.")
+    if str(job.get("type") or "") != "compte_rendu_refere_preventif":
+        raise ValueError("type attendu : compte_rendu_refere_preventif.")
+    job_id = str(job.get("job_id") or "").strip()
+    if not job_id:
+        raise ValueError("job_id obligatoire pour la soumission.")
+    queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
+    result = {
+        "job_id": job_id,
+        "job_path": str(queued_path),
+        "status": "dry-run" if dry_run else "queued",
+        "job": job,
+    }
+    if dry_run:
+        return result
+    preflight_pcfixe_target_dir(queued_path.parent)
+    tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
+    tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp_path, queued_path)
+    return result
+
+
+def find_compte_rendu_refere_preventif_job_status(job_id: str) -> dict:
+    """Suivi queued/running/done/failed d un job compte_rendu_refere_preventif."""
+    safe_job_id = _safe_job_token(job_id)
+    result = {
+        "job_id": job_id,
+        "status": "introuvable",
+        "job_path": "",
+        "job": {},
+        "type": "",
+        "jobs_root": "",
+        "submitted_at": "",
+        "started_at": "",
+        "finished_at": "",
+        "exit_code": "",
+        "error": "",
+        "error_code": "",
+        "error_message": "",
+    }
+    if not safe_job_id:
+        result["error"] = "job_id vide ou invalide"
+        return result
+    try:
+        jobs_root = get_pcfixe_jobs_root()
+    except Exception as exc:
+        result["error"] = f"racine _jobs inaccessible : {exc}"
+        return result
+    result["jobs_root"] = str(jobs_root)
+    for status in ("queued", "running", "done", "failed"):
+        status_dir = jobs_root / status
+        if not status_dir.is_dir():
+            continue
+        candidates = [status_dir / f"{safe_job_id}.json"]
+        try:
+            candidates.extend(sorted(
+                status_dir.glob(f"{safe_job_id}*.json"),
+                key=lambda p: p.stat().st_mtime if p.exists() else 0.0,
+                reverse=True,
+            ))
+        except Exception:
+            pass
+        job_path = next((p for p in candidates if p.is_file()), None)
+        if job_path is None:
+            continue
+        job_data = _audit_quality_read_json(job_path)
+        merged_job = dict(job_data) if isinstance(job_data, dict) else {}
+        nested_job = job_data.get("job") if isinstance(job_data.get("job"), dict) else {}
+        merged_job.update(nested_job)
+        if str(merged_job.get("type") or "") != "compte_rendu_refere_preventif":
+            continue
+        result.update({
+            "status": status,
+            "job_path": str(job_path),
+            "job": merged_job,
+            "type": str(merged_job.get("type") or "compte_rendu_refere_preventif"),
+            "job_id": str(merged_job.get("job_id") or job_data.get("job_id") or job_path.stem),
+        })
+        try:
+            result["submitted_at"] = datetime.fromtimestamp(job_path.stat().st_mtime).isoformat(timespec="seconds")
+        except Exception:
+            result["submitted_at"] = ""
+        for key in ("submitted_at", "created_at", "queued_at", "created"):
+            if merged_job.get(key):
+                result["submitted_at"] = str(merged_job[key])
+                break
+        if not result["submitted_at"]:
+            stamp_match = re.search(r"_(\d{8})_(\d{6})_", result["job_id"])
+            if stamp_match:
+                try:
+                    result["submitted_at"] = datetime.strptime(
+                        "".join(stamp_match.groups()), "%Y%m%d%H%M%S"
+                    ).isoformat(timespec="seconds")
+                except ValueError:
+                    pass
+        result["error_code"] = _audit_quality_manifest_value(
+            job_data, "error_code", "code", "status_code", "exit_code"
+        )
+        result["error_message"] = _audit_quality_manifest_value(
+            job_data, "error_message", "message", "error", "stderr"
+        )
+        break
+    logs_dir = jobs_root / "logs"
+    manifest_path = _audit_quality_find_log(logs_dir, safe_job_id, (".manifest.json", "manifest.json"))
+    stdout_path = _audit_quality_find_log(logs_dir, safe_job_id, (".stdout.log", "stdout.log"))
+    stderr_path = _audit_quality_find_log(logs_dir, safe_job_id, (".stderr.log", "stderr.log"))
+    result["manifest_path"] = str(manifest_path or "")
+    result["stdout_path"] = str(stdout_path or "")
+    result["stderr_path"] = str(stderr_path or "")
+    manifest = _audit_quality_read_json(manifest_path) if manifest_path else {}
+    if manifest:
+        result["started_at"] = _audit_quality_manifest_value(
+            manifest, "started_at", "start_time", "started", "debut"
+        )
+        result["finished_at"] = _audit_quality_manifest_value(
+            manifest, "finished_at", "ended_at", "end_time", "completed_at", "fin"
+        )
+        result["exit_code"] = _audit_quality_manifest_value(
+            manifest, "exit_code", "returncode", "return_code"
+        )
+        result["error"] = _audit_quality_manifest_value(
+            manifest, "error", "stderr", "message", "exception"
+        )
+        result["error_code"] = _audit_quality_manifest_value(
+            manifest, "error_code", "code", "status_code", "exit_code"
+        ) or result["error_code"]
+        result["error_message"] = _audit_quality_manifest_value(
+            manifest, "error_message", "message", "error", "stderr"
+        ) or result["error_message"]
+    if stderr_path and not result["error"]:
+        stderr_excerpt = _audit_quality_read_text(stderr_path, 2000).strip()
+        result["error"] = stderr_excerpt.splitlines()[-1] if stderr_excerpt else ""
+    return result
+
 PHOTO_BATCH_RESET_VALUES = ("none", "reset_vlm", "reset_llm", "reset_vlm_plus")
 PHOTO_BATCH_RERUN_WEAK_BACKENDS = ("same", "local", "remote")
 PHOTO_BATCH_PUBLIC_OPTIONS = {
@@ -17380,6 +17783,116 @@ elif page == "Voxtral (ASR / CR)":
                             st.success("Job compte_rendu déposé. Streamlit n’attend pas la fin du traitement.")
                     except Exception as e:
                         st.error(f"Soumission du job compte_rendu impossible : {e}")
+
+            # ------------------------------------------------------------------
+            # REFERE PREVENTIF : second type de job compte rendu (contrat fige).
+            # L UI determine les prerequis, construit le JSON, le soumet dans la
+            # queue PC fixe existante et suit queued/running/done/failed. Aucun
+            # SSH/Docker/pipeline NAS depuis l UI.
+            # ------------------------------------------------------------------
+            st.markdown("#### Compte rendu référé préventif")
+            st.caption(
+                "Le pipeline référé préventif est lancé par le spooler PC fixe à partir du dernier "
+                "run généraliste valide (segments/ + pass2E_sujets_compact/). "
+                "Le DOCX final est livré par le spooler dans compte_rendu_LLM/."
+            )
+            if cr_id_captation == "(aucune)":
+                st.info("Sélectionner une captation pour préparer le compte rendu référé préventif.")
+            refere_preflight = preflight_compte_rendu_refere_preventif(cr_affaire_id, cr_id_captation)
+            refere_profile = (
+                refere_preflight["resolved"]["profile"]
+                if isinstance(refere_preflight.get("resolved"), dict)
+                else None
+            )
+            if refere_preflight["missing"]:
+                st.warning("Préflight référé préventif incomplet : " + "; ".join(refere_preflight["missing"]))
+            refere_can_submit = bool(refere_preflight["ok"] and refere_profile is not None)
+            if refere_profile is not None:
+                st.success(
+                    "Run généraliste source retenu : "
+                    + str(refere_profile["run_name"])
+                    + " ("
+                    + str(refere_profile["run_nas"])
+                    + ")"
+                )
+            refere_dry_run = st.checkbox(
+                "Prévisualiser le JSON sans déposer le job référé",
+                value=True,
+                key="cr_refere_preventif_dry_run",
+            )
+            if not cr_spooler_available:
+                st.warning("Soumission référé préventif désactivée : accès SMB au spooler indisponible.")
+            if st.button(
+                "Lancer le compte rendu – Référé préventif",
+                key="cr_refere_preventif_submit",
+                disabled=(not cr_spooler_available) or (not refere_can_submit),
+                help="Dépose le job compte_rendu_refere_preventif dans la queue PC fixe après préflight.",
+            ):
+                try:
+                    if cr_id_captation == "(aucune)":
+                        raise ValueError("Sélectionner une captation.")
+                    fresh_preflight = preflight_compte_rendu_refere_preventif(cr_affaire_id, cr_id_captation)
+                    if not fresh_preflight["ok"]:
+                        raise ValueError(
+                            "Préflight référé préventif incomplet : " + "; ".join(fresh_preflight["missing"])
+                        )
+                    fresh_profile = fresh_preflight["resolved"]["profile"]
+                    refere_job = build_compte_rendu_refere_preventif_job(
+                        id_affaire=cr_affaire_id,
+                        id_captation=cr_id_captation,
+                        run_profile=fresh_profile,
+                        model_pass2f="pass2f_remote",
+                    )
+                    refere_result = submit_compte_rendu_refere_preventif_job(
+                        refere_job,
+                        dry_run=refere_dry_run,
+                    )
+                    st.session_state["voxtral_last_cr_refere_preventif_job"] = refere_result
+                    st.write("type :", refere_result["job"]["type"])
+                    st.write("job_id :", refere_result["job_id"])
+                    st.write("état :", refere_result["status"])
+                    st.markdown("JSON du job :")
+                    st.json(refere_result["job"])
+                    if not refere_dry_run:
+                        st.session_state["cr_refere_follow_job_id"] = refere_result["job_id"]
+                        st.success(
+                            "Job référé préventif déposé dans la queue PC fixe. "
+                            "Streamlit n’attend pas la fin du traitement ; le DOCX est livré par le spooler."
+                        )
+                except Exception as e:
+                    st.error(f"Soumission du job référé préventif impossible : {e}")
+            st.markdown("##### Suivi du job référé préventif")
+            if "cr_refere_follow_job_id" not in st.session_state:
+                st.session_state["cr_refere_follow_job_id"] = ""
+            refere_follow_job_id = st.text_input(
+                "job_id référé à suivre",
+                key="cr_refere_follow_job_id",
+            ).strip()
+            refere_status_key = f"cr_refere_status::{refere_follow_job_id}"
+            if st.button(
+                "Actualiser le statut",
+                key="cr_refere_refresh_status",
+                disabled=not bool(refere_follow_job_id),
+                help="Lecture ciblée du job_id dans queued/running/done/failed et des logs associés.",
+            ):
+                st.session_state[refere_status_key] = find_compte_rendu_refere_preventif_job_status(refere_follow_job_id)
+            refere_status = st.session_state.get(refere_status_key)
+            if refere_status:
+                st.write("type :", refere_status.get("type") or "compte_rendu_refere_preventif")
+                st.write("job_id :", refere_status.get("job_id", ""))
+                st.write("état :", refere_status.get("status", ""))
+                if refere_status.get("status") in {"queued", "running"}:
+                    st.info("Job référé préventif en attente ou en cours côté spooler.")
+                elif refere_status.get("status") == "failed":
+                    st.error("Job référé préventif en échec côté spooler.")
+                    if refere_status.get("error_code"):
+                        st.write("error_code :", refere_status["error_code"])
+                    if refere_status.get("error_message"):
+                        st.write("error_message :", refere_status["error_message"])
+                elif refere_status.get("status") == "done":
+                    st.success("Job référé préventif terminé : le DOCX a été livré par le spooler.")
+                else:
+                    st.warning("Job référé préventif introuvable dans queued/running/done/failed.")
 
             st.markdown("#### Audit qualité du compte-rendu")
             st.caption("L’UI prépare uniquement un job spooler ; l’audit sera exécuté côté serveur lorsque audit_reunion_quality.py sera disponible.")
