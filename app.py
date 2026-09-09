@@ -2753,10 +2753,16 @@ def load_sqlite_documentary_rows(aff_root_local: str, cfg: dict | None = None) -
     if not db_path.exists():
         return []
     try:
+        ensure_documents_sqlite_schema(aff_root_local, cfg)
         conn = sqlite3.connect(str(db_path))
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
-            "SELECT numero_expert, code_partie, chemin_nas, chemin_local, nom_original, nom_cible FROM Documents"
+            """
+            SELECT id_document, numero_expert, code_partie, chemin_nas, chemin_local, nom_original, nom_cible,
+                   sha256, transmission_id, COALESCE(statut_document, 'actif') AS statut_document,
+                   suppression_motif, suppression_ts
+            FROM Documents
+            """
         ).fetchall()
         conn.close()
     except Exception:
@@ -2764,6 +2770,7 @@ def load_sqlite_documentary_rows(aff_root_local: str, cfg: dict | None = None) -
     return [
         {
             "source_documentaire": "sqlite",
+            "id_document": row["id_document"],
             "expert_doc_id": row["numero_expert"],
             "numero_expert": row["numero_expert"],
             "code_partie": row["code_partie"],
@@ -2771,6 +2778,11 @@ def load_sqlite_documentary_rows(aff_root_local: str, cfg: dict | None = None) -
             "chemin_local": row["chemin_local"],
             "nom_original": row["nom_original"],
             "nom_cible": row["nom_cible"],
+            "sha256": row["sha256"],
+            "transmission_id": row["transmission_id"],
+            "statut_document": row["statut_document"],
+            "suppression_motif": row["suppression_motif"],
+            "suppression_ts": row["suppression_ts"],
         }
         for row in rows
     ]
@@ -3935,6 +3947,10 @@ def ensure_documents_sqlite_schema(aff_root_local: str, cfg: dict | None = None)
             "description_cohorte": "TEXT",
             "transmission_id": "TEXT",
             "created_at": "TEXT",
+            "statut_document": "TEXT",
+            "suppression_motif": "TEXT",
+            "suppression_ts": "TEXT",
+            "suppression_actor": "TEXT",
         }.items():
             if column not in existing:
                 conn.execute(f"ALTER TABLE Documents ADD COLUMN {column} {ddl_type}")
@@ -4756,6 +4772,17 @@ def document_registry_fingerprint(doc: dict) -> str:
         compact_spaces(str(doc.get("sous_piece") or "")).lower(),
     ])
 
+def document_registry_override_key(expert_doc_id: str, fingerprint: str) -> str:
+    expert_doc_id = compact_spaces(expert_doc_id or "")
+    fingerprint = compact_spaces(fingerprint or "")
+    return f"{expert_doc_id}||{fingerprint}" if expert_doc_id and fingerprint else expert_doc_id
+
+def documentary_maintenance_row_key(row: dict) -> str:
+    return document_registry_override_key(
+        row.get("expert_doc_id") or row.get("numero_expert") or "",
+        row.get("registry_fingerprint") or "",
+    )
+
 def attach_expert_doc_ids(docs: list[dict], aff_id: str = "") -> list[dict]:
     used_by_code: dict[str, set[int]] = {}
     pending_generated: list[dict] = []
@@ -4902,9 +4929,15 @@ def state1_inclusion_decision(
 def is_state1_communication(doc: dict, has_letter_or_dire_same_group: bool = False) -> bool:
     return state1_inclusion_decision(doc, has_letter_or_dire_same_group)[0]
 
-def flatten_transmission_documents(records: list[dict], aff_id: str = "", existing_ids_by_fingerprint: dict | None = None) -> list[dict]:
+def flatten_transmission_documents(
+    records: list[dict],
+    aff_id: str = "",
+    existing_ids_by_fingerprint: dict | None = None,
+    suppressed_fingerprints: set[str] | None = None,
+) -> list[dict]:
     docs = []
     existing_ids_by_fingerprint = existing_ids_by_fingerprint or {}
+    suppressed_fingerprints = suppressed_fingerprints or set()
     for record in records or []:
         if record.get("_parse_error"):
             continue
@@ -4998,14 +5031,19 @@ def flatten_transmission_documents(records: list[dict], aff_id: str = "", existi
                 "validation_status": item.get("_validation_status") or base.get("validation_status") or "",
                 "legacy_acceptance_reason": item.get("_legacy_acceptance_reason") or base.get("legacy_acceptance_reason") or "",
             })
+    filtered_docs = []
     for doc in docs:
-        existing_id = existing_ids_by_fingerprint.get(document_registry_fingerprint(doc))
+        fingerprint = document_registry_fingerprint(doc)
+        if fingerprint in suppressed_fingerprints:
+            continue
+        existing_id = existing_ids_by_fingerprint.get(fingerprint)
         if existing_id and not valid_expert_doc_id(doc.get("expert_doc_id") or ""):
             doc["expert_doc_id"] = existing_id
         sanitize_reference_label_fields(doc)
         doc["libelle_document"] = document_display_label(doc)
         doc["libelle_retenu"] = doc["libelle_document"]
-    return attach_expert_doc_ids(docs, aff_id)
+        filtered_docs.append(doc)
+    return attach_expert_doc_ids(filtered_docs, aff_id)
 
 def documents_registry_overrides_path(aff_root_local: str, cfg: dict | None = None) -> Path:
     log_dir = Path(configured_admin_path(aff_root_local, cfg, "logs"))
@@ -5029,8 +5067,12 @@ def load_documents_registry_overrides(aff_root_local: str, cfg: dict | None = No
                 continue
             for row in event.get("rows", []) or []:
                 expert_doc_id = compact_spaces(row.get("expert_doc_id") or "")
+                fingerprint = compact_spaces(row.get("registry_fingerprint") or "")
                 if expert_doc_id:
-                    overrides[expert_doc_id] = row
+                    if fingerprint:
+                        overrides[document_registry_override_key(expert_doc_id, fingerprint)] = row
+                    if not row.get("suppression_logique") or not fingerprint:
+                        overrides[expert_doc_id] = row
     return overrides
 
 def load_documents_registry_existing_ids(aff_root_local: str, cfg: dict | None = None) -> dict:
@@ -5045,11 +5087,32 @@ def load_documents_registry_existing_ids(aff_root_local: str, cfg: dict | None =
             except Exception:
                 continue
             for row in event.get("rows", []) or []:
+                if row.get("suppression_logique"):
+                    continue
                 expert_doc_id = compact_spaces(row.get("expert_doc_id") or "")
                 fingerprint = compact_spaces(row.get("registry_fingerprint") or "")
                 if valid_expert_doc_id(expert_doc_id) and fingerprint:
                     existing[fingerprint] = expert_doc_id
     return existing
+
+def load_documents_registry_suppressed_fingerprints(aff_root_local: str, cfg: dict | None = None) -> set[str]:
+    path = documents_registry_overrides_path(aff_root_local, cfg)
+    suppressed = set()
+    if not path.exists():
+        return suppressed
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            try:
+                event = json.loads(line.strip())
+            except Exception:
+                continue
+            for row in event.get("rows", []) or []:
+                fingerprint = compact_spaces(row.get("registry_fingerprint") or "")
+                if row.get("suppression_logique") and fingerprint:
+                    suppressed.add(fingerprint)
+                elif fingerprint and compact_spaces(row.get("statut_document") or "") in {"supprimé", "supprime", "doublon", "support_split"}:
+                    suppressed.add(fingerprint)
+    return suppressed
 
 def append_documents_registry_overrides(aff_root_local: str, cfg: dict | None, rows: list[dict]) -> str:
     path = documents_registry_overrides_path(aff_root_local, cfg)
@@ -5089,7 +5152,8 @@ def append_targeted_document_label_correction(
 def apply_document_registry_overrides(docs: list[dict], overrides: dict) -> list[dict]:
     for doc in docs or []:
         expert_doc_id = compact_spaces(doc.get("expert_doc_id") or "")
-        override = overrides.get(expert_doc_id) or {}
+        fingerprint = document_registry_fingerprint(doc)
+        override = overrides.get(document_registry_override_key(expert_doc_id, fingerprint)) or overrides.get(expert_doc_id) or {}
         for key in (
             "libelle_corrige", "date_transmission_corrigee", "deposant_corrige",
             "source_type", "code_source", "statut_document", "commentaire_gestion",
@@ -5109,7 +5173,8 @@ def apply_document_registry_overrides(docs: list[dict], overrides: dict) -> list
 def build_documents_registry(records: list[dict], aff_id: str, aff_root_local: str = "", cfg: dict | None = None) -> list[dict]:
     records, _validation_diag = definitive_records_with_diagnostic(records)
     existing_ids = load_documents_registry_existing_ids(aff_root_local, cfg) if aff_root_local else {}
-    docs = flatten_transmission_documents(records, aff_id, existing_ids)
+    suppressed_fingerprints = load_documents_registry_suppressed_fingerprints(aff_root_local, cfg) if aff_root_local else set()
+    docs = flatten_transmission_documents(records, aff_id, existing_ids, suppressed_fingerprints)
     overrides = load_documents_registry_overrides(aff_root_local, cfg) if aff_root_local else {}
     docs = apply_document_registry_overrides(docs, overrides)
     docs = [doc for doc in docs if str(doc.get("statut_document") or "actif") not in {"supprimé", "supprime", "doublon", "support_split"}]
@@ -5148,6 +5213,438 @@ def build_documents_registry(records: list[dict], aff_id: str, aff_root_local: s
             "legacy_acceptance_reason": doc.get("legacy_acceptance_reason") or "",
         })
     return rows
+
+def documentary_cohort_context(
+    aff_id: str,
+    party: dict | None,
+    date_transmission,
+    auteur_transmission: str,
+    files: list[str] | None = None,
+    cohort_id: str = "",
+) -> dict:
+    party = party or {}
+    date_value = date_transmission.isoformat() if hasattr(date_transmission, "isoformat") else str(date_transmission or "")
+    code = party_code(party.get("code_partie") or party.get("code") or "")
+    nom = compact_spaces(party.get("nom") or party.get("nom_affiche") or "")
+    folder_rel = compact_spaces(party.get("folder_rel") or "")
+    context = {
+        "affaire": compact_spaces(aff_id or ""),
+        "cohort_id": compact_spaces(cohort_id or ""),
+        "code_partie": code,
+        "nom_partie": nom,
+        "folder_rel": folder_rel,
+        "date_transmission": date_value,
+        "auteur_transmission": compact_spaces(auteur_transmission or ""),
+        "avocat": compact_spaces(auteur_transmission or ""),
+        "files": sorted({Path(str(name)).name for name in (files or []) if Path(str(name)).name}, key=str.lower),
+    }
+    context["context_id"] = documentary_cohort_context_id(context)
+    return context
+
+def documentary_cohort_context_id(context: dict, parent_document: str = "") -> str:
+    payload = {
+        "affaire": compact_spaces((context or {}).get("affaire") or ""),
+        "code_partie": party_code((context or {}).get("code_partie") or ""),
+        "date_transmission": compact_spaces((context or {}).get("date_transmission") or ""),
+        "auteur_transmission": compact_spaces((context or {}).get("auteur_transmission") or ""),
+        "parent_document": Path(str(parent_document or "")).name,
+        "files": sorted({Path(str(name)).name for name in ((context or {}).get("files") or []) if Path(str(name)).name}, key=str.lower),
+    }
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
+
+def cohort_dependent_session_keys(project_id: str) -> list[str]:
+    return [
+        "piece_title_suggestions",
+        "default_code_partie",
+        "default_date_tx",
+        "split_rows",
+        "ingestion_party",
+        "ingestion_date_transmission_expert",
+        "ingestion_auteur_transmission",
+        "ingestion_dire",
+        "ingestion_bcp",
+        "ingestion_pieces",
+        "ingestion_multi_pdf",
+        "ingestion_other_docs",
+        "ingestion_mapping_rows",
+        "ingestion_split_rows",
+        "ingestion_manual_split_rows",
+        "ingestion_manual_split_rows_current",
+        "ingestion_manual_pagination_text",
+        "ingestion_manual_pagination_parse",
+        "ingestion_manual_pagination_imported_count",
+        "ingestion_multi_pdf_ocr_csv",
+        "ingestion_detect_csv",
+        "ingestion_multi_pdf_server_path",
+        "ingestion_server_ocr_paths",
+        "ingestion_local_original_paths",
+        "last_ingestion_event",
+        "last_transmission_id",
+        f"split_rows_editor_{project_id}",
+        f"separated_pieces_rename_dry_run_{project_id}",
+        f"guided_split_immediate_result_{project_id}",
+        f"dire_bord_ocr_result_{project_id}",
+        f"dire_bord_ocr_signature_{project_id}",
+        f"dire_bord_ocr_preview_{project_id}",
+        f"deepseek_ocr_dry_run_docs_{project_id}",
+        f"deepseek_ocr_last_job_id_{project_id}",
+        f"deepseek_ocr_last_result_{project_id}",
+        f"deepseek_ocr_last_job_signature_{project_id}",
+        f"deepseek_ocr_last_submission_{project_id}",
+        f"deepseek_ocr_follow_job_id_{project_id}",
+        f"deepseek_ocr_preview_{project_id}",
+        f"ingestion_qualification_summary_{project_id}",
+    ]
+
+def reset_cohort_dependent_session_state(session_state, project_id: str) -> list[str]:
+    removed = []
+    for key in cohort_dependent_session_keys(project_id):
+        if key in session_state:
+            session_state.pop(key, None)
+            removed.append(key)
+    return removed
+
+def sync_documentary_cohort_session(session_state, project_id: str, context: dict) -> dict:
+    signature_key = f"pdf_current_cohort_signature_{project_id}"
+    previous = session_state.get(signature_key)
+    current = (context or {}).get("context_id") or documentary_cohort_context_id(context or {})
+    removed = []
+    if previous and previous != current:
+        removed = reset_cohort_dependent_session_state(session_state, project_id)
+    session_state[signature_key] = current
+    return {"previous": previous, "current": current, "changed": bool(previous and previous != current), "removed_keys": removed}
+
+def ingestion_context_from_values(aff_id: str, party: dict | None, date_transmission, auteur_transmission: str) -> dict:
+    ctx = documentary_cohort_context(aff_id, party or {}, date_transmission, auteur_transmission, files=[])
+    ctx.pop("files", None)
+    return ctx
+
+def validate_cohort_ingestion_context(cohort_context: dict, ingestion_context: dict) -> tuple[bool, list[dict]]:
+    fields = [
+        ("affaire", "affaire"),
+        ("code_partie", "code_partie"),
+        ("date_transmission", "date_transmission"),
+        ("auteur_transmission", "auteur_transmission"),
+    ]
+    divergences = []
+    for field, label in fields:
+        cohort_value = compact_spaces((cohort_context or {}).get(field) or "")
+        ingestion_value = compact_spaces((ingestion_context or {}).get(field) or "")
+        if field == "code_partie":
+            cohort_value = party_code(cohort_value)
+            ingestion_value = party_code(ingestion_value)
+        if cohort_value != ingestion_value:
+            divergences.append({
+                "champ": label,
+                "valeur_cohorte": cohort_value,
+                "valeur_ingestion": ingestion_value,
+            })
+    return not divergences, divergences
+
+def expected_split_child_filenames(rows: list[dict], title_lookup: dict[str, str] | None = None) -> set[str]:
+    expected = set()
+    for row in rows or []:
+        item = dict(row or {})
+        for key in ("filename", "fichier_sortie", "fichier_source", "nom_cible_propose"):
+            name = Path(str(item.get(key) or "")).name
+            if name:
+                expected.add(name.lower())
+        numero_piece = coerce_editor_int(item.get("numero_piece") or item.get("numero"))
+        if numero_piece is None:
+            continue
+        sous_piece = compact_spaces(item.get("sous_piece") or "")
+        piece_ref_style = item.get("piece_ref_style") or ""
+        libelle = compact_spaces(
+            item.get("libelle_final")
+            or item.get("editable_title")
+            or item.get("titre_propose")
+            or piece_title_lookup_get(title_lookup or {}, numero_piece, sous_piece, piece_ref_style)
+            or ""
+        )
+        if libelle:
+            expected.add(f"PIECE n°{piece_reference_piece(numero_piece, sous_piece, piece_ref_style)} {sanitize_filename(libelle)}.pdf".lower())
+    return {name for name in expected if name}
+
+def filter_split_child_paths_for_current_context(paths, source_rows: list[dict], title_lookup: dict[str, str] | None, parent_document: str = "") -> tuple[list[Path], dict]:
+    expected_names = expected_split_child_filenames(source_rows, title_lookup)
+    parent_name = Path(str(parent_document or "")).stem.lower()
+    selected = []
+    rejected = []
+    for raw_path in paths or []:
+        path = Path(raw_path)
+        name = path.name.lower()
+        if expected_names:
+            if name in expected_names:
+                selected.append(path)
+            else:
+                rejected.append({"fichier": path.name, "motif": "absent_du_plan_de_decoupe_courant"})
+            continue
+        if parent_name and parent_name in path.stem.lower():
+            selected.append(path)
+        else:
+            rejected.append({"fichier": path.name, "motif": "aucun_plan_de_decoupe_courant"})
+    return selected, {"expected_filenames": sorted(expected_names), "rejected": rejected}
+
+def build_document_maintenance_rows(records: list[dict], aff_id: str, aff_root_local: str = "", cfg: dict | None = None) -> list[dict]:
+    registry_rows = build_documents_registry(records, aff_id, aff_root_local, cfg)
+    sqlite_by_id: dict[str, list[dict]] = {}
+    if aff_root_local:
+        for sqlite_row in load_sqlite_documentary_rows(aff_root_local, cfg):
+            sqlite_key = compact_spaces(sqlite_row.get("expert_doc_id") or sqlite_row.get("numero_expert") or "")
+            if sqlite_key:
+                sqlite_by_id.setdefault(sqlite_key, []).append(sqlite_row)
+    states_by_id: dict[str, set[str]] = {}
+    try:
+        states = build_document_states(records, aff_id, aff_root_local, cfg)
+        for state_name, rows in {
+            "etat1": states.get("etat1_dires_messages_courriers") or [],
+            "etat2": states.get("etat2_detail_documents_fournis") or [],
+            "etat3": states.get("etat3_tableau_recapitulatif") or [],
+            "etat4": states.get("etat4_documents_recus") or [],
+        }.items():
+            for state_row in rows:
+                expert_doc_id = compact_spaces((state_row or {}).get("expert_doc_id") or "")
+                if expert_doc_id:
+                    states_by_id.setdefault(expert_doc_id, set()).add(state_name)
+    except Exception:
+        states_by_id = {}
+    transmission_ids = {}
+    for record in records or []:
+        for item in record_document_items(record):
+            expert_doc_id = compact_spaces(item.get("expert_doc_id") or item.get("numero_expert") or "")
+            if expert_doc_id:
+                transmission_ids.setdefault(expert_doc_id, set()).add(compact_spaces(record.get("transmission_id") or ""))
+    rows = []
+    for row in registry_rows:
+        expert_doc_id = compact_spaces(row.get("expert_doc_id") or "")
+        sqlite_candidates = sqlite_by_id.get(expert_doc_id, [])
+        sqlite_row = {}
+        if sqlite_candidates:
+            row_transmission_id = compact_spaces(row.get("transmission_id") or "")
+            row_destination = compact_spaces(row.get("destination") or "").lower()
+            exact = [
+                candidate for candidate in sqlite_candidates
+                if row_transmission_id and compact_spaces(candidate.get("transmission_id") or "") == row_transmission_id
+            ]
+            if not exact and row_destination:
+                exact = [
+                    candidate for candidate in sqlite_candidates
+                    if compact_spaces(candidate.get("chemin_local") or candidate.get("chemin_nas") or "").lower() == row_destination
+                ]
+            if len(exact) == 1:
+                sqlite_row = exact[0]
+            elif len(sqlite_candidates) == 1:
+                sqlite_row = sqlite_candidates[0]
+        sources = ["transmissions.jsonl", "documents_registry"]
+        if sqlite_row:
+            sources.append("SQLite Documents")
+        transmission_presence = bool(transmission_ids.get(expert_doc_id) or row.get("transmission_id"))
+        sqlite_presence = bool(sqlite_row)
+        states_presence = sorted(states_by_id.get(expert_doc_id, set()))
+        rows.append({
+            "expert_doc_id": expert_doc_id,
+            "code_partie": party_code(row.get("code_source") or row.get("code_partie") or sqlite_row.get("code_partie") or ""),
+            "deposant": row.get("deposant_corrige") or row.get("deposant") or sqlite_row.get("deposant") or "",
+            "date": row.get("date_retenue_etat") or row.get("date_transmission_expert") or sqlite_row.get("date_reception") or "",
+            "libelle": row.get("libelle_corrige") or row.get("libelle") or sqlite_row.get("description") or "",
+            "fichier": row.get("fichier_source") or sqlite_row.get("nom_original") or "",
+            "chemin": row.get("destination") or sqlite_row.get("chemin_local") or sqlite_row.get("chemin_nas") or "",
+            "transmissions": ", ".join(sorted(v for v in transmission_ids.get(expert_doc_id, set()) if v)),
+            "sources": ", ".join(sources),
+            "presence_sqlite": sqlite_presence,
+            "presence_transmissions_jsonl": transmission_presence,
+            "autres_sources": ", ".join(source for source in sources if source not in {"SQLite Documents", "transmissions.jsonl"}),
+            "etats_concernes": ", ".join(states_presence),
+            "registry_fingerprint": row.get("registry_fingerprint") or "",
+            "maintenance_key": documentary_maintenance_row_key(row),
+            "sqlite_id_document": sqlite_row.get("id_document") or "",
+            "statut_document": row.get("statut_document") or "actif",
+        })
+    return rows
+
+def documentary_maintenance_selection_signature(rows: list[dict]) -> str:
+    payload = [
+        {
+            "maintenance_key": documentary_maintenance_row_key(row),
+            "expert_doc_id": compact_spaces(row.get("expert_doc_id") or ""),
+            "code_partie": party_code(row.get("code_partie") or ""),
+            "transmissions": compact_spaces(row.get("transmissions") or ""),
+            "registry_fingerprint": compact_spaces(row.get("registry_fingerprint") or ""),
+        }
+        for row in sorted(rows or [], key=lambda item: expert_doc_id_sort_key(item.get("expert_doc_id") or ""))
+    ]
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+def documentary_deletion_confirmation_text(selected_expert_doc_ids: list[str]) -> str:
+    ids = sorted({compact_spaces(value) for value in selected_expert_doc_ids or [] if compact_spaces(value)}, key=expert_doc_id_sort_key)
+    return "SUPPRIMER " + ", ".join(ids) if ids else ""
+
+def documentary_deletion_preflight(
+    rows: list[dict],
+    selected_expert_doc_ids: list[str],
+    reason: str = "",
+    expected_signature: str = "",
+) -> dict:
+    selected = [compact_spaces(value) for value in (selected_expert_doc_ids or []) if compact_spaces(value)]
+    by_key = {documentary_maintenance_row_key(row): row for row in rows or [] if documentary_maintenance_row_key(row)}
+    by_id: dict[str, list[dict]] = {}
+    for row in rows or []:
+        expert_doc_id = compact_spaces(row.get("expert_doc_id") or "")
+        if expert_doc_id:
+            by_id.setdefault(expert_doc_id, []).append(row)
+    found = []
+    missing = []
+    ambiguous = []
+    for value in selected:
+        if value in by_key:
+            found.append(by_key[value])
+            continue
+        id_matches = by_id.get(value, [])
+        if len(id_matches) == 1:
+            found.append(id_matches[0])
+        elif len(id_matches) > 1:
+            ambiguous.append(value)
+        else:
+            missing.append(value)
+    current_signature = documentary_maintenance_selection_signature(found)
+    blockers = []
+    if not selected:
+        blockers.append("aucune_selection")
+    if missing:
+        blockers.append("selection_introuvable")
+    if ambiguous:
+        blockers.append("selection_ambigue")
+    if not compact_spaces(reason or ""):
+        blockers.append("motif_obligatoire")
+    if expected_signature and expected_signature != current_signature:
+        blockers.append("preflight_perime")
+    return {
+        "ok": not blockers,
+        "blockers": blockers,
+        "selected_count": len(set(selected)),
+        "found_count": len(found),
+        "missing_expert_doc_ids": sorted(set(missing), key=expert_doc_id_sort_key),
+        "ambiguous_expert_doc_ids": sorted(set(ambiguous), key=expert_doc_id_sort_key),
+        "selection_signature": current_signature,
+        "confirmation_text": documentary_deletion_confirmation_text([
+            compact_spaces(row.get("expert_doc_id") or "") for row in found
+        ]),
+        "rows": found,
+    }
+
+def append_documentary_deletion_overrides(aff_root_local: str, cfg: dict | None, rows: list[dict], reason: str) -> str:
+    override_rows = []
+    for row in rows or []:
+        expert_doc_id = compact_spaces(row.get("expert_doc_id") or "")
+        registry_fingerprint = compact_spaces(row.get("registry_fingerprint") or "")
+        if not valid_expert_doc_id(expert_doc_id) or not registry_fingerprint:
+            continue
+        override_rows.append({
+            "expert_doc_id": expert_doc_id,
+            "registry_fingerprint": registry_fingerprint,
+            "suppression_key": document_registry_override_key(expert_doc_id, registry_fingerprint),
+            "transmission_id": compact_spaces(row.get("transmissions") or row.get("transmission_id") or ""),
+            "statut_document": "supprimé",
+            "commentaire_gestion": compact_spaces(reason or ""),
+            "suppression_logique": True,
+        })
+    if not override_rows:
+        raise ValueError("Aucune entrée documentaire valide à supprimer avec une clé persistante non ambiguë.")
+    path = documents_registry_overrides_path(aff_root_local, cfg)
+    event = {
+        "ts": datetime.now().isoformat(timespec="seconds"),
+        "action": "documentary_entries_logical_delete",
+        "aff_id": get_project_id(cfg or {}, ""),
+        "motif": compact_spaces(reason or ""),
+        "utilisateur_machine": user_machine_label(),
+        "rows": override_rows,
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
+    return str(path)
+
+def mark_documentary_sqlite_entries_deleted(aff_root_local: str, cfg: dict | None, rows: list[dict], reason: str) -> dict:
+    targets = [
+        {
+            "expert_doc_id": compact_spaces(row.get("expert_doc_id") or ""),
+            "id_document": compact_spaces(row.get("sqlite_id_document") or row.get("id_document") or ""),
+        }
+        for row in rows or []
+        if valid_expert_doc_id(row.get("expert_doc_id") or "")
+    ]
+    db_path = ensure_documents_sqlite_schema(aff_root_local, cfg)
+    deleted = []
+    skipped_without_pk = []
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("BEGIN")
+        ts = datetime.now().isoformat(timespec="seconds")
+        actor = user_machine_label()
+        for target in targets:
+            expert_doc_id = target["expert_doc_id"]
+            id_document = target["id_document"]
+            if not id_document:
+                skipped_without_pk.append(expert_doc_id)
+                continue
+            cur = conn.execute(
+                """
+                UPDATE Documents
+                SET statut_document = 'supprimé',
+                    suppression_motif = ?,
+                    suppression_ts = ?,
+                    suppression_actor = ?
+                WHERE id_document = ?
+                """,
+                (compact_spaces(reason or ""), ts, actor, id_document),
+            )
+            if cur.rowcount:
+                deleted.append(expert_doc_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return {
+        "sqlite_path": str(db_path),
+        "marked_deleted_expert_doc_ids": deleted,
+        "skipped_without_sqlite_primary_key": skipped_without_pk,
+    }
+
+def apply_documentary_logical_deletion(
+    aff_root_local: str,
+    cfg: dict | None,
+    rows: list[dict],
+    reason: str,
+    rebuild_states: bool = True,
+) -> dict:
+    expert_doc_ids = [compact_spaces(row.get("expert_doc_id") or "") for row in rows or [] if valid_expert_doc_id(row.get("expert_doc_id") or "")]
+    if not expert_doc_ids:
+        raise ValueError("Aucune entrée documentaire valide à supprimer.")
+    override_log = append_documentary_deletion_overrides(aff_root_local, cfg, rows, reason)
+    sqlite_result = mark_documentary_sqlite_entries_deleted(aff_root_local, cfg, rows, reason)
+    export_results = []
+    if rebuild_states:
+        for state_no in (1, 2, 3, 4):
+            export_results.append(generate_document_state_exports(aff_root_local, cfg or {}, state_no))
+    refreshed_rows = build_document_maintenance_rows(
+        load_transmission_records(aff_root_local, cfg),
+        get_project_id(cfg or {}, ""),
+        aff_root_local,
+        cfg,
+    )
+    remaining_ids = {
+        compact_spaces(row.get("expert_doc_id") or "")
+        for row in refreshed_rows
+    }
+    return {
+        "deleted_expert_doc_ids": expert_doc_ids,
+        "override_log": override_log,
+        "sqlite": sqlite_result,
+        "exports": export_results,
+        "remaining_selected_ids": sorted(set(expert_doc_ids) & remaining_ids, key=expert_doc_id_sort_key),
+    }
+
 
 def is_real_non_piece_document(doc: dict) -> bool:
     if doc.get("numero_piece"):
@@ -5482,7 +5979,8 @@ def diagnostic_pieces_103_112_gerber(docs: list[dict]) -> list[dict]:
 def build_document_states(records: list[dict], aff_id: str = "", aff_root_local: str = "", cfg: dict | None = None) -> dict:
     records, validation_diag = definitive_records_with_diagnostic(records)
     existing_ids = load_documents_registry_existing_ids(aff_root_local, cfg) if aff_root_local else {}
-    docs_raw = flatten_transmission_documents(records, aff_id, existing_ids)
+    suppressed_fingerprints = load_documents_registry_suppressed_fingerprints(aff_root_local, cfg) if aff_root_local else set()
+    docs_raw = flatten_transmission_documents(records, aff_id, existing_ids, suppressed_fingerprints)
     if aff_root_local:
         docs_raw = apply_document_registry_overrides(docs_raw, load_documents_registry_overrides(aff_root_local, cfg))
     docs_raw = [doc for doc in docs_raw if str(doc.get("statut_document") or "actif") not in {"supprimé", "supprime", "doublon", "support_split"}]
@@ -18212,7 +18710,7 @@ elif page == "Administration":
     st.subheader("🔧 Administration")
     _render_pcfixe_admin_section()
 
-    st.markdown("### Correction ciblée d’un libellé documentaire")
+    st.markdown("### 🧹 Maintenance documentaire")
     st.text_input(
         "Affaire",
         value=get_project_id(project_config, ""),
@@ -18221,6 +18719,119 @@ elif page == "Administration":
     )
     try:
         admin_records = load_transmission_records(aff_root_local, project_config)
+        maintenance_rows_all = build_document_maintenance_rows(
+            admin_records,
+            get_project_id(project_config, ""),
+            aff_root_local,
+            project_config,
+        )
+        st.markdown("#### Préflight suppression d'entrées documentaires")
+        maint_cols = st.columns(5)
+        with maint_cols[0]:
+            maint_code = st.text_input("Filtre code_partie", value="", key="admin_doc_maint_filter_code")
+        with maint_cols[1]:
+            maint_deposant = st.text_input("Filtre déposant", value="", key="admin_doc_maint_filter_deposant")
+        with maint_cols[2]:
+            maint_date = st.text_input("Filtre date", value="", key="admin_doc_maint_filter_date")
+        with maint_cols[3]:
+            maint_expert = st.text_input("Filtre expert_doc_id", value="", key="admin_doc_maint_filter_expert")
+        with maint_cols[4]:
+            maint_label = st.text_input("Filtre libellé/fichier", value="", key="admin_doc_maint_filter_label")
+        maintenance_rows = []
+        for row in maintenance_rows_all:
+            hay_label = f"{row.get('libelle') or ''} {row.get('fichier') or ''}".lower()
+            if maint_code and maint_code not in str(row.get("code_partie") or ""):
+                continue
+            if maint_deposant and maint_deposant.lower() not in str(row.get("deposant") or "").lower():
+                continue
+            if maint_date and maint_date not in str(row.get("date") or ""):
+                continue
+            if maint_expert and maint_expert.lower() not in str(row.get("expert_doc_id") or "").lower():
+                continue
+            if maint_label and maint_label.lower() not in hay_label:
+                continue
+            maintenance_rows.append(row)
+        st.dataframe(
+            prepare_df_for_streamlit_display(maintenance_rows),
+            width="stretch",
+            column_order=[
+                "maintenance_key", "expert_doc_id", "code_partie", "deposant", "date", "libelle",
+                "fichier", "chemin", "presence_sqlite", "presence_transmissions_jsonl",
+                "autres_sources", "etats_concernes",
+            ],
+        )
+        selectable_rows = [
+            row for row in maintenance_rows
+            if valid_expert_doc_id(row.get("expert_doc_id") or "") and documentary_maintenance_row_key(row)
+        ]
+        selectable_keys = [documentary_maintenance_row_key(row) for row in selectable_rows]
+        labels_by_key = {
+            documentary_maintenance_row_key(row): " | ".join(
+                compact_spaces(part) for part in [
+                    row.get("expert_doc_id") or "",
+                    row.get("transmissions") or "",
+                    row.get("fichier") or "",
+                    row.get("libelle") or "",
+                ] if compact_spaces(part)
+            )
+            for row in selectable_rows
+        }
+        selected_delete_keys = st.multiselect(
+            "Entrées documentaires à supprimer",
+            selectable_keys,
+            format_func=lambda key: labels_by_key.get(key, key),
+            key="admin_doc_maint_delete_ids",
+        )
+        deletion_reason = st.text_area(
+            "Motif obligatoire",
+            value="",
+            key="admin_doc_maint_delete_reason",
+        )
+        deletion_preflight = documentary_deletion_preflight(maintenance_rows, selected_delete_keys, deletion_reason)
+        with st.expander("Résultat du préflight", expanded=bool(selected_delete_keys)):
+            st.json(deletion_preflight)
+        expected_confirmation = deletion_preflight.get("confirmation_text") or ""
+        st.text_input(
+            "Confirmation exacte",
+            value="",
+            placeholder=expected_confirmation,
+            key="admin_doc_maint_confirmation_text",
+            help="Recopier exactement le texte de confirmation affiché par le préflight.",
+        )
+        if expected_confirmation:
+            st.caption(f"Texte attendu : {expected_confirmation}")
+        confirm_matches = compact_spaces(st.session_state.get("admin_doc_maint_confirmation_text") or "") == expected_confirmation
+        if st.button(
+            "Supprimer logiquement les entrées documentaires sélectionnées",
+            key="admin_doc_maint_delete_selected",
+            type="primary",
+        ):
+            second_preflight = documentary_deletion_preflight(
+                maintenance_rows,
+                selected_delete_keys,
+                deletion_reason,
+                expected_signature=deletion_preflight.get("selection_signature") or "",
+            )
+            if not second_preflight.get("ok"):
+                st.error("Suppression bloquée par le second préflight.")
+                st.json(second_preflight)
+            elif not confirm_matches:
+                st.error("Confirmation invalide : recopier exactement le texte attendu.")
+            else:
+                result = apply_documentary_logical_deletion(
+                    aff_root_local,
+                    project_config,
+                    second_preflight.get("rows") or [],
+                    deletion_reason,
+                    rebuild_states=True,
+                )
+                if result.get("remaining_selected_ids"):
+                    st.error("Suppression logique appliquée mais des entrées sélectionnées restent visibles.")
+                    st.json(result)
+                else:
+                    st.success("Suppression logique appliquée et États 1–4 régénérés.")
+                    st.json(result)
+        st.markdown("#### Correction ciblée d’un libellé documentaire")
         admin_registry_rows = build_documents_registry(
             admin_records,
             get_project_id(project_config, ""),
@@ -18343,13 +18954,20 @@ elif page == "Pré-traitement dépôt PDF":
         key=f"pdf_cohort_uploads_{project_id}",
     )
     cohort_file_names = [Path(f.name).name for f in cohort_uploads] if cohort_uploads else []
+    selected_cohort_context = documentary_cohort_context(
+        project_id,
+        selected_cohort_party,
+        cohort_date,
+        cohort_attorney,
+        cohort_file_names,
+    )
+    cohort_sync = sync_documentary_cohort_session(st.session_state, project_id, selected_cohort_context)
+    if cohort_sync.get("changed"):
+        st.info("Contexte de cohorte modifié : les états dérivés de l'ancienne transmission ont été réinitialisés.")
     if cohort_file_names:
         st.session_state[f"pdf_current_cohort_{project_id}"] = {
-            "cohort_id": f"{project_id}_selection",
-            "date_transmission": cohort_date.isoformat(),
-            "code_partie": party_code(selected_cohort_party.get("code_partie")),
-            "nom_partie": safe_text(selected_cohort_party.get("nom") or selected_cohort_party.get("nom_affiche")),
-            "avocat": cohort_attorney,
+            **selected_cohort_context,
+            "cohort_id": selected_cohort_context.get("context_id"),
             "files": cohort_file_names,
             "uploads": {Path(f.name).name: f for f in cohort_uploads},
         }
@@ -18383,6 +19001,7 @@ elif page == "Pré-traitement dépôt PDF":
             "cohort_id": cohort_id,
             "created_at": datetime.now().isoformat(timespec="seconds"),
             "files": saved_names,
+            "context_id": documentary_cohort_context_id({**current_pdf_cohort, "files": saved_names}),
         }
         st.session_state[f"pdf_current_cohort_{project_id}"] = current_pdf_cohort
         cohort_log_path = append_depot_cohorte_record(aff_root_local, project_config, {
@@ -20845,13 +21464,22 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 if party_code(party.get("code_partie")) == current_pdf_cohort.get("code_partie"):
                     default_party_index = i
                     break
-        selected_party = st.selectbox(
-            "Partie cible",
-            party_options,
-            format_func=source_code_label,
-            index=default_party_index,
-            key=f"classement_originaux_partie_cible_{project_id}",
+        selected_party = party_options[default_party_index]
+        if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("code_partie"):
+            st.text_input(
+                "Partie cible",
+                value=source_code_label(selected_party),
+                disabled=True,
+                key=f"classement_originaux_partie_cible_display_{project_id}",
             )
+        else:
+            selected_party = st.selectbox(
+                "Partie cible",
+                party_options,
+                format_func=source_code_label,
+                index=default_party_index,
+                key=f"classement_originaux_partie_cible_{project_id}",
+                )
     
     with st.expander("Ingestion des pièces d'une partie", expanded=False):
         st.text_input("Affaire", value=get_project_id(project_config, ""), disabled=True, key=f"ingestion_affaire_display_{project_id}")
@@ -20869,22 +21497,38 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                     if party_code(party.get("code_partie")) == current_pdf_cohort.get("code_partie"):
                         default_ingestion_party_index = i
                         break
-            ingestion_party = st.selectbox(
-                "Partie",
-                party_options,
-                format_func=source_code_label,
-                index=default_ingestion_party_index,
-                key="ingestion_party",
-            )
+            ingestion_party = party_options[default_ingestion_party_index]
+            if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("code_partie"):
+                st.text_input(
+                    "Partie",
+                    value=source_code_label(ingestion_party),
+                    disabled=True,
+                    key=f"ingestion_party_display_{project_id}",
+                )
+            else:
+                ingestion_party = st.selectbox(
+                    "Partie",
+                    party_options,
+                    format_func=source_code_label,
+                    index=default_ingestion_party_index,
+                    key="ingestion_party",
+                )
         else:
             st.warning("Aucune partie avec dossier cible n'est disponible.")
     
         col_tx_1, col_tx_2 = st.columns(2)
         with col_tx_1:
+            cohort_forced = page == "Pré-traitement dépôt PDF" and bool(current_pdf_cohort.get("date_transmission"))
+            cohort_date_value = (
+                date.fromisoformat(current_pdf_cohort.get("date_transmission"))
+                if cohort_forced
+                else date.today()
+            )
             date_transmission_expert = st.date_input(
                 "Date de transmission à l'expert",
-                value=date.fromisoformat(current_pdf_cohort.get("date_transmission")) if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("date_transmission") else date.today(),
-                key="ingestion_date_transmission_expert",
+                value=cohort_date_value,
+                key=f"ingestion_date_transmission_expert_{project_id}" if cohort_forced else "ingestion_date_transmission_expert",
+                disabled=cohort_forced,
             )
             type_transmission = st.selectbox(
                 "Type de transmission",
@@ -20892,7 +21536,13 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 key="ingestion_type_transmission",
             )
         with col_tx_2:
-            auteur_transmission = st.text_input("Auteur / conseil", value=current_pdf_cohort.get("avocat", "") if page == "Pré-traitement dépôt PDF" else "", key="ingestion_auteur_transmission")
+            cohort_author_forced = page == "Pré-traitement dépôt PDF" and bool(current_pdf_cohort.get("auteur_transmission") or current_pdf_cohort.get("avocat"))
+            auteur_transmission = st.text_input(
+                "Auteur / conseil",
+                value=(current_pdf_cohort.get("auteur_transmission") or current_pdf_cohort.get("avocat") or "") if cohort_author_forced else "",
+                key=f"ingestion_auteur_transmission_{project_id}" if cohort_author_forced else "ingestion_auteur_transmission",
+                disabled=cohort_author_forced,
+            )
             reference_transmission = st.text_input("Référence", value="", key="ingestion_reference_transmission")
         commentaire_transmission = st.text_area("Commentaire", value="", key="ingestion_commentaire_transmission")
     
@@ -21055,11 +21705,24 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 / "AD_Expert_Traitements"
                 / "_Splits"
             )
+            parent_pdf_name = multi_pdf_name if multi_pdf_name != "(aucun)" else ""
             source_rows = (
                 st.session_state.get("ingestion_manual_split_rows_current")
                 or st.session_state.get("ingestion_manual_split_rows")
                 or current_split_table_rows()
             )
+            if not parent_pdf_name:
+                return {
+                    "dossier_splits_scanné": split_dir_unc,
+                    "nombre_fichiers_trouvés": 0,
+                    "fichiers_enfants_retenus": [],
+                    "parent_pdf_associé": "",
+                    "statut_identification": "AUCUN_PARENT_MULTI_PDF",
+                    "code_partie_contexte": _normalized_documentary_code((ingestion_party or {}).get("code_partie")),
+                    "context_id": documentary_cohort_context_id(current_pdf_cohort or {}, ""),
+                    "cle_actuelle": "cohorte + parent + plan de découpe courant",
+                    "rows": [],
+                }
             expected_numbers = {
                 numero
                 for numero in (
@@ -21078,8 +21741,16 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             selected_by_number = {}
             ambiguous_by_number = {}
             split_context_code = _normalized_documentary_code((ingestion_party or {}).get("code_partie"))
+            split_context_id = documentary_cohort_context_id(current_pdf_cohort or {}, parent_pdf_name)
+            filter_diag = {}
             try:
                 found_files = [path for path in Path(split_dir_unc).glob("*.pdf") if path.is_file()]
+                found_files, filter_diag = filter_split_child_paths_for_current_context(
+                    found_files,
+                    source_rows,
+                    title_lookup,
+                    parent_pdf_name,
+                )
                 candidates_by_number = {}
                 for path in found_files:
                     piece_ref = detect_piece_ref_details_from_filename(path.name)
@@ -21131,11 +21802,13 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 "dossier_splits_scanné": split_dir_unc,
                 "nombre_fichiers_trouvés": len(found_files),
                 "fichiers_enfants_retenus": [row["fichier_source"] for row in rows],
-                "parent_pdf_associé": multi_pdf_name if multi_pdf_name != "(aucun)" else "",
+                "parent_pdf_associé": parent_pdf_name,
                 "statut_identification": "AMBIGUÏTÉ" if ambiguous_by_number else "DOCUMENTAIRE OK",
                 "code_partie_contexte": split_context_code,
-                "cle_actuelle": "numero_piece + sous_piece",
-                "cle_recommandee": "code_partie + expert_doc_id ou code_partie + numero_piece + sous_piece",
+                "context_id": split_context_id,
+                "cle_actuelle": "cohorte + parent + plan de découpe courant",
+                "cle_recommandee": "cohorte + parent + nom d'enfant attendu",
+                "filtre_contexte": filter_diag,
                 "ambiguities": [
                     {
                         "numero_piece": key[0],
@@ -21497,6 +22170,16 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             }
     
         if st.button("Valider le dépôt documentaire et copier les originaux", key="ingestion_copy_originals"):
+            ingestion_context = ingestion_context_from_values(
+                get_project_id(project_config, ""),
+                ingestion_party,
+                date_transmission_expert,
+                auteur_transmission,
+            )
+            context_ok, context_divergences = validate_cohort_ingestion_context(
+                current_pdf_cohort,
+                ingestion_context,
+            ) if page == "Pré-traitement dépôt PDF" and current_pdf_cohort else (True, [])
             if not ingestion_party:
                 st.error("Choisir une partie.")
             elif not file_labels:
@@ -21517,6 +22200,9 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                     "Validation bloquée : chaque libellé d’enfant numéroté doit commencer par “PIECE”. "
                     f"Corriger : {', '.join(invalid_split_child_labels)}"
                 )
+            elif not context_ok:
+                st.error("Incohérence entre le contexte de cohorte et le contexte d'ingestion")
+                st.dataframe(prepare_df_for_streamlit_display(context_divergences), width="stretch")
             elif not selected_uploads:
                 st.error("Choisir au moins un fichier parmi les fichiers déposés.")
             else:
@@ -22490,6 +23176,16 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
     col_classify, col_technical = st.columns(2)
     with col_classify:
         if uploaded_files and st.button("Valider le dépôt documentaire dans la partie sélectionnée"):
+            ingestion_context = ingestion_context_from_values(
+                get_project_id(project_config, ""),
+                selected_party,
+                date_transmission_expert,
+                auteur_transmission,
+            )
+            context_ok, context_divergences = validate_cohort_ingestion_context(
+                current_pdf_cohort,
+                ingestion_context,
+            ) if page == "Pré-traitement dépôt PDF" and current_pdf_cohort else (True, [])
             if not selected_party:
                 st.error("Aucune partie cible disponible.")
             elif not date_transmission_expert:
@@ -22498,6 +23194,9 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 st.error("Renseigner le type de transmission dans le bloc d'ingestion.")
             elif not auteur_transmission.strip():
                 st.error("Renseigner l'auteur ou le conseil dans le bloc d'ingestion.")
+            elif not context_ok:
+                st.error("Incohérence entre le contexte de cohorte et le contexte d'ingestion")
+                st.dataframe(prepare_df_for_streamlit_display(context_divergences), width="stretch")
             else:
                 try:
                     transmission_id = make_transmission_id(get_project_id(project_config, ""))
@@ -22516,6 +23215,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                         selected_party,
                         uploaded_files,
                         transmission_meta,
+                        project_config,
                         selected_document_roles,
                     )
                     st.session_state["last_transmission_id"] = event.get("transmission_id")
