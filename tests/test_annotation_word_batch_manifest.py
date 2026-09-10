@@ -72,6 +72,7 @@ def _load_annotation_functions():
         "_annotation_detail_sort_time",
         "_annotation_verified_batch_from_stamp",
         "_annotation_file_profile",
+        "_annotation_word_report_photo_subject_fields",
         "_photo_report_job_preview",
         "submit_annotation_photos_batch_job",
         "submit_annotation_photos_batch_publish_retry_job",
@@ -1042,8 +1043,40 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
         self.assertTrue(preview["job"]["batch_output_verified"])
         expected_context = self.paths["nas_trans_dir"] / "contexte_general_photos.json"
         self.assertEqual(preview["job"]["contexte_general_photos_json"], str(expected_context))
+        self.assertIn("include_excluded_photos", preview["job"])
+        self.assertIs(preview["job"]["include_excluded_photos"], False)
         self.assertIn("--contexte-general-photos-json", preview["command_preview"])
         self.assertIn(str(expected_context), preview["command_preview"])
+
+    def test_word_job_carries_include_excluded_photos_flag_when_enabled(self):
+        legacy = {
+            "job_id": "annotation_2025-J47_cap_vlm_20260724_130000_legacy_b",
+            "type": "annotation_photos_batch",
+            "status": "done",
+            "affaire": "2025-J47",
+            "captation": "cap",
+            "options": list(ACTION_OPTIONS),
+            "exit_code": 0,
+            "photos_batch_csv_path": str(self.batch),
+        }
+        self._write_job(legacy)
+        modern = self._manifest(job_id="annotation_2025-J47_cap_vlm_20260724_140000_modern_b")
+        self._write_job(modern)
+        _, latest = self._latest()
+        preview = self.ns["_photo_report_job_preview"](
+            id_affaire="2025-J47",
+            id_captation="cap",
+            infos_pcfixe=self.infos,
+            paths=self.paths,
+            audit=self._audit(),
+            latest_batch=latest,
+            mode="provisoire",
+            only_retenue=False,
+            include_excluded_photos=True,
+            dry_run=True,
+        )
+        self.assertTrue(preview["available"])
+        self.assertIs(preview["job"]["include_excluded_photos"], True)
 
     def test_no_batch_preview_is_unavailable_without_valueerror(self):
         preview = self.ns["_photo_report_job_preview"](

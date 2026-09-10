@@ -12938,6 +12938,40 @@ def _patch_captation_llm_backend(
         "infos_sync_error": infos_sync_error,
     }
 
+def _annotation_word_report_photo_subject_fields(paths: dict) -> dict[str, str]:
+    """Ajoute au job Word les chemins d affectation photo -> sujet (optionnel).
+
+    Source de verite : photo_subject_assignments.json, ecrit par l UI dans le
+    meme dossier que photos.csv / photos_batch.csv (cote NAS). Si ce fichier
+    n existe pas, aucun champ n est ajoute et le contrat historique du job
+    annotation_photos_word_report reste strictement inchange.
+
+    Le job transporte uniquement des chemins canoniques (NAS + miroir PC fixe),
+    jamais le contenu des affectations : le PC fixe lira lui-meme la source.
+    """
+    if not isinstance(paths, dict):
+        return {}
+    photos_dir = paths.get("nas_photos_dir")
+    if not photos_dir:
+        return {}
+    assignment_nas = Path(str(photos_dir)) / "photo_subject_assignments.json"
+    if not assignment_nas.is_file():
+        return {}
+    fields = {
+        "photo_subject_assignments_nas": str(assignment_nas),
+        "sujets_xlsx_nas": str(Path(str(paths.get("nas_trans_dir") or "")) / "Sujets.xlsx"),
+    }
+    pcfixe_photos_dir = paths.get("pcfixe_photos_dir")
+    if pcfixe_photos_dir:
+        fields["mirror_pc_photo_subject_assignments"] = (
+            str(Path(str(pcfixe_photos_dir)) / "photo_subject_assignments.json")
+        )
+    pcfixe_trans_dir = paths.get("pcfixe_trans_dir")
+    if pcfixe_trans_dir:
+        fields["mirror_pc_sujets_xlsx"] = str(Path(str(pcfixe_trans_dir)) / "Sujets.xlsx")
+    return fields
+
+
 def _photo_report_job_preview(
     *,
     id_affaire: str,
@@ -12948,6 +12982,7 @@ def _photo_report_job_preview(
     latest_batch: dict | None = None,
     mode: str,
     only_retenue: bool,
+    include_excluded_photos: bool = False,
     dry_run: bool = True,
 ) -> dict:
     id_affaire = (id_affaire or "").strip()
@@ -13085,7 +13120,9 @@ def _photo_report_job_preview(
         "expected_photos_batch_csv_sha256": expected_batch_hash,
         "mode": mode,
         "retenue": retenue,
+        "include_excluded_photos": bool(include_excluded_photos),
     }
+    job.update(_annotation_word_report_photo_subject_fields(paths))
     queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
     status = "dry-run" if dry_run else "queued"
     if not dry_run:
@@ -18943,6 +18980,12 @@ elif page == "Annotation photos / Rapport Word":
             horizontal=True,
             key="ann_photos_report_filter",
         )
+        ann_report_include_excluded = st.checkbox(
+            "Inclure les photos exclues",
+            value=False,
+            key="ann_photos_report_include_excluded",
+            help="Inclut les photos marquees exclue dans l affectation photo -> sujet (desactive par defaut).",
+        )
         ann_report_dry_run = st.checkbox(
             "Dry-run rapport Word (afficher le JSON sans le déposer)",
             value=True,
@@ -18967,6 +19010,7 @@ elif page == "Annotation photos / Rapport Word":
                 latest_batch=ann_report_preflight.get("latest_batch", {}),
                 mode=report_mode,
                 only_retenue=report_filter == "uniquement photos retenues",
+                include_excluded_photos=ann_report_include_excluded,
                 dry_run=True,
             )
             st.json(report_preview["job"])
@@ -19050,6 +19094,7 @@ elif page == "Annotation photos / Rapport Word":
                     latest_batch=ann_report_preflight.get("latest_batch", {}),
                     mode=report_mode,
                     only_retenue=report_filter == "uniquement photos retenues",
+                include_excluded_photos=ann_report_include_excluded,
                     dry_run=ann_report_dry_run,
                 )
                 st.write("job_id :", report_result["job"]["job_id"])
