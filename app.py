@@ -5502,6 +5502,35 @@ def documentary_deletion_confirmation_text(selected_expert_doc_ids: list[str]) -
     ids = sorted({compact_spaces(value) for value in selected_expert_doc_ids or [] if compact_spaces(value)}, key=expert_doc_id_sort_key)
     return "SUPPRIMER " + ", ".join(ids) if ids else ""
 
+def documentary_deletion_reason_from_values(selected_reason: str, custom_reason: str = "") -> str:
+    selected_reason = compact_spaces(selected_reason or "")
+    if selected_reason == "Autre motif saisi ci-dessous":
+        return compact_spaces(custom_reason or "")
+    return selected_reason
+
+def documentary_deletion_preflight_can_freeze(preflight: dict) -> bool:
+    blockers = set(preflight.get("blockers") or [])
+    structural_blockers = blockers & {"aucune_selection", "selection_introuvable", "selection_ambigue", "preflight_perime"}
+    return (
+        not structural_blockers
+        and int(preflight.get("selected_count") or 0) > 0
+        and int(preflight.get("found_count") or 0) == int(preflight.get("selected_count") or 0)
+        and bool(preflight.get("selection_signature"))
+    )
+
+def documentary_deletion_frozen_selection_payload(preflight: dict) -> dict:
+    rows = preflight.get("rows") or []
+    return {
+        "selection_keys": [documentary_maintenance_row_key(row) for row in rows if documentary_maintenance_row_key(row)],
+        "selection_signature": compact_spaces(preflight.get("selection_signature") or ""),
+        "confirmation_text": compact_spaces(preflight.get("confirmation_text") or ""),
+        "expert_doc_ids": [
+            compact_spaces(row.get("expert_doc_id") or "")
+            for row in rows
+            if compact_spaces(row.get("expert_doc_id") or "")
+        ],
+    }
+
 def documentary_deletion_preflight(
     rows: list[dict],
     selected_expert_doc_ids: list[str],
@@ -19933,15 +19962,37 @@ elif page == "Administration":
             format_func=lambda key: labels_by_key.get(key, key),
             key="admin_doc_maint_delete_ids",
         )
-        deletion_reason = st.text_area(
-            "Motif obligatoire",
-            value="",
-            key="admin_doc_maint_delete_reason",
+        deletion_reason_options = [
+            "",
+            "Données parasites / entrée documentaire erronée",
+            "Doublon documentaire confirmé",
+            "Mauvaise partie / mauvais déposant / mauvaise date",
+            "Autre motif saisi ci-dessous",
+        ]
+        selected_reason_option = st.selectbox(
+            "Motif de suppression",
+            deletion_reason_options,
+            key="admin_doc_maint_delete_reason_choice",
+            help="Motif obligatoire : il sera journalisé dans le tombstone append-only.",
         )
+        custom_deletion_reason = ""
+        if selected_reason_option == "Autre motif saisi ci-dessous":
+            custom_deletion_reason = st.text_area(
+                "Préciser le motif de suppression",
+                value="",
+                key="admin_doc_maint_delete_reason_custom",
+            )
+        deletion_reason = documentary_deletion_reason_from_values(selected_reason_option, custom_deletion_reason)
         deletion_preflight = documentary_deletion_preflight(maintenance_rows, selected_delete_keys, deletion_reason)
+        if selected_delete_keys and documentary_deletion_preflight_can_freeze(deletion_preflight):
+            st.session_state["documentary_deletion_preflight_selection"] = documentary_deletion_frozen_selection_payload(deletion_preflight)
+        frozen_deletion_selection = st.session_state.get("documentary_deletion_preflight_selection") or {}
         with st.expander("Résultat du préflight", expanded=bool(selected_delete_keys)):
             st.json(deletion_preflight)
-        expected_confirmation = deletion_preflight.get("confirmation_text") or ""
+            if frozen_deletion_selection:
+                st.markdown("**Sélection figée pour suppression**")
+                st.json(frozen_deletion_selection)
+        expected_confirmation = frozen_deletion_selection.get("confirmation_text") or deletion_preflight.get("confirmation_text") or ""
         st.text_input(
             "Confirmation exacte",
             value="",
@@ -19952,16 +20003,25 @@ elif page == "Administration":
         if expected_confirmation:
             st.caption(f"Texte attendu : {expected_confirmation}")
         confirm_matches = compact_spaces(st.session_state.get("admin_doc_maint_confirmation_text") or "") == expected_confirmation
+        if frozen_deletion_selection and st.button("Annuler la sélection de suppression", key="admin_doc_maint_clear_frozen_selection"):
+            st.session_state.pop("documentary_deletion_preflight_selection", None)
+            st.rerun()
         if st.button(
             "Supprimer logiquement les entrées documentaires sélectionnées",
             key="admin_doc_maint_delete_selected",
             type="primary",
+            disabled=not bool(frozen_deletion_selection.get("selection_keys")) or not bool(deletion_reason),
         ):
+            current_reason_option = st.session_state.get("admin_doc_maint_delete_reason_choice") or ""
+            current_custom_reason = st.session_state.get("admin_doc_maint_delete_reason_custom") or ""
+            current_deletion_reason = documentary_deletion_reason_from_values(current_reason_option, current_custom_reason)
+            frozen_selection_keys = st.session_state.get("documentary_deletion_preflight_selection", {}).get("selection_keys") or []
+            frozen_selection_signature = st.session_state.get("documentary_deletion_preflight_selection", {}).get("selection_signature") or ""
             second_preflight = documentary_deletion_preflight(
                 maintenance_rows,
-                selected_delete_keys,
-                deletion_reason,
-                expected_signature=deletion_preflight.get("selection_signature") or "",
+                frozen_selection_keys,
+                current_deletion_reason,
+                expected_signature=frozen_selection_signature,
             )
             if not second_preflight.get("ok"):
                 st.error("Suppression bloquée par le second préflight.")
@@ -19973,7 +20033,7 @@ elif page == "Administration":
                     aff_root_local,
                     project_config,
                     second_preflight.get("rows") or [],
-                    deletion_reason,
+                    current_deletion_reason,
                     rebuild_states=True,
                 )
                 if result.get("remaining_selected_ids"):
@@ -19982,6 +20042,7 @@ elif page == "Administration":
                 else:
                     st.success("Suppression logique appliquée et États 1–4 régénérés.")
                     st.json(result)
+                    st.session_state.pop("documentary_deletion_preflight_selection", None)
         st.markdown("#### Correction ciblée d’un libellé documentaire")
         admin_registry_rows = build_documents_registry(
             admin_records,

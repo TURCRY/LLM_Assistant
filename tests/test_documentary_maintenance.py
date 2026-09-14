@@ -303,6 +303,82 @@ class DocumentaryMaintenanceTests(unittest.TestCase):
         self.assertEqual("SUPPRIMER 01-001, 01-002", two["confirmation_text"])
         self.assertNotEqual(one["selection_signature"], two["selection_signature"])
 
+    def test_deletion_reason_choice_is_required_and_passed_to_preflight(self):
+        rows = [
+            {
+                "expert_doc_id": "01-001",
+                "code_partie": "01",
+                "transmissions": "T1",
+                "registry_fingerprint": "T1|a.pdf|path-a|1|",
+            }
+        ]
+        predefined = self.ns["documentary_deletion_reason_from_values"](
+            "Données parasites / entrée documentaire erronée",
+            "",
+        )
+        self.assertEqual("Données parasites / entrée documentaire erronée", predefined)
+        ok = self.ns["documentary_deletion_preflight"](rows, [self.ns["documentary_maintenance_row_key"](rows[0])], predefined)
+        self.assertTrue(ok["ok"], ok)
+
+        empty_custom = self.ns["documentary_deletion_reason_from_values"]("Autre motif saisi ci-dessous", "  ")
+        blocked = self.ns["documentary_deletion_preflight"](
+            rows,
+            [self.ns["documentary_maintenance_row_key"](rows[0])],
+            empty_custom,
+        )
+        self.assertFalse(blocked["ok"])
+        self.assertIn("motif_obligatoire", blocked["blockers"])
+
+        custom = self.ns["documentary_deletion_reason_from_values"](
+            "Autre motif saisi ci-dessous",
+            "Erreur documentaire confirmée",
+        )
+        self.assertEqual("Erreur documentaire confirmée", custom)
+        ok_custom = self.ns["documentary_deletion_preflight"](
+            rows,
+            [self.ns["documentary_maintenance_row_key"](rows[0])],
+            custom,
+        )
+        self.assertTrue(ok_custom["ok"], ok_custom)
+
+    def test_frozen_preflight_selection_survives_empty_widget_rerun_for_second_preflight(self):
+        rows = []
+        for index in range(1, 14):
+            rows.append({
+                "expert_doc_id": f"01-{index:03d}",
+                "code_partie": "01",
+                "transmissions": f"T{index}",
+                "registry_fingerprint": f"T{index}|piece-{index}.pdf|path-{index}|{index}|",
+            })
+        selected_keys = [self.ns["documentary_maintenance_row_key"](row) for row in rows]
+        reason = "Données parasites / entrée documentaire erronée"
+        first_preflight = self.ns["documentary_deletion_preflight"](rows, selected_keys, reason)
+        self.assertTrue(first_preflight["ok"], first_preflight)
+        self.assertTrue(self.ns["documentary_deletion_preflight_can_freeze"](first_preflight))
+        frozen = self.ns["documentary_deletion_frozen_selection_payload"](first_preflight)
+        self.assertEqual(13, len(frozen["selection_keys"]))
+        self.assertEqual(first_preflight["selection_signature"], frozen["selection_signature"])
+
+        widget_selection_after_rerun = []
+        empty_widget_preflight = self.ns["documentary_deletion_preflight"](
+            rows,
+            widget_selection_after_rerun,
+            reason,
+        )
+        self.assertFalse(empty_widget_preflight["ok"])
+        self.assertIn("aucune_selection", empty_widget_preflight["blockers"])
+
+        second_preflight = self.ns["documentary_deletion_preflight"](
+            rows,
+            frozen["selection_keys"],
+            reason,
+            expected_signature=frozen["selection_signature"],
+        )
+        self.assertTrue(second_preflight["ok"], second_preflight)
+        self.assertEqual(13, second_preflight["selected_count"])
+        self.assertEqual(13, second_preflight["found_count"])
+        self.assertEqual(frozen["selection_signature"], second_preflight["selection_signature"])
+
     def test_append_only_journal_created(self):
         records = [self._record("01-001")]
         result = self._delete(records, ["01-001"])
