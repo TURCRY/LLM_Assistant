@@ -5252,6 +5252,23 @@ def documentary_cohort_context_id(context: dict, parent_document: str = "") -> s
     }
     return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
+def documentary_cohort_widget_suffix(context: dict | None) -> str:
+    context = context or {}
+    return compact_spaces(context.get("context_id") or documentary_cohort_context_id(context) or "no_cohort")
+
+def party_from_cohort_context(context: dict | None, parties: list[dict]) -> dict | None:
+    code = party_code((context or {}).get("code_partie") or "")
+    if not code:
+        return None
+    for party in parties or []:
+        if party_code(party.get("code_partie") or party.get("code") or "") == code:
+            return {**party, "code_partie": code}
+    return {
+        "code_partie": code,
+        "nom": compact_spaces((context or {}).get("nom_partie") or ""),
+        "folder_rel": compact_spaces((context or {}).get("folder_rel") or ""),
+    }
+
 def cohort_dependent_session_keys(project_id: str) -> list[str]:
     return [
         "piece_title_suggestions",
@@ -5280,6 +5297,12 @@ def cohort_dependent_session_keys(project_id: str) -> list[str]:
         "ingestion_local_original_paths",
         "last_ingestion_event",
         "last_transmission_id",
+        f"pdf_cohort_upload_attorney_{project_id}",
+        f"split_code_partie_{project_id}",
+        f"classement_originaux_partie_cible_display_{project_id}",
+        f"ingestion_party_display_{project_id}",
+        f"ingestion_date_transmission_expert_{project_id}",
+        f"ingestion_auteur_transmission_{project_id}",
         f"split_rows_editor_{project_id}",
         f"separated_pieces_rename_dry_run_{project_id}",
         f"guided_split_immediate_result_{project_id}",
@@ -20073,7 +20096,7 @@ elif page == "Pré-traitement dépôt PDF":
         cohort_attorney = st.text_input(
             "Avocat / conseil transmetteur",
             value=party_attorney(selected_cohort_party),
-            key=f"pdf_cohort_upload_attorney_{project_id}",
+            key=f"pdf_cohort_upload_attorney_{project_id}_{party_code(selected_cohort_party.get('code_partie') or selected_cohort_party.get('code') or '')}",
         )
     cohort_uploads = st.file_uploader(
         "Dépose tes fichiers ici",
@@ -20147,6 +20170,7 @@ elif page == "Pré-traitement dépôt PDF":
         st.success(f"Cohorte enregistrée dans Depot_initial : {len(saved_names)} fichier(s). Aucun code expert attribué.")
         st.caption("Journal cohorte provisoire :")
         st.code(str(cohort_log_path), language=None)
+    current_pdf_cohort_widget_suffix = documentary_cohort_widget_suffix(current_pdf_cohort)
 
     # chemins par défaut basés sur la config projet existante
     split_aff_id = get_project_id(project_config, "")
@@ -20170,7 +20194,7 @@ elif page == "Pré-traitement dépôt PDF":
     st.text_input(
         "Code partie déduit du déposant",
         value=code_partie,
-        key=f"split_code_partie_{project_id}",
+        key=f"split_code_partie_{project_id}_{current_pdf_cohort_widget_suffix}",
         disabled=True,
     )
     prefix      = st.text_input("Préfixe n° avocat", value="PIECE", key=f"split_prefix_avocat_{project_id}")
@@ -22567,6 +22591,7 @@ if batch_preview:
 
 def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None = None) -> None:
     current_pdf_cohort = current_pdf_cohort or {}
+    cohort_widget_suffix = documentary_cohort_widget_suffix(current_pdf_cohort)
     st.markdown("### 📤 Classement des originaux et dépôt technique")
     if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("uploads"):
         uploaded_files = list((current_pdf_cohort.get("uploads") or {}).values())
@@ -22587,18 +22612,20 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
     selected_party = None
     if party_options:
         default_party_index = 0
+        cohort_party = None
         if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("code_partie"):
+            cohort_party = party_from_cohort_context(current_pdf_cohort, party_options)
             for i, party in enumerate(party_options):
-                if party_code(party.get("code_partie")) == current_pdf_cohort.get("code_partie"):
+                if party_code(party.get("code_partie")) == party_code(current_pdf_cohort.get("code_partie")):
                     default_party_index = i
                     break
-        selected_party = party_options[default_party_index]
+        selected_party = cohort_party or party_options[default_party_index]
         if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("code_partie"):
             st.text_input(
                 "Partie cible",
                 value=source_code_label(selected_party),
                 disabled=True,
-                key=f"classement_originaux_partie_cible_display_{project_id}",
+                key=f"classement_originaux_partie_cible_display_{project_id}_{cohort_widget_suffix}",
             )
         else:
             selected_party = st.selectbox(
@@ -22620,18 +22647,20 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
         ingestion_party = None
         if party_options:
             default_ingestion_party_index = 0
+            cohort_ingestion_party = None
             if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("code_partie"):
+                cohort_ingestion_party = party_from_cohort_context(current_pdf_cohort, party_options)
                 for i, party in enumerate(party_options):
-                    if party_code(party.get("code_partie")) == current_pdf_cohort.get("code_partie"):
+                    if party_code(party.get("code_partie")) == party_code(current_pdf_cohort.get("code_partie")):
                         default_ingestion_party_index = i
                         break
-            ingestion_party = party_options[default_ingestion_party_index]
+            ingestion_party = cohort_ingestion_party or party_options[default_ingestion_party_index]
             if page == "Pré-traitement dépôt PDF" and current_pdf_cohort.get("code_partie"):
                 st.text_input(
                     "Partie",
                     value=source_code_label(ingestion_party),
                     disabled=True,
-                    key=f"ingestion_party_display_{project_id}",
+                    key=f"ingestion_party_display_{project_id}_{cohort_widget_suffix}",
                 )
             else:
                 ingestion_party = st.selectbox(
@@ -22655,7 +22684,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             date_transmission_expert = st.date_input(
                 "Date de transmission à l'expert",
                 value=cohort_date_value,
-                key=f"ingestion_date_transmission_expert_{project_id}" if cohort_forced else "ingestion_date_transmission_expert",
+                key=f"ingestion_date_transmission_expert_{project_id}_{cohort_widget_suffix}" if cohort_forced else "ingestion_date_transmission_expert",
                 disabled=cohort_forced,
             )
             type_transmission = st.selectbox(
@@ -22668,7 +22697,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             auteur_transmission = st.text_input(
                 "Auteur / conseil",
                 value=(current_pdf_cohort.get("auteur_transmission") or current_pdf_cohort.get("avocat") or "") if cohort_author_forced else "",
-                key=f"ingestion_auteur_transmission_{project_id}" if cohort_author_forced else "ingestion_auteur_transmission",
+                key=f"ingestion_auteur_transmission_{project_id}_{cohort_widget_suffix}" if cohort_author_forced else "ingestion_auteur_transmission",
                 disabled=cohort_author_forced,
             )
             reference_transmission = st.text_input("Référence", value="", key="ingestion_reference_transmission")

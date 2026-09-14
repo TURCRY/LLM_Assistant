@@ -37,6 +37,8 @@ def _load_helpers():
         "expert_doc_id_sort_key",
         "documentary_cohort_context",
         "documentary_cohort_context_id",
+        "documentary_cohort_widget_suffix",
+        "party_from_cohort_context",
         "cohort_dependent_session_keys",
         "reset_cohort_dependent_session_state",
         "sync_documentary_cohort_session",
@@ -165,6 +167,51 @@ class DocumentaryCohortContextTests(unittest.TestCase):
         )
         self.assertTrue(result["changed"])
         self.assertNotIn("ingestion_manual_split_rows", state)
+
+    def test_switching_from_party_25_to_03_updates_downstream_readonly_context(self):
+        parties = [
+            self._party(25, "Gérard TORDJMAN"),
+            self._party(3, "Philippe INGOLD et Véronique INGOLD"),
+        ]
+        previous = self._context(code=25, files=["ancien.pdf"])
+        current = self.ns["documentary_cohort_context"](
+            "2025-J48",
+            parties[1],
+            date(2026, 2, 27),
+            "Conseil INGOLD",
+            ["ingold.pdf"],
+        )
+        state = {
+            "pdf_current_cohort_signature_2025-J48": previous["context_id"],
+            "default_code_partie": "25",
+            "split_code_partie_2025-J48": "25",
+            "classement_originaux_partie_cible_display_2025-J48": "25 – Gérard TORDJMAN",
+            "ingestion_party_display_2025-J48": "25 – Gérard TORDJMAN",
+            "ingestion_date_transmission_expert_2025-J48": date(2025, 10, 24),
+            "ingestion_auteur_transmission_2025-J48": "Ancien conseil",
+        }
+        result = self.ns["sync_documentary_cohort_session"](state, "2025-J48", current)
+        self.assertTrue(result["changed"])
+        self.assertNotIn("default_code_partie", state)
+        self.assertNotIn("split_code_partie_2025-J48", state)
+        self.assertNotIn("classement_originaux_partie_cible_display_2025-J48", state)
+        self.assertNotIn("ingestion_party_display_2025-J48", state)
+        self.assertNotIn("ingestion_date_transmission_expert_2025-J48", state)
+        self.assertNotIn("ingestion_auteur_transmission_2025-J48", state)
+        downstream_party = self.ns["party_from_cohort_context"](current, parties)
+        ingestion = self.ns["ingestion_context_from_values"](
+            "2025-J48",
+            downstream_party,
+            date.fromisoformat(current["date_transmission"]),
+            current["auteur_transmission"],
+        )
+        self.assertEqual("03", downstream_party["code_partie"])
+        self.assertEqual("03", ingestion["code_partie"])
+        self.assertTrue(self.ns["validate_cohort_ingestion_context"](current, ingestion)[0])
+        self.assertNotEqual(
+            self.ns["documentary_cohort_widget_suffix"](previous),
+            self.ns["documentary_cohort_widget_suffix"](current),
+        )
 
     def test_split_filter_rejects_generic_piece_01_and_02_from_old_context(self):
         rows = [
