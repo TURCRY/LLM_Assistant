@@ -9853,19 +9853,51 @@ def submit_compte_rendu_refere_preventif_job(job: dict, *, dry_run: bool = False
     job_id = str(job.get("job_id") or "").strip()
     if not job_id:
         raise ValueError("job_id obligatoire pour la soumission.")
-    queued_path = get_pcfixe_jobs_queued_dir() / f"{job_id}.json"
+    queued_root = get_pcfixe_jobs_queued_dir()
+    queued_path = queued_root / f"{job_id}.json"
     result = {
         "job_id": job_id,
         "job_path": str(queued_path),
-        "status": "dry-run" if dry_run else "queued",
+        "queued_root": str(queued_root),
+        "status": "dry-run" if dry_run else "pending",
+        "deposit_verified": False,
         "job": job,
     }
     if dry_run:
         return result
-    preflight_pcfixe_target_dir(queued_path.parent)
     tmp_path = queued_path.with_suffix(queued_path.suffix + ".tmp")
-    tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(tmp_path, queued_path)
+    try:
+        preflight_pcfixe_target_dir(queued_path.parent)
+        tmp_path.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp_path, queued_path)
+    except Exception as exc:
+        smb_host = _unc_host(queued_root) or str(queued_root).strip("\\").split("\\", 1)[0]
+        raise RuntimeError(
+            "Depot du job refere preventif echoue : "
+            f"chemin tente={queued_path} ; racine queue={queued_root} ; "
+            f"hote SMB={smb_host} ; temporaire={tmp_path} ; "
+            f"exception={type(exc).__name__}: {exc}"
+        ) from exc
+    if not queued_path.is_file():
+        raise RuntimeError(
+            "Depot du job refere preventif non verifie : fichier absent apres ecriture : "
+            f"{queued_path} ; racine queue={queued_root} ; temporaire={tmp_path}"
+        )
+    try:
+        deposited = json.loads(queued_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(
+            "Depot du job refere preventif non verifie : manifest illisible : "
+            f"{queued_path} ; exception={type(exc).__name__}: {exc}"
+        ) from exc
+    deposited_job_id = str((deposited or {}).get("job_id") or "").strip()
+    if deposited_job_id != job_id:
+        raise RuntimeError(
+            "Depot du job refere preventif incoherent : job_id relu="
+            f"{deposited_job_id!r} attendu={job_id!r} ; chemin={queued_path}"
+        )
+    result["status"] = "queued"
+    result["deposit_verified"] = True
     return result
 
 
@@ -17888,10 +17920,16 @@ elif page == "Voxtral (ASR / CR)":
                     st.write("type :", refere_result["job"]["type"])
                     st.write("job_id :", refere_result["job_id"])
                     st.write("état :", refere_result["status"])
+                    st.write("chemin déposé :", refere_result["job_path"])
+                    st.write("racine queue :", refere_result.get("queued_root", ""))
+                    st.write("dépôt vérifié :", "oui" if refere_result.get("deposit_verified") else "non")
                     st.markdown("JSON du job :")
                     st.json(refere_result["job"])
                     if not refere_dry_run:
                         st.session_state["cr_refere_follow_job_id"] = refere_result["job_id"]
+                        st.session_state[f"cr_refere_status::{refere_result['job_id']}"] = (
+                            find_compte_rendu_refere_preventif_job_status(refere_result["job_id"])
+                        )
                         st.success(
                             "Job référé préventif déposé dans la queue PC fixe. "
                             "Streamlit n’attend pas la fin du traitement ; le DOCX est livré par le spooler."
