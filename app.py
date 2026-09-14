@@ -8761,7 +8761,7 @@ def submit_asr_v2_job(
     )
     if pc_proper_names:
         shutil.copy2(proper_source, unc_trans_dir / proper_source.name)
-    if pc_debrief and debrief_source:
+    if pc_debrief and debrief_source and debrief_source.is_file():
         shutil.copy2(debrief_source, unc_trans_dir / debrief_source.name)
 
     preflight_pcfixe_target_dir(queued_path.parent)
@@ -13360,6 +13360,417 @@ def _annotation_batch_action_state(job_details: dict[str, dict], action_key: str
         "status": status,
     }
 
+# prepare_voxtral_audio() ne prepare que des WAV (mono 16 kHz) : le depot et le scan
+# du dossier debrief n'admettent donc que le .wav.
+DEBRIEF_AUDIO_UPLOAD_EXTENSIONS = (".wav",)
+DEBRIEF_AUDIO_SCAN_PATTERNS = tuple(
+    pattern
+    for extension in DEBRIEF_AUDIO_UPLOAD_EXTENSIONS
+    for pattern in (f"*{extension}", f"*{extension.upper()}")
+)
+
+def debrief_affaire_root(raw_root: str | Path | None, affaire_id: str) -> Path:
+    """Racine d'affaire du debrief : <racine>/<affaire>, sans dupliquer l'id d'affaire.
+
+    Les helpers existants ne renvoient pas le meme niveau : AFFAIRES_ROOT pointe sur
+    <...>\\Affaires alors que effective_nas_affaire_root et pcfixe_unc_root_for_laptop
+    renvoient deja <...>\\Affaires\\<affaire>.
+    """
+    root = Path(str(raw_root or ""))
+    wanted = str(affaire_id or "").strip().casefold()
+    tail = root.name.strip().casefold()
+    if wanted and tail != wanted and tail == "affaires":
+        return root / str(affaire_id)
+    return root
+
+def debrief_audio_dest_dir(
+    affaire_root: str | Path | None,
+    id_captation: str,
+) -> Path:
+    """Dossier canonique des WAV de debrief : <racine affaire>/AE_Expert_captations/<captation>/debrief."""
+    return (
+        Path(str(affaire_root))
+        / "AE_Expert_captations"
+        / str(id_captation)
+        / "debrief"
+    )
+
+def validate_debrief_audio_filename(filename: str | Path | None) -> str:
+    """Retourne le nom de fichier de debrief valide, ou leve ValueError."""
+    name = Path(str(filename or "").strip().strip('"')).name
+    if not name or name in {".", ".."}:
+        raise ValueError("Nom de fichier de debrief invalide.")
+    extension = Path(name).suffix.casefold()
+    if extension not in DEBRIEF_AUDIO_UPLOAD_EXTENSIONS:
+        admises = ", ".join(DEBRIEF_AUDIO_UPLOAD_EXTENSIONS)
+        raise ValueError(
+            f"Extension audio non admise pour le debrief : {Path(name).suffix or '(aucune)'}. "
+            f"Extensions admises : {admises}."
+        )
+    return name
+
+def resolve_debrief_audio_destinations(
+    *,
+    project_config: dict,
+    affaire_id: str,
+    id_captation: str,
+    filename: str = "",
+    laptop_root: str | Path | None = None,
+    nas_root: str | Path | None = None,
+    pcfixe_root: str | Path | None = None,
+) -> dict:
+    """Resout les cibles laptop / NAS / PC fixe du debrief sans ecrire sur disque.
+
+    Les racines sont deduites des helpers existants (AFFAIRES_ROOT, effective_nas_affaire_root,
+    pcfixe_unc_root_for_laptop) sauf si elles sont fournies explicitement (tests).
+    """
+    affaire_id = str(affaire_id or "").strip()
+    id_captation = str(id_captation or "").strip()
+    name = Path(str(filename or "").strip().strip('"')).name
+    ready = bool(affaire_id and id_captation)
+
+    laptop_root_value = str(laptop_root) if laptop_root else str(AFFAIRES_ROOT)
+    nas_root_value = ""
+    pcfixe_root_value = ""
+    nas_error = ""
+    pcfixe_error = ""
+    try:
+        nas_root_value = str(nas_root) if nas_root else str(effective_nas_affaire_root(project_config, affaire_id))
+    except Exception as exc:
+        nas_error = f"{type(exc).__name__}: {exc}"
+    try:
+        pcfixe_root_value = (
+            str(pcfixe_root) if pcfixe_root else str(pcfixe_unc_root_for_laptop(project_config, affaire_id))
+        )
+    except Exception as exc:
+        pcfixe_error = f"{type(exc).__name__}: {exc}"
+
+    targets: dict[str, dict] = {}
+    for role, label, root_value, root_error in (
+        ("laptop", "Laptop", laptop_root_value, ""),
+        ("nas", "NAS", nas_root_value, nas_error),
+        ("pcfixe", "PC fixe", pcfixe_root_value, pcfixe_error),
+    ):
+        affaire_root_value = (
+            str(debrief_affaire_root(root_value, affaire_id)) if root_value else ""
+        )
+        directory = (
+            debrief_audio_dest_dir(affaire_root_value, id_captation)
+            if (ready and affaire_root_value)
+            else None
+        )
+        targets[role] = {
+            "role": role,
+            "label": label,
+            "root": affaire_root_value,
+            "dir": str(directory) if directory else "",
+            "path": str(directory / name) if (directory and name) else "",
+            "error": root_error,
+        }
+
+    return {
+        "affaire_id": affaire_id,
+        "id_captation": id_captation,
+        "filename": name,
+        "ready": ready,
+        "relative_dir": (
+            os.path.join(affaire_id, "AE_Expert_captations", id_captation, "debrief") if ready else ""
+        ),
+        "targets": targets,
+    }
+
+def debrief_audio_scan_dirs(destinations: dict) -> list[Path]:
+    """Dossiers debrief a scanner (laptop puis NAS), sans doublon ni cible non resolue."""
+    out: list[Path] = []
+    targets = (destinations or {}).get("targets") or {}
+    for role in ("laptop", "nas"):
+        raw = str((targets.get(role) or {}).get("dir") or "").strip()
+        if not raw:
+            continue
+        path = Path(raw)
+        if path not in out:
+            out.append(path)
+    return out
+
+def list_debrief_audio_candidates(destinations: dict, *, finder=None) -> list[Path]:
+    """WAV de debrief detectes (laptop puis NAS), dedoublonnes par nom de fichier."""
+    globber = finder or _glob_existing_files
+    found: list[Path] = []
+    seen: set[str] = set()
+    for directory in debrief_audio_scan_dirs(destinations):
+        for candidate in globber(directory, list(DEBRIEF_AUDIO_SCAN_PATTERNS)):
+            key = candidate.name.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(candidate)
+    return found
+
+def default_debrief_target_prober(raw: str | Path | None) -> tuple[bool, str]:
+    """Teste une racine debrief avec le garde-temps SMB deja utilise par l'application."""
+    value = str(raw or "").strip()
+    if not value:
+        return False, "racine non resolue"
+    try:
+        accessible, detail = _test_path_with_timeout(value)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+    return bool(accessible), str(detail or "")
+
+def probe_debrief_audio_destinations(destinations: dict, *, probe_fn=None) -> list[dict]:
+    """Decrit chaque cible debrief et son accessibilite, sans aucune ecriture."""
+    prober = probe_fn or default_debrief_target_prober
+    rows: list[dict] = []
+    targets = (destinations or {}).get("targets") or {}
+    for role in ("laptop", "nas", "pcfixe"):
+        target = targets.get(role)
+        if target is None:
+            continue
+        root = str(target.get("root") or "")
+        if target.get("error"):
+            accessible, detail = False, str(target["error"])
+        elif not root:
+            accessible, detail = False, "racine non resolue"
+        else:
+            try:
+                accessible, detail = prober(root)
+            except Exception as exc:
+                accessible, detail = False, f"{type(exc).__name__}: {exc}"
+        rows.append({
+            "cible": str(target.get("label") or role),
+            "racine": root or "(non resolue)",
+            "destination": str(target.get("path") or target.get("dir") or ""),
+            "racine accessible": "OK" if accessible else "inaccessible",
+            "detail": str(detail or ""),
+        })
+    return rows
+
+def debrief_audio_source_fingerprint(*, source_path: str | Path | None = None, payload: bytes | None = None) -> dict:
+    """Empreinte (nom, taille, sha256) de la source a deposer."""
+    if source_path is not None:
+        path = Path(str(source_path))
+        if not path.is_file():
+            raise FileNotFoundError(f"Fichier de debrief introuvable : {path}")
+        return {
+            "source_path": str(path),
+            "payload": None,
+            "filename": path.name,
+            "size": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+    if payload is None:
+        raise ValueError("Fournir soit source_path, soit payload.")
+    data = bytes(payload)
+    return {
+        "source_path": "",
+        "payload": data,
+        "filename": "",
+        "size": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+
+def deposit_debrief_audio_to_dir(
+    target_dir: str | Path | None,
+    *,
+    filename: str,
+    expected_size: int,
+    expected_sha256: str,
+    source_path: str | Path | None = None,
+    payload: bytes | None = None,
+) -> dict:
+    """Copie verifiee d'un fichier de debrief vers un dossier cible (ecriture temporaire + renommage)."""
+    result = {
+        "role": "",
+        "dir": str(target_dir) if target_dir else "",
+        "path": str(Path(target_dir) / filename) if target_dir else "",
+        "accessible": False,
+        "state": "failed",
+        "size": 0,
+        "sha256": "",
+        "error": "",
+    }
+    if not target_dir:
+        result["error"] = "Destination non resolue."
+        return result
+
+    directory = Path(target_dir)
+    target = directory / filename
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        result["error"] = f"Dossier inaccessible : {type(exc).__name__}: {exc}"
+        return result
+    if not directory.is_dir():
+        result["error"] = f"Dossier inaccessible : {directory}"
+        return result
+    result["accessible"] = True
+
+    if target.is_file():
+        try:
+            existing_size = target.stat().st_size
+        except Exception as exc:
+            result["error"] = f"Fichier existant illisible : {type(exc).__name__}: {exc}"
+            return result
+        existing_sha = sha256_file(target)
+        result["size"] = existing_size
+        result["sha256"] = existing_sha
+        if existing_size == expected_size and existing_sha and expected_sha256 and existing_sha == expected_sha256:
+            result["state"] = "already_present"
+            return result
+        result["state"] = "conflict"
+        if not existing_sha:
+            result["error"] = (
+                "Un fichier de meme nom existe deja et son empreinte SHA256 n'a pas pu etre verifiee."
+            )
+        else:
+            result["error"] = "Un fichier de meme nom mais de contenu different existe deja."
+        return result
+
+    tmp_path = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        if payload is not None:
+            tmp_path.write_bytes(payload)
+        else:
+            with open(str(source_path), "rb") as source_handle, open(str(tmp_path), "wb") as tmp_handle:
+                shutil.copyfileobj(source_handle, tmp_handle, 1024 * 1024)
+        os.replace(str(tmp_path), str(target))
+    except Exception as exc:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            pass
+        result["error"] = f"Copie impossible : {type(exc).__name__}: {exc}"
+        return result
+
+    try:
+        final_size = target.stat().st_size
+    except Exception as exc:
+        result["error"] = f"Verification impossible : {type(exc).__name__}: {exc}"
+        return result
+    final_sha = sha256_file(target)
+    result["size"] = final_size
+    result["sha256"] = final_sha
+    if final_size != expected_size or not final_sha or final_sha != expected_sha256:
+        result["error"] = "Verification taille/SHA256 echouee apres copie."
+        try:
+            target.unlink()
+        except Exception:
+            pass
+        return result
+    result["state"] = "copied"
+    return result
+
+def deposit_debrief_audio(
+    *,
+    project_config: dict,
+    affaire_id: str,
+    id_captation: str,
+    source_path: str | Path | None = None,
+    payload: bytes | None = None,
+    filename: str = "",
+    laptop_root: str | Path | None = None,
+    nas_root: str | Path | None = None,
+    pcfixe_root: str | Path | None = None,
+    targets: tuple[str, ...] = ("laptop", "nas", "pcfixe"),
+    probe_fn=None,
+) -> dict:
+    """Depose un fichier de debrief sur le laptop, le NAS et le PC fixe, avec verification SHA256."""
+    affaire_id = str(affaire_id or "").strip()
+    id_captation = str(id_captation or "").strip()
+    if not affaire_id or not id_captation:
+        raise ValueError("Selectionner une affaire et une captation avant de deposer un debrief.")
+
+    raw_name = str(filename or "").strip() or (
+        Path(str(source_path)).name if source_path is not None else ""
+    )
+    name = validate_debrief_audio_filename(raw_name)
+    fingerprint = debrief_audio_source_fingerprint(source_path=source_path, payload=payload)
+    destinations = resolve_debrief_audio_destinations(
+        project_config=project_config,
+        affaire_id=affaire_id,
+        id_captation=id_captation,
+        filename=name,
+        laptop_root=laptop_root,
+        nas_root=nas_root,
+        pcfixe_root=pcfixe_root,
+    )
+
+    results: dict[str, dict] = {}
+    for role in ("laptop", "nas", "pcfixe"):
+        target = destinations["targets"][role]
+        if role not in targets:
+            results[role] = {
+                "role": role,
+                "dir": target["dir"],
+                "path": target["path"],
+                "accessible": None,
+                "state": "skipped",
+                "size": 0,
+                "sha256": "",
+                "error": "",
+            }
+            continue
+        if target.get("error"):
+            results[role] = {
+                "role": role,
+                "dir": target["dir"],
+                "path": target["path"],
+                "accessible": False,
+                "state": "failed",
+                "size": 0,
+                "sha256": "",
+                "error": str(target["error"]),
+            }
+            continue
+        results[role] = deposit_debrief_audio_to_dir(
+            target["dir"],
+            filename=name,
+            expected_size=fingerprint["size"],
+            expected_sha256=fingerprint["sha256"],
+            source_path=fingerprint["source_path"] or None,
+            payload=fingerprint["payload"],
+        )
+        results[role]["role"] = role
+
+    requested = [role for role in ("laptop", "nas", "pcfixe") if role in targets]
+    ok = bool(requested) and all(
+        results[role]["state"] in {"copied", "already_present"} for role in requested
+    )
+    return {
+        "ok": ok,
+        "filename": name,
+        "relative_dir": destinations["relative_dir"],
+        "size": fingerprint["size"],
+        "sha256": fingerprint["sha256"],
+        "targets": results,
+        "requested": requested,
+        "conflicts": [role for role in requested if results[role]["state"] == "conflict"],
+        "failed": [role for role in requested if results[role]["state"] == "failed"],
+        "destinations": destinations,
+    }
+
+def debrief_deposit_rows(deposit_result: dict) -> list[dict]:
+    """Lignes d'affichage d'un resultat de depot debrief (cible, etat, taille, sha256, erreur)."""
+    labels = {"laptop": "Laptop", "nas": "NAS", "pcfixe": "PC fixe"}
+    states = {
+        "copied": "copie",
+        "already_present": "deja present",
+        "conflict": "conflit",
+        "failed": "echec",
+        "skipped": "ignore",
+    }
+    rows: list[dict] = []
+    targets = (deposit_result or {}).get("targets") or {}
+    for role in ("laptop", "nas", "pcfixe"):
+        if role not in targets:
+            continue
+        row = dict(targets[role])
+        row["label"] = labels.get(role, role)
+        row["state_label"] = states.get(str(row.get("state") or ""), str(row.get("state") or ""))
+        rows.append(row)
+    return rows
+
 def build_debrief_audio_block(
     *,
     project_config: dict,
@@ -16582,10 +16993,15 @@ elif page == "Voxtral (ASR / CR)":
     )
     default_debrief_infos_path = asr_ctx.get("infos_path_effective", "") if asr_ctx else ""
     debrief_trans_dir = Path(default_debrief_infos_path).parent if default_debrief_infos_path else None
+    debrief_destinations = resolve_debrief_audio_destinations(
+        project_config=project_config,
+        affaire_id=affaire_id,
+        id_captation=selected_captation if selected_captation != "(aucune)" else "",
+    )
     canonical_debrief_audio_dir = (
-        AFFAIRES_ROOT / affaire_id / "AE_Expert_captations" / selected_captation / "debrief"
-        if affaire_id and selected_captation != "(aucune)"
-        else Path("")
+        Path(debrief_destinations["targets"]["laptop"]["dir"])
+        if debrief_destinations["ready"]
+        else None
     )
     canonical_debrief_csv_dir = (debrief_trans_dir / "debrief") if debrief_trans_dir else Path("")
 
@@ -16612,16 +17028,132 @@ elif page == "Voxtral (ASR / CR)":
             help="Déduit automatiquement depuis l’id_captation.",
         )
 
-    debrief_dir_path = st.text_input(
-        "Dossier debrief contenant les WAV",
-        value=str(canonical_debrief_audio_dir),
-        disabled=True,
-        key="voxtral_debrief_dir_path",
-        help="Choisir le dossier debrief de la captation ; les *.wav présents seront listés ci-dessous.",
+    debrief_dir_display = (
+        str(canonical_debrief_audio_dir)
+        if canonical_debrief_audio_dir
+        else "(sélectionner une affaire et une captation)"
     )
-    debrief_wav_candidates = _glob_existing_files(debrief_dir_path, ["*.wav", "*.WAV"]) if debrief_dir_path else []
+    st.text_input(
+        "Dossier debrief contenant les WAV",
+        value=debrief_dir_display,
+        disabled=True,
+        # La clé inclut affaire+captation : la valeur d'un widget à clé n'est appliquée
+        # qu'au premier rendu, donc une clé fixe figerait « . » pour toute la session et
+        # le dossier debrief resterait introuvable même après sélection de la captation.
+        key=f"voxtral_debrief_dir_path_{affaire_id}_{selected_captation}",
+        help="Dossier debrief canonique de la captation ; les WAV présents (laptop puis NAS) sont listés ci-dessous.",
+    )
+
+    st.markdown("#### Déposer un fichier de debrief")
+    st.caption(
+        "Le fichier est copié immédiatement sur le laptop, le NAS et le PC fixe, avec contrôle SHA256 : "
+        "aucune attente du sync périodique NAS ↔ PC fixe. La copie PC fixe est indispensable avant l'ASR."
+    )
+    if st.session_state.pop("voxtral_debrief_upload_reset", False):
+        st.session_state.pop("voxtral_debrief_upload", None)
+    uploaded_debrief = st.file_uploader(
+        "Fichier de debrief à déposer",
+        type=[extension.lstrip(".") for extension in DEBRIEF_AUDIO_UPLOAD_EXTENSIONS],
+        accept_multiple_files=False,
+        key="voxtral_debrief_upload",
+        help="Les destinations sont déduites de l'affaire et de la captation actives.",
+    )
+    debrief_deposit_notice = st.session_state.get("voxtral_debrief_deposit_notice")
+    if isinstance(debrief_deposit_notice, dict) and debrief_deposit_notice.get("message"):
+        debrief_notice_level = str(debrief_deposit_notice.get("level") or "error")
+        debrief_notice_message = str(debrief_deposit_notice["message"])
+        if debrief_notice_level == "success":
+            st.success(debrief_notice_message)
+        elif debrief_notice_level == "warning":
+            st.warning(debrief_notice_message)
+        else:
+            st.error(debrief_notice_message)
+        if debrief_deposit_notice.get("rows"):
+            st.dataframe(pd.DataFrame(debrief_deposit_notice["rows"]), width="stretch", hide_index=True)
+
+    if uploaded_debrief is not None:
+        debrief_upload_payload = uploaded_debrief.getvalue()
+        try:
+            debrief_upload_name = validate_debrief_audio_filename(uploaded_debrief.name)
+            debrief_upload_error = ""
+        except Exception as exc:
+            debrief_upload_name = ""
+            debrief_upload_error = str(exc)
+        debrief_upload_destinations = resolve_debrief_audio_destinations(
+            project_config=project_config,
+            affaire_id=affaire_id,
+            id_captation=selected_captation if selected_captation != "(aucune)" else "",
+            filename=debrief_upload_name or uploaded_debrief.name,
+        )
+        debrief_upload_sha256 = hashlib.sha256(debrief_upload_payload).hexdigest()
+        st.write(
+            f"**Fichier** : {uploaded_debrief.name} — {len(debrief_upload_payload):,} octets — "
+            f"SHA256 `{debrief_upload_sha256}`"
+        )
+        st.write(
+            f"**Affaire** : {affaire_id or '(aucune)'} — **Captation** : {selected_captation} — "
+            f"**Destination relative** : {debrief_upload_destinations['relative_dir'] or '(non résolue)'}"
+        )
+        st.dataframe(
+            pd.DataFrame(probe_debrief_audio_destinations(debrief_upload_destinations)),
+            width="stretch",
+            hide_index=True,
+        )
+        if debrief_upload_error:
+            st.error(f"Dépôt impossible : {debrief_upload_error}")
+        elif not debrief_upload_destinations["ready"]:
+            st.error("Sélectionner une affaire et une captation avant de déposer un fichier de debrief.")
+        elif st.button("Déposer le fichier de debrief", key="voxtral_debrief_deposit"):
+            debrief_deposit_result = deposit_debrief_audio(
+                project_config=project_config,
+                affaire_id=affaire_id,
+                id_captation=selected_captation,
+                payload=debrief_upload_payload,
+                filename=debrief_upload_name,
+            )
+            debrief_notice = {"rows": debrief_deposit_rows(debrief_deposit_result)}
+            if debrief_deposit_result["conflicts"]:
+                debrief_notice["level"] = "warning"
+                debrief_notice["message"] = (
+                    "Un fichier de même nom mais de contenu différent existe déjà. "
+                    "Aucun écrasement et aucun suffixe automatique : retirer ou renommer le "
+                    "fichier en conflit, puis redéposer."
+                )
+            elif debrief_deposit_result["ok"]:
+                debrief_notice["level"] = "success"
+                debrief_notice["message"] = (
+                    "Débrief déposé et vérifié (SHA256) : "
+                    + str(debrief_deposit_result["filename"])
+                    + " — cibles traitées : "
+                    + ", ".join(
+                        {"laptop": "laptop", "nas": "NAS", "pcfixe": "PC fixe"}.get(role, role)
+                        for role in debrief_deposit_result["requested"]
+                    )
+                )
+                st.session_state["voxtral_debrief_wav_select"] = debrief_deposit_result["filename"]
+                st.session_state["voxtral_debrief_upload_reset"] = True
+            else:
+                debrief_notice["level"] = "error"
+                debrief_notice["message"] = (
+                    "Dépôt incomplet : cible(s) en échec ("
+                    + (", ".join(debrief_deposit_result["failed"]) or "aucune cible")
+                    + "). Le fichier n'est pas exploitable en l'état pour l'ASR."
+                )
+            st.session_state["voxtral_debrief_deposit_notice"] = debrief_notice
+            st.rerun()
+
+    debrief_scan_dirs = debrief_audio_scan_dirs(debrief_destinations)
+    debrief_dir_path = str(debrief_scan_dirs[0]) if debrief_scan_dirs else debrief_dir_display
+    if debrief_scan_dirs:
+        st.caption("Dossiers debrief scannés : " + " ; ".join(str(item) for item in debrief_scan_dirs))
+    else:
+        st.caption("Aucun dossier debrief résolu pour cette captation.")
+    debrief_wav_candidates = list_debrief_audio_candidates(debrief_destinations)
     if debrief_wav_candidates:
-        debrief_wav_labels = [p.name for p in debrief_wav_candidates]
+        debrief_wav_labels = [path.name for path in debrief_wav_candidates]
+        stored_debrief_wav = st.session_state.get("voxtral_debrief_wav_select")
+        if stored_debrief_wav is not None and stored_debrief_wav not in debrief_wav_labels:
+            st.session_state.pop("voxtral_debrief_wav_select", None)
         selected_debrief_wav_label = st.selectbox(
             "WAV de debrief à transcrire",
             debrief_wav_labels,
