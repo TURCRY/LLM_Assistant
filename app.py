@@ -5252,6 +5252,433 @@ def documentary_cohort_context_id(context: dict, parent_document: str = "") -> s
     }
     return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:16]
 
+def documentary_cohort_stable_id(context: dict | None) -> str:
+    context = context or {}
+    return compact_spaces(
+        context.get("cohort_id")
+        or context.get("context_id")
+        or documentary_cohort_context_id(context)
+    )
+
+def documentary_cohort_context_from_record(record: dict, project_id: str) -> dict:
+    record = record or {}
+    return {
+        "affaire": record.get("affaire") or project_id,
+        "cohort_id": record.get("cohort_id") or record.get("context_id") or "",
+        "context_id": record.get("context_id") or record.get("cohort_id") or "",
+        "created_at": record.get("created_at"),
+        "date_transmission": record.get("date_transmission"),
+        "code_partie": record.get("code_partie"),
+        "nom_partie": record.get("nom_partie"),
+        "folder_rel": record.get("folder_rel") or "",
+        "avocat": record.get("avocat") or record.get("auteur_transmission") or "",
+        "auteur_transmission": record.get("auteur_transmission") or record.get("avocat") or "",
+        "files": record.get("files") or [],
+    }
+
+def restore_documentary_cohort_identity(context: dict, records: list[dict] | None) -> dict:
+    """Restaure l'identité persistante d'une transmission, indépendamment de sa liste de fichiers."""
+    context = dict(context or {})
+    expected = (
+        compact_spaces(context.get("affaire") or ""),
+        party_code(context.get("code_partie") or ""),
+        compact_spaces(context.get("date_transmission") or ""),
+        compact_spaces(context.get("auteur_transmission") or context.get("avocat") or "").casefold(),
+    )
+    matches = []
+    for record in records or []:
+        actual = (
+            compact_spaces(record.get("affaire") or ""),
+            party_code(record.get("code_partie") or ""),
+            compact_spaces(record.get("date_transmission") or ""),
+            compact_spaces(record.get("auteur_transmission") or record.get("avocat") or "").casefold(),
+        )
+        persistent_id = compact_spaces(record.get("cohort_id") or "")
+        if actual == expected and persistent_id:
+            matches.append(record)
+    if matches:
+        context["cohort_id"] = compact_spaces(matches[-1].get("cohort_id") or "")
+    return context
+
+def split_manifest_path(split_dir: str | Path, context: dict | None) -> Path:
+    cohort_id = documentary_cohort_stable_id(context)
+    safe_id = re.sub(r"[^A-Za-z0-9._-]+", "_", cohort_id).strip("._-") or "cohorte"
+    return Path(split_dir) / f"_split_manifest_{safe_id}.json"
+
+def load_split_manifest(split_dir: str | Path, context: dict | None) -> dict:
+    path = split_manifest_path(split_dir, context)
+    if not path.is_file():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if compact_spaces(data.get("cohort_id") or "") != documentary_cohort_stable_id(context):
+        return {}
+    return data
+
+def split_manifest_parent_key(parent_document: str) -> str:
+    normalized = unicodedata.normalize("NFKC", Path(str(parent_document or "")).name).casefold().strip()
+    return hashlib.sha1(normalized.encode("utf-8", errors="ignore")).hexdigest()[:20]
+
+def split_manifest_parent_name(parent_document: str, *, strip_document_prefix: bool = False) -> str:
+    name = unicodedata.normalize("NFKC", Path(str(parent_document or "")).name).casefold().strip()
+    if strip_document_prefix:
+        name = re.sub(r"^\d+\s+", "", name).strip()
+    return name
+
+def resolve_split_manifest_parent(
+    manifest: dict,
+    parent_document: str,
+    parent_sha256: str = "",
+    *,
+    scope: str = "current",
+) -> dict:
+    """Résout un parent par nom exact, puis par alias numérique prouvé par SHA256."""
+    requested_name = Path(str(parent_document or "")).name
+    requested_normalized = split_manifest_parent_name(requested_name)
+    requested_alias = split_manifest_parent_name(requested_name, strip_document_prefix=True)
+    requested_sha = compact_spaces(parent_sha256 or "").casefold()
+    exact_candidates = []
+    alias_candidates = []
+    sha_conflicts = []
+    for parent_key, raw_parent in (manifest.get("parents") or {}).items():
+        parent = dict(raw_parent or {})
+        candidate_name = Path(str(parent.get("parent_document") or "")).name
+        candidate_normalized = split_manifest_parent_name(candidate_name)
+        candidate_sha = compact_spaces(parent.get("parent_sha256") or "").casefold()
+        candidate = {"parent_key": parent_key, "parent": parent}
+        if candidate_normalized == requested_normalized:
+            if requested_sha and candidate_sha and requested_sha != candidate_sha:
+                sha_conflicts.append(candidate_name)
+            else:
+                exact_candidates.append(candidate)
+            continue
+        if split_manifest_parent_name(candidate_name, strip_document_prefix=True) == requested_alias:
+            if requested_sha and candidate_sha and requested_sha == candidate_sha:
+                alias_candidates.append(candidate)
+            elif requested_sha or candidate_sha:
+                sha_conflicts.append(candidate_name)
+
+    candidates = exact_candidates if exact_candidates else alias_candidates
+    if len(candidates) != 1:
+        return {
+            "parent_document": requested_name,
+            "matched": False,
+            "ambiguous": len(candidates) > 1,
+            "candidate_count": len(candidates),
+            "sha_conflicts": sha_conflicts,
+        }
+    result = candidates[0]
+    result.update({
+        "parent_document": requested_name,
+        "manifest_parent_document": Path(str(result["parent"].get("parent_document") or "")).name,
+        "matched": True,
+        "ambiguous": False,
+        "candidate_count": 1,
+        "matched_by": (
+            "exact_name"
+            if exact_candidates
+            else f"sha256_alias_{'historical' if scope == 'historical' else 'current'}"
+        ),
+        "sha_conflicts": sha_conflicts,
+    })
+    return result
+
+def reconcile_fragmented_split_manifests(
+    split_dir: str | Path,
+    context: dict,
+    parent_documents: list[str],
+    parent_source_dir: str | Path,
+) -> dict:
+    """Fusionne les parents manquants d'une même transmission quand l'identité est certaine."""
+    split_dir = Path(split_dir)
+    current_path = split_manifest_path(split_dir, context)
+    current = load_split_manifest(split_dir, context)
+    diagnostic = {"recovered": [], "ambiguous": [], "not_found": []}
+    if not current:
+        return diagnostic
+
+    target_affaire = compact_spaces((context or {}).get("affaire") or current.get("affaire") or "")
+    target_code = party_code((context or {}).get("code_partie") or current.get("code_partie") or "")
+    target_date = compact_spaces((context or {}).get("date_transmission") or current.get("date_transmission") or "")
+    other_manifests = []
+    for path in sorted(split_dir.glob("_split_manifest_*.json")) if split_dir.is_dir() else []:
+        if path == current_path:
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if compact_spaces(data.get("affaire") or "") != target_affaire:
+            continue
+        if party_code(data.get("code_partie") or "") != target_code:
+            continue
+        if compact_spaces(data.get("date_transmission") or "") != target_date:
+            continue
+        other_manifests.append((path, data))
+
+    additions = []
+    for requested in parent_documents or []:
+        requested_name = Path(str(requested or "")).name
+        requested_path = Path(parent_source_dir) / requested_name
+        requested_sha = sha256_file(requested_path) if requested_path.is_file() else ""
+        current_match = resolve_split_manifest_parent(current, requested_name, requested_sha, scope="current")
+        if current_match.get("matched"):
+            continue
+        if current_match.get("ambiguous"):
+            diagnostic["ambiguous"].append({
+                "parent_document": requested_name,
+                "candidate_count": current_match.get("candidate_count", 0),
+                "reason": "correspondance_ambigue_manifest_courant",
+            })
+            continue
+        if current_match.get("sha_conflicts"):
+            diagnostic["not_found"].append({
+                "parent_document": requested_name,
+                "candidate_count": 0,
+                "reason": "sha256_parent_divergent_manifest_courant",
+                "manifest_parent_documents": current_match.get("sha_conflicts") or [],
+            })
+            continue
+        candidates = []
+        for source_path, source_manifest in other_manifests:
+            historical_match = resolve_split_manifest_parent(
+                source_manifest, requested_name, requested_sha, scope="historical"
+            )
+            if historical_match.get("matched"):
+                candidates.append((source_path, historical_match))
+            elif historical_match.get("ambiguous"):
+                candidates.extend((source_path, historical_match) for _ in range(2))
+        if len(candidates) != 1:
+            item = {
+                "parent_document": requested_name,
+                "candidate_count": len(candidates),
+                "reason": "correspondance_ambigue" if len(candidates) > 1 else "aucun_manifest_compatible",
+            }
+            diagnostic["ambiguous" if len(candidates) > 1 else "not_found"].append(item)
+            continue
+        source_path, historical_match = candidates[0]
+        recovered_parent = dict(historical_match["parent"])
+        additions.append((recovered_parent, source_path, historical_match["matched_by"], requested_name))
+
+    if additions:
+        parents = current.setdefault("parents", {})
+        for parent, source_path, matched_by, requested_name in additions:
+            manifest_parent_name = Path(str(parent.get("parent_document") or "")).name
+            parents[split_manifest_parent_key(manifest_parent_name)] = parent
+            diagnostic["recovered"].append({
+                "parent_document": requested_name,
+                "manifest_parent_document": manifest_parent_name,
+                "source_manifest": str(source_path),
+                "matched_by": matched_by,
+                "alias_documentaire": matched_by == "sha256_alias_historical",
+            })
+        current["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        temp_path = current_path.with_name(f"{current_path.name}.{uuid.uuid4().hex}.tmp")
+        temp_path.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(current_path)
+    return diagnostic
+
+def piece_number_range_from_parent_filename(parent_document: str) -> tuple[int, int] | None:
+    text = unicodedata.normalize("NFKD", Path(str(parent_document or "")).stem)
+    text = text.encode("ascii", "ignore").decode("ascii")
+    match = re.search(r"(?i)pieces?\s*(?:n\s*[o°]?\s*)?(\d+)\s*(?:a|au|-)\s*(\d+)", text)
+    if not match:
+        return None
+    start, end = int(match.group(1)), int(match.group(2))
+    return (min(start, end), max(start, end))
+
+def upsert_split_manifest(
+    split_dir: str | Path,
+    context: dict,
+    affaire: str,
+    parent_document: str,
+    parent_path: str | Path,
+    pieces: list[dict],
+    created_files: list[str | Path],
+) -> dict:
+    split_dir = Path(split_dir)
+    split_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = split_manifest_path(split_dir, context)
+    manifest = load_split_manifest(split_dir, context) or {
+        "schema_version": 1,
+        "affaire": compact_spaces(affaire or (context or {}).get("affaire") or ""),
+        "cohort_id": documentary_cohort_stable_id(context),
+        "context_id": compact_spaces((context or {}).get("context_id") or ""),
+        "code_partie": party_code((context or {}).get("code_partie") or ""),
+        "date_transmission": compact_spaces((context or {}).get("date_transmission") or ""),
+        "auteur_transmission": compact_spaces(
+            (context or {}).get("auteur_transmission") or (context or {}).get("avocat") or ""
+        ),
+        "parents": {},
+    }
+    parents = manifest.setdefault("parents", {})
+    created_by_name = {Path(str(path)).name.casefold(): Path(str(path)) for path in created_files or []}
+    children = []
+    for piece in pieces or []:
+        filename = Path(str(piece.get("filename") or piece.get("nom_cible") or "")).name
+        child_path = created_by_name.get(filename.casefold())
+        numero_piece = coerce_editor_int(piece.get("numero_piece") or piece.get("numero"))
+        if not filename or child_path is None or numero_piece is None:
+            continue
+        children.append({
+            "numero_piece": numero_piece,
+            "sous_piece": compact_spaces(piece.get("sous_piece") or ""),
+            "piece_ref_style": piece.get("piece_ref_style") or "",
+            "start_page": coerce_editor_int(piece.get("start_page") or piece.get("page_debut")),
+            "end_page": coerce_editor_int(piece.get("end_page") or piece.get("page_fin")),
+            "title_at_split": compact_spaces(piece.get("title") or piece.get("libelle_final") or ""),
+            "filename": filename,
+            "sha256": sha256_file(child_path) if child_path.is_file() else "",
+        })
+    if len(children) != len(pieces or []):
+        raise ValueError("Manifest non écrit : tous les enfants du split réel ne sont pas vérifiables.")
+    parent_name = Path(str(parent_document or "")).name
+    parent_file = Path(str(parent_path or ""))
+    parents[split_manifest_parent_key(parent_name)] = {
+        "parent_document": parent_name,
+        "parent_sha256": sha256_file(parent_file) if parent_file.is_file() else "",
+        "expected_child_count": len(pieces or []),
+        "children": children,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    manifest["updated_at"] = datetime.now().isoformat(timespec="seconds")
+    temp_path = manifest_path.with_name(f"{manifest_path.name}.{uuid.uuid4().hex}.tmp")
+    temp_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(manifest_path)
+    return {"path": str(manifest_path), "manifest": manifest}
+
+def split_manifest_parent_statuses(
+    manifest: dict,
+    split_dir: str | Path,
+    parent_documents: list[str] | None = None,
+    parent_source_dir: str | Path | None = None,
+) -> list[dict]:
+    resolved_parents = []
+    if parent_documents:
+        for requested in dict.fromkeys(Path(str(name)).name for name in parent_documents if Path(str(name)).name):
+            requested_path = Path(parent_source_dir) / requested if parent_source_dir is not None else None
+            requested_sha = sha256_file(requested_path) if requested_path is not None and requested_path.is_file() else ""
+            resolution = resolve_split_manifest_parent(manifest, requested, requested_sha, scope="current")
+            if resolution.get("matched"):
+                resolved_parents.append((requested, resolution["parent"], resolution))
+    else:
+        for parent in (manifest.get("parents") or {}).values():
+            parent_name = Path(str((parent or {}).get("parent_document") or "")).name
+            resolved_parents.append((parent_name, parent, {
+                "manifest_parent_document": parent_name,
+                "matched_by": "exact_name",
+            }))
+    statuses = []
+    for parent_name, parent, resolution in resolved_parents:
+        children = []
+        missing = []
+        for child in (parent or {}).get("children") or []:
+            item = dict(child or {})
+            child_path = Path(split_dir) / Path(str(item.get("filename") or "")).name
+            item["path"] = str(child_path)
+            item["exists"] = child_path.is_file()
+            expected_sha256 = compact_spaces(item.get("sha256") or "")
+            item["sha256_matches"] = (
+                not expected_sha256
+                or (item["exists"] and sha256_file(child_path) == expected_sha256)
+            )
+            children.append(item)
+            if not item["exists"] or not item["sha256_matches"]:
+                missing.append(item.get("filename") or "")
+        expected_count = int((parent or {}).get("expected_child_count") or len(children))
+        statuses.append({
+            "parent_document": parent_name,
+            "manifest_parent_document": resolution.get("manifest_parent_document") or parent_name,
+            "matched_by": resolution.get("matched_by") or "exact_name",
+            "parent_sha256": (parent or {}).get("parent_sha256") or "",
+            "expected_child_count": expected_count,
+            "existing_child_count": sum(1 for child in children if child.get("exists")),
+            "complete": len(children) == expected_count and not missing,
+            "missing": missing,
+            "children": children,
+        })
+    return statuses
+
+def migrate_unmanifested_split_parents(
+    split_dir: str | Path,
+    parent_source_dir: str | Path,
+    context: dict,
+    affaire: str,
+    parent_documents: list[str],
+) -> dict:
+    """Adopte prudemment les anciens splits lorsque le parent annonce une plage numérique complète."""
+    split_dir = Path(split_dir)
+    ranges = {
+        Path(str(parent)).name: piece_number_range_from_parent_filename(parent)
+        for parent in parent_documents or []
+    }
+    valid_ranges = {name: value for name, value in ranges.items() if value is not None}
+    overlapping = set()
+    names = list(valid_ranges)
+    for idx, left_name in enumerate(names):
+        left = valid_ranges[left_name]
+        for right_name in names[idx + 1:]:
+            right = valid_ranges[right_name]
+            if max(left[0], right[0]) <= min(left[1], right[1]):
+                overlapping.update({left_name, right_name})
+    candidates_by_number: dict[int, list[Path]] = {}
+    for path in split_dir.glob("*.pdf") if split_dir.is_dir() else []:
+        details = detect_piece_ref_details_from_filename(path.name)
+        numero = coerce_editor_int(details.get("numero_piece"))
+        if numero is not None:
+            candidates_by_number.setdefault(numero, []).append(path)
+    migrated, rejected = [], []
+    for parent_name, number_range in valid_ranges.items():
+        if parent_name in overlapping:
+            rejected.append({"parent_document": parent_name, "reason": "plage_numerique_chevauchante"})
+            continue
+        start, end = number_range
+        selected = []
+        for numero in range(start, end + 1):
+            candidates = candidates_by_number.get(numero) or []
+            if len(candidates) != 1:
+                selected = []
+                rejected.append({
+                    "parent_document": parent_name,
+                    "reason": "plage_incomplete_ou_ambigue",
+                    "numero_piece": numero,
+                    "candidate_count": len(candidates),
+                })
+                break
+            selected.append((numero, candidates[0]))
+        if not selected:
+            continue
+        next_page = 1
+        pieces, created_files = [], []
+        for numero, child_path in selected:
+            page_count = coerce_editor_int(file_page_count_record(child_path).get("page_count")) or 1
+            pieces.append({
+                "numero": numero,
+                "start_page": next_page,
+                "end_page": next_page + page_count - 1,
+                "filename": child_path.name,
+                "title": fallback_piece_title_from_filename(child_path.name, numero) or child_path.stem,
+            })
+            created_files.append(str(child_path))
+            next_page += page_count
+        upsert_split_manifest(
+            split_dir,
+            context,
+            affaire,
+            parent_name,
+            Path(parent_source_dir) / parent_name,
+            pieces,
+            created_files,
+        )
+        migrated.append(parent_name)
+    return {"migrated": migrated, "rejected": rejected}
+
 def documentary_cohort_widget_suffix(context: dict | None) -> str:
     context = context or {}
     return compact_spaces(context.get("context_id") or documentary_cohort_context_id(context) or "no_cohort")
@@ -5282,6 +5709,7 @@ def cohort_dependent_session_keys(project_id: str) -> list[str]:
         "ingestion_bcp",
         "ingestion_pieces",
         "ingestion_multi_pdf",
+        "ingestion_multi_pdfs",
         "ingestion_other_docs",
         "ingestion_mapping_rows",
         "ingestion_split_rows",
@@ -5368,7 +5796,7 @@ def expected_split_child_filenames(rows: list[dict], title_lookup: dict[str, str
     expected = set()
     for row in rows or []:
         item = dict(row or {})
-        for key in ("filename", "fichier_sortie", "fichier_source", "nom_cible_propose"):
+        for key in ("filename", "fichier_sortie", "fichier_source", "nom_cible", "nom_cible_propose"):
             name = Path(str(item.get(key) or "")).name
             if name:
                 expected.add(name.lower())
@@ -20166,6 +20594,7 @@ elif page == "Pré-traitement dépôt PDF":
         key=f"pdf_cohort_uploads_{project_id}",
     )
     cohort_file_names = [Path(f.name).name for f in cohort_uploads] if cohort_uploads else []
+    saved_cohortes = load_depot_cohorte_records(aff_root_local, project_config)
     selected_cohort_context = documentary_cohort_context(
         project_id,
         selected_cohort_party,
@@ -20173,31 +20602,23 @@ elif page == "Pré-traitement dépôt PDF":
         cohort_attorney,
         cohort_file_names,
     )
+    selected_cohort_context = restore_documentary_cohort_identity(selected_cohort_context, saved_cohortes)
     cohort_sync = sync_documentary_cohort_session(st.session_state, project_id, selected_cohort_context)
     if cohort_sync.get("changed"):
         st.info("Contexte de cohorte modifié : les états dérivés de l'ancienne transmission ont été réinitialisés.")
     if cohort_file_names:
         st.session_state[f"pdf_current_cohort_{project_id}"] = {
             **selected_cohort_context,
-            "cohort_id": selected_cohort_context.get("context_id"),
+            "cohort_id": documentary_cohort_stable_id(selected_cohort_context),
             "files": cohort_file_names,
             "uploads": {Path(f.name).name: f for f in cohort_uploads},
         }
         st.success(f"Cohorte courante : {len(cohort_file_names)} fichier(s). Aucun code expert attribué à ce stade.")
     current_pdf_cohort = st.session_state.get(f"pdf_current_cohort_{project_id}", {})
     if not current_pdf_cohort:
-        saved_cohortes = load_depot_cohorte_records(aff_root_local, project_config)
         if saved_cohortes:
             last_cohort = saved_cohortes[-1]
-            current_pdf_cohort = {
-                "cohort_id": last_cohort.get("cohort_id"),
-                "created_at": last_cohort.get("created_at"),
-                "date_transmission": last_cohort.get("date_transmission"),
-                "code_partie": last_cohort.get("code_partie"),
-                "nom_partie": last_cohort.get("nom_partie"),
-                "avocat": last_cohort.get("avocat"),
-                "files": last_cohort.get("files") or [],
-            }
+            current_pdf_cohort = documentary_cohort_context_from_record(last_cohort, project_id)
             st.session_state[f"pdf_current_cohort_{project_id}"] = current_pdf_cohort
     if cohort_uploads and st.button("Enregistrer la cohorte dans Depot_initial", key=f"pdf_save_current_cohort_{project_id}"):
         depot_initial_dir = Path(pj(aff_root_local, "AA_Expert_Admin", "Depot_initial"))
@@ -20207,7 +20628,11 @@ elif page == "Pré-traitement dépôt PDF":
             safe_name = Path(file_obj.name).name
             (depot_initial_dir / safe_name).write_bytes(file_obj.getvalue())
             saved_names.append(safe_name)
-        cohort_id = f"{project_id}_{datetime.now():%Y%m%d_%H%M%S}"
+        cohort_id = (
+            current_pdf_cohort.get("cohort_id")
+            or current_pdf_cohort.get("context_id")
+            or documentary_cohort_context_id({**current_pdf_cohort, "files": saved_names})
+        )
         current_pdf_cohort = {
             **current_pdf_cohort,
             "cohort_id": cohort_id,
@@ -20220,11 +20645,14 @@ elif page == "Pré-traitement dépôt PDF":
             "event": "cohorte_depot_provisoire",
             "affaire": project_id,
             "cohort_id": cohort_id,
+            "context_id": current_pdf_cohort.get("context_id"),
             "created_at": current_pdf_cohort.get("created_at"),
             "date_transmission": current_pdf_cohort.get("date_transmission"),
             "code_partie": current_pdf_cohort.get("code_partie"),
             "nom_partie": current_pdf_cohort.get("nom_partie"),
+            "folder_rel": current_pdf_cohort.get("folder_rel"),
             "avocat": current_pdf_cohort.get("avocat"),
+            "auteur_transmission": current_pdf_cohort.get("auteur_transmission") or current_pdf_cohort.get("avocat"),
             "files": saved_names,
             "note": "Dépôt provisoire; aucun code expert attribué.",
         })
@@ -21979,17 +22407,16 @@ elif page == "Pré-traitement dépôt PDF":
 
     # Dossier dépôt initial (côté Laptop)
     depot_dir = pj(aff_root_local, "AA_Expert_Admin", "Depot_initial")
-    selected_multi_pdf_name = st.session_state.get("ingestion_multi_pdf") or ""
+    selected_multi_pdf_names = list(st.session_state.get("ingestion_multi_pdfs") or [])
+    legacy_selected_multi_pdf_name = st.session_state.get("ingestion_multi_pdf") or ""
+    if not selected_multi_pdf_names and legacy_selected_multi_pdf_name and legacy_selected_multi_pdf_name != "(aucun)":
+        selected_multi_pdf_names = [legacy_selected_multi_pdf_name]
     cohort_pdf_names = [
         Path(name).name
         for name in (current_pdf_cohort.get("files") or [])
         if Path(name).suffix.lower() == ".pdf"
     ]
-    guided_pdf_names = (
-        [Path(selected_multi_pdf_name).name]
-        if selected_multi_pdf_name and selected_multi_pdf_name != "(aucun)"
-        else cohort_pdf_names
-    )
+    guided_pdf_names = [Path(name).name for name in selected_multi_pdf_names] or cohort_pdf_names
     pdfs = [
         Path(depot_dir) / name
         for name in dict.fromkeys(guided_pdf_names)
@@ -21999,7 +22426,33 @@ elif page == "Pré-traitement dépôt PDF":
     if not pdfs:
         st.info("Aucun PDF disponible dans la cohorte courante pour la découpe guidée.")
     else:
-        sel = st.selectbox("Choisir un PDF à découper", [p.name for p in pdfs], key=f"guided_split_pdf_select_{project_id}")
+        guided_split_dir_unc = str(
+            Path(pcfixe_unc_root_for_laptop(project_config, get_project_id(project_config, "")))
+            / "AD_Expert_Traitements"
+            / "_Splits"
+        )
+        guided_manifest = load_split_manifest(guided_split_dir_unc, current_pdf_cohort)
+        guided_status_by_parent = {
+            status["parent_document"].casefold(): status
+            for status in split_manifest_parent_statuses(
+                guided_manifest, guided_split_dir_unc, [p.name for p in pdfs], depot_dir
+            )
+        }
+        def _guided_parent_label(name: str) -> str:
+            status = guided_status_by_parent.get(Path(name).name.casefold())
+            if not status:
+                return f"{name} — à découper"
+            marker = "✓" if status.get("complete") else "incomplet"
+            return (
+                f"{name} — {marker} {status.get('existing_child_count', 0)}/"
+                f"{status.get('expected_child_count', 0)} enfants créés"
+            )
+        sel = st.selectbox(
+            "Choisir un PDF à découper",
+            [p.name for p in pdfs],
+            format_func=_guided_parent_label,
+            key=f"guided_split_pdf_select_{project_id}",
+        )
         this_pdf = next(p for p in pdfs if p.name == sel)
         guided_page_meta = file_page_count_record(this_pdf)
         guided_total_pages = guided_page_meta.get("page_count") if guided_page_meta.get("page_count_source") == "pdf_metadata" else None
@@ -22200,13 +22653,12 @@ elif page == "Pré-traitement dépôt PDF":
         
 
         # Options d’exécution
-        col_opt = st.columns(3)
+        col_opt = st.columns(2)
         with col_opt[0]:
             do_dry = st.checkbox("Simulation (dry-run)", value=True, key=f"guided_split_dry_run_{project_id}")
         with col_opt[1]:
             rename_prefix = st.text_input("Préfixe n° avocat", value="PIECE", key=f"batch_guided_prefix_avocat_{project_id}")
-        with col_opt[2]:
-            strategy = st.selectbox("Stratégie de numérotation", ["global", "triplet"], index=0, key=f"guided_split_strategy_{project_id}")
+        strategy = "global"
 
         # Empiler dans un batch guidé
         if "guided_jobs" not in st.session_state:
@@ -22218,7 +22670,7 @@ elif page == "Pré-traitement dépôt PDF":
             "code_partie": guided_code_partie,
             "numero_avocat_prefix": (rename_prefix or "PIECE").strip(),
             "strategy": strategy,
-            "state": {"last_global": 0} if strategy == "global" else {"prefix": "1", "last_suffix": "00"},
+            "state": {"last_global": 0},
             "pieces": pieces,
             "output_dir_nas": output_dir_nas,
             "mirror_to_nas": True,
@@ -22305,6 +22757,21 @@ elif page == "Pré-traitement dépôt PDF":
                 "created_files": created_files,
                 "response": technical_response,
             }
+            if not dry_run and result["ok"] and len(created_files) == len(pieces):
+                try:
+                    manifest_result = upsert_split_manifest(
+                        output_dir_unc,
+                        current_pdf_cohort,
+                        guided_aff_id,
+                        this_pdf.name,
+                        source_unc,
+                        pieces,
+                        created_files,
+                    )
+                    result["split_manifest_path"] = manifest_result.get("path")
+                except Exception as exc:
+                    result["ok"] = False
+                    result["split_manifest_error"] = str(exc)
             st.session_state[guided_split_result_key] = result
             if not result["ok"]:
                 st.error("Le serveur n’a pas validé le split.")
@@ -22318,6 +22785,15 @@ elif page == "Pré-traitement dépôt PDF":
                     "ne sont pas encore visibles depuis le laptop."
                 )
 
+        selected_parent_status = guided_status_by_parent.get(this_pdf.name.casefold()) or {}
+        selected_parent_already_split = bool(selected_parent_status.get("complete"))
+        if selected_parent_already_split:
+            st.success(
+                "Déjà découpé — "
+                f"{selected_parent_status.get('existing_child_count', 0)}/"
+                f"{selected_parent_status.get('expected_child_count', 0)} enfants présents"
+            )
+
         immediate_cols = st.columns(2)
         with immediate_cols[0]:
             if st.button(
@@ -22330,12 +22806,14 @@ elif page == "Pré-traitement dépôt PDF":
                 "Exécuter le split réel et créer les fichiers enfants",
                 key=f"guided_split_execute_selected_{project_id}",
                 type="primary",
+                disabled=selected_parent_already_split,
             ):
                 run_guided_split_now(dry_run=False)
 
         immediate_result = st.session_state.get(guided_split_result_key) or {}
         if (
             immediate_result
+            and not selected_parent_already_split
             and immediate_result.get("parent_pdf") == this_pdf.name
             and _norm(immediate_result.get("output_dir_pcfixe")) == _norm(out_dir_pc)
         ):
@@ -22789,10 +23267,41 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             bcp_name = st.selectbox("BCP", ["(aucun)"] + source_file_labels, key="ingestion_bcp")
         with col_ing_2:
             piece_names = st.multiselect("Fichiers de pièces", file_labels, key="ingestion_pieces")
-            multi_pdf_name = st.selectbox("PDF unique multi-pièces", ["(aucun)"] + file_labels, key="ingestion_multi_pdf")
+            legacy_multi_pdf_default = st.session_state.get("ingestion_multi_pdf") or ""
+            classification_split_dir_unc = str(
+                Path(pcfixe_unc_root_for_laptop(project_config, get_project_id(project_config, "")))
+                / "AD_Expert_Traitements"
+                / "_Splits"
+            )
+            persisted_parent_defaults = [
+                status.get("parent_document")
+                for status in split_manifest_parent_statuses(
+                    load_split_manifest(classification_split_dir_unc, current_pdf_cohort),
+                    classification_split_dir_unc,
+                    file_labels,
+                    depot_dir,
+                )
+                if status.get("parent_document") in file_labels
+            ]
+            multi_pdf_defaults = list(dict.fromkeys([
+                *persisted_parent_defaults,
+                *(
+                    [legacy_multi_pdf_default]
+                    if legacy_multi_pdf_default in file_labels and legacy_multi_pdf_default != "(aucun)"
+                    else []
+                ),
+            ]))
+            multi_pdf_names = st.multiselect(
+                "PDF multi-pièces parents",
+                file_labels,
+                default=multi_pdf_defaults,
+                key="ingestion_multi_pdfs",
+                help="Tous ces PDF sont des conteneurs techniques de la même cohorte et ne seront pas classés comme documents finaux.",
+            )
+            multi_pdf_name = multi_pdf_names[0] if multi_pdf_names else "(aucun)"
     
         assigned_for_other = {
-            name for name in [dire_name, bcp_name, multi_pdf_name, *piece_names]
+            name for name in [dire_name, bcp_name, *multi_pdf_names, *piece_names]
             if name and name != "(aucun)"
         }
         other_options = [name for name in file_labels if name not in assigned_for_other]
@@ -22923,13 +23432,13 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 / "AD_Expert_Traitements"
                 / "_Splits"
             )
-            parent_pdf_name = multi_pdf_name if multi_pdf_name != "(aucun)" else ""
+            parent_pdf_names = [Path(name).name for name in multi_pdf_names if Path(name).name]
             source_rows = (
                 st.session_state.get("ingestion_manual_split_rows_current")
                 or st.session_state.get("ingestion_manual_split_rows")
                 or current_split_table_rows()
             )
-            if not parent_pdf_name:
+            if not parent_pdf_names:
                 return {
                     "dossier_splits_scanné": split_dir_unc,
                     "nombre_fichiers_trouvés": 0,
@@ -22955,77 +23464,205 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 if normalized_numero is not None
             )
 
+            split_context_code = _normalized_documentary_code((ingestion_party or {}).get("code_partie"))
+            split_context_id = documentary_cohort_context_id(current_pdf_cohort or {}, "")
+            manifest = load_split_manifest(split_dir_unc, current_pdf_cohort)
+            migration_diag = {}
+            if not manifest:
+                try:
+                    migration_diag = migrate_unmanifested_split_parents(
+                        split_dir_unc,
+                        Path(pcfixe_unc_root_for_laptop(project_config, get_project_id(project_config, "")))
+                        / "AA_Expert_Admin"
+                        / "Depot_initial",
+                        current_pdf_cohort,
+                        get_project_id(project_config, ""),
+                        parent_pdf_names,
+                    )
+                    manifest = load_split_manifest(split_dir_unc, current_pdf_cohort)
+                except Exception as exc:
+                    migration_diag = {"error": str(exc)}
+            reconciliation_diag = {}
+            if manifest:
+                try:
+                    reconciliation_diag = reconcile_fragmented_split_manifests(
+                        split_dir_unc,
+                        current_pdf_cohort,
+                        parent_pdf_names,
+                        Path(pcfixe_unc_root_for_laptop(project_config, get_project_id(project_config, "")))
+                        / "AA_Expert_Admin"
+                        / "Depot_initial",
+                    )
+                    manifest = load_split_manifest(split_dir_unc, current_pdf_cohort)
+                except Exception as exc:
+                    reconciliation_diag = {"error": str(exc)}
+            guided_result = st.session_state.get(f"guided_split_immediate_result_{project_id}") or {}
+            if (
+                not manifest
+                and guided_result.get("ok")
+                and not guided_result.get("dry_run")
+                and Path(str(guided_result.get("parent_pdf") or "")).name in parent_pdf_names
+                and guided_result.get("created_files")
+            ):
+                recovered_pieces = []
+                for row in guided_result.get("pieces") or []:
+                    pages = str((row or {}).get("pages") or "").split("-", 1)
+                    recovered_pieces.append({
+                        "numero_piece": (row or {}).get("numero_piece"),
+                        "filename": (row or {}).get("nom_cible"),
+                        "start_page": coerce_editor_int(pages[0]) if pages else None,
+                        "end_page": coerce_editor_int(pages[1]) if len(pages) > 1 else None,
+                    })
+                try:
+                    upsert_split_manifest(
+                        split_dir_unc,
+                        current_pdf_cohort,
+                        get_project_id(project_config, ""),
+                        guided_result.get("parent_pdf") or "",
+                        guided_result.get("input_path_unc") or "",
+                        recovered_pieces,
+                        guided_result.get("created_files") or [],
+                    )
+                    manifest = load_split_manifest(split_dir_unc, current_pdf_cohort)
+                except Exception:
+                    pass
+            manifest_statuses = split_manifest_parent_statuses(
+                manifest,
+                split_dir_unc,
+                parent_pdf_names,
+                Path(pcfixe_unc_root_for_laptop(project_config, get_project_id(project_config, "")))
+                / "AA_Expert_Admin"
+                / "Depot_initial",
+            )
+            manifest_by_parent = {status["parent_document"].casefold(): status for status in manifest_statuses}
+            rows = []
+            parent_statuses = []
+            for parent_pdf_name in parent_pdf_names:
+                status = manifest_by_parent.get(parent_pdf_name.casefold())
+                if status:
+                    parent_statuses.append(status)
+                    for child in status.get("children") or []:
+                        if not child.get("exists"):
+                            continue
+                        numero_piece = coerce_editor_int(child.get("numero_piece"))
+                        if numero_piece is None:
+                            continue
+                        sous_piece = compact_spaces(child.get("sous_piece") or "")
+                        piece_ref_style = child.get("piece_ref_style") or ""
+                        child_path = Path(str(child.get("path") or ""))
+                        libelle = compact_spaces(
+                            piece_title_lookup_get(title_lookup, numero_piece, sous_piece, piece_ref_style, allow_parent_fallback=False)
+                            or child.get("title_at_split")
+                            or fallback_piece_title_from_filename(child_path.name, numero_piece, sous_piece, piece_ref_style)
+                            or child_path.stem
+                        )
+                        rows.append({
+                            "fichier_source": child_path.name,
+                            "numero_piece": numero_piece,
+                            "sous_piece": sous_piece,
+                            "reference_piece": piece_reference_piece(numero_piece, sous_piece, piece_ref_style),
+                            "piece_ref_style": piece_ref_style,
+                            "libelle_ocr": libelle,
+                            "nom_cible_propose": f"PIECE n°{piece_reference_piece(numero_piece, sous_piece, piece_ref_style)} {sanitize_filename(libelle)}.pdf",
+                            "action": "classer",
+                            "origine": "manifest_split_pdf_multi_pieces",
+                            "parent_source": parent_pdf_name,
+                            "pages_source": f"{child.get('start_page') or ''}-{child.get('end_page') or ''}".strip("-"),
+                            "chemin_source": str(child_path),
+                        })
+
+            # Compatibilité des dossiers historiques : le matching par nom ne reste autorisé
+            # que pour une cohorte sans manifest et avec un seul parent déclaré.
             found_files = []
             selected_by_number = {}
             ambiguous_by_number = {}
-            split_context_code = _normalized_documentary_code((ingestion_party or {}).get("code_partie"))
-            split_context_id = documentary_cohort_context_id(current_pdf_cohort or {}, parent_pdf_name)
             filter_diag = {}
-            try:
-                found_files = [path for path in Path(split_dir_unc).glob("*.pdf") if path.is_file()]
-                found_files, filter_diag = filter_split_child_paths_for_current_context(
-                    found_files,
-                    source_rows,
-                    title_lookup,
-                    parent_pdf_name,
-                )
-                candidates_by_number = {}
-                for path in found_files:
+            if not manifest and len(parent_pdf_names) == 1:
+                parent_pdf_name = parent_pdf_names[0]
+                try:
+                    found_files = [path for path in Path(split_dir_unc).glob("*.pdf") if path.is_file()]
+                    found_files, filter_diag = filter_split_child_paths_for_current_context(
+                        found_files,
+                        source_rows,
+                        title_lookup,
+                        parent_pdf_name,
+                    )
+                    candidates_by_number = {}
+                    for path in found_files:
+                        piece_ref = detect_piece_ref_details_from_filename(path.name)
+                        numero_piece = piece_ref.get("numero_piece")
+                        sous_piece = piece_ref.get("sous_piece") or ""
+                        if numero_piece is None or (expected_numbers and numero_piece not in expected_numbers):
+                            continue
+                        selected_key = (numero_piece, sous_piece.lower())
+                        candidates_by_number.setdefault(selected_key, []).append(path)
+                    for selected_key, candidates in candidates_by_number.items():
+                        if len(candidates) == 1:
+                            selected_by_number[selected_key] = candidates[0]
+                        else:
+                            ambiguous_by_number[selected_key] = sorted(str(path) for path in candidates)
+                except Exception:
+                    found_files = []
+                    selected_by_number = {}
+                    ambiguous_by_number = {}
+                for (numero_piece, sous_piece_key), path in sorted(selected_by_number.items()):
                     piece_ref = detect_piece_ref_details_from_filename(path.name)
-                    numero_piece = piece_ref.get("numero_piece")
-                    sous_piece = piece_ref.get("sous_piece") or ""
-                    if numero_piece is None or (expected_numbers and numero_piece not in expected_numbers):
-                        continue
-                    selected_key = (numero_piece, sous_piece.lower())
-                    candidates_by_number.setdefault(selected_key, []).append(path)
-                for selected_key, candidates in candidates_by_number.items():
-                    if len(candidates) == 1:
-                        selected_by_number[selected_key] = candidates[0]
-                    else:
-                        ambiguous_by_number[selected_key] = sorted(str(path) for path in candidates)
-            except Exception:
-                found_files = []
-                selected_by_number = {}
-                ambiguous_by_number = {}
-
-            rows = []
-            for (numero_piece, sous_piece_key), path in sorted(selected_by_number.items()):
-                piece_ref = detect_piece_ref_details_from_filename(path.name)
-                sous_piece = piece_ref.get("sous_piece") or sous_piece_key
-                piece_ref_style = piece_ref.get("piece_ref_style") or ""
-                libelle = compact_spaces(
-                    piece_title_lookup_get(title_lookup, numero_piece, sous_piece, piece_ref_style, allow_parent_fallback=False)
-                    or fallback_piece_title_from_filename(path.name, numero_piece, sous_piece, piece_ref_style)
-                    or piece_title_lookup_get(title_lookup, numero_piece, sous_piece, piece_ref_style)
-                    or path.stem
-                )
-                rows.append({
-                    "fichier_source": path.name,
-                    "numero_piece": numero_piece,
-                    "sous_piece": sous_piece,
-                    "reference_piece": piece_reference_piece(numero_piece, sous_piece, piece_ref_style),
-                    "piece_ref_style": piece_ref_style,
-                    "libelle_ocr": libelle,
-                    "nom_cible_propose": (
-                        f"PIECE n°{piece_reference_piece(numero_piece, sous_piece, piece_ref_style)} {sanitize_filename(libelle)}.pdf"
-                        if libelle else path.name
-                    ),
-                    "action": "classer" if libelle else "à vérifier",
-                    "origine": "enfant_split_pdf_multi_pieces",
-                    "parent_source": multi_pdf_name if multi_pdf_name != "(aucun)" else "",
-                    "pages_source": "",
-                    "chemin_source": str(path),
+                    sous_piece = piece_ref.get("sous_piece") or sous_piece_key
+                    piece_ref_style = piece_ref.get("piece_ref_style") or ""
+                    libelle = compact_spaces(
+                        piece_title_lookup_get(title_lookup, numero_piece, sous_piece, piece_ref_style, allow_parent_fallback=False)
+                        or fallback_piece_title_from_filename(path.name, numero_piece, sous_piece, piece_ref_style)
+                        or piece_title_lookup_get(title_lookup, numero_piece, sous_piece, piece_ref_style)
+                        or path.stem
+                    )
+                    rows.append({
+                        "fichier_source": path.name,
+                        "numero_piece": numero_piece,
+                        "sous_piece": sous_piece,
+                        "reference_piece": piece_reference_piece(numero_piece, sous_piece, piece_ref_style),
+                        "piece_ref_style": piece_ref_style,
+                        "libelle_ocr": libelle,
+                        "nom_cible_propose": f"PIECE n°{piece_reference_piece(numero_piece, sous_piece, piece_ref_style)} {sanitize_filename(libelle)}.pdf" if libelle else path.name,
+                        "action": "classer" if libelle else "à vérifier",
+                        "origine": "fallback_nom_historique",
+                        "parent_source": parent_pdf_name,
+                        "pages_source": "",
+                        "chemin_source": str(path),
+                    })
+                parent_statuses.append({
+                    "parent_document": parent_pdf_name,
+                    "expected_child_count": len(expected_numbers),
+                    "existing_child_count": len(rows),
+                    "complete": bool(rows) and (not expected_numbers or len(rows) == len(expected_numbers)),
+                    "legacy_fallback": True,
+                    "missing": [],
                 })
+            known_parents = {status.get("parent_document", "").casefold() for status in parent_statuses}
+            for parent_pdf_name in parent_pdf_names:
+                if parent_pdf_name.casefold() not in known_parents:
+                    parent_statuses.append({
+                        "parent_document": parent_pdf_name,
+                        "expected_child_count": 0,
+                        "existing_child_count": 0,
+                        "complete": False,
+                        "missing": [],
+                        "reason": "parent_absent_du_manifest_courant",
+                    })
             return {
                 "dossier_splits_scanné": split_dir_unc,
                 "nombre_fichiers_trouvés": len(found_files),
                 "fichiers_enfants_retenus": [row["fichier_source"] for row in rows],
-                "parent_pdf_associé": parent_pdf_name,
-                "statut_identification": "AMBIGUÏTÉ" if ambiguous_by_number else "DOCUMENTAIRE OK",
+                "parents_pdf_associés": parent_pdf_names,
+                "parents": parent_statuses,
+                "parents_incomplets": [status.get("parent_document") for status in parent_statuses if not status.get("complete")],
+                "manifest_path": str(split_manifest_path(split_dir_unc, current_pdf_cohort)),
+                "statut_identification": "INCOMPLET" if any(not status.get("complete") for status in parent_statuses) else ("AMBIGUÏTÉ" if ambiguous_by_number else "DOCUMENTAIRE OK"),
                 "code_partie_contexte": split_context_code,
                 "context_id": split_context_id,
-                "cle_actuelle": "cohorte + parent + plan de découpe courant",
-                "cle_recommandee": "cohorte + parent + nom d'enfant attendu",
+                "cle_actuelle": "affaire + cohorte stable + parent + numero_piece + sous_piece",
+                "fallback_historique": not bool(manifest),
+                "migration_anciens_splits": migration_diag,
+                "reconciliation_manifests": reconciliation_diag,
                 "filtre_contexte": filter_diag,
                 "ambiguities": [
                     {
@@ -23053,28 +23690,10 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 for key, value in split_children_scan.items()
                 if key != "rows"
             })
-            guided_split_result = st.session_state.get(f"guided_split_immediate_result_{project_id}") or {}
-            canonical_guided_split_dir = str(
-                Path(pcfixe_local_root_for_server(project_config, get_project_id(project_config, ""))).joinpath(
-                    "AD_Expert_Traitements",
-                    "_Splits",
-                )
-            )
-            matching_created_children = (
-                guided_split_result.get("parent_pdf") == multi_pdf_name
-                and _norm(guided_split_result.get("output_dir_pcfixe")) == _norm(canonical_guided_split_dir)
-                and bool(guided_split_result.get("created_files"))
-            )
-            matching_created_children = matching_created_children or bool(split_children_scan.get("rows"))
-            if (
-                multi_pdf_name
-                and multi_pdf_name != "(aucun)"
-                and not piece_names
-                and not matching_created_children
-            ):
+            if split_children_scan.get("parents_incomplets"):
                 st.warning(
-                    "Le PDF multi-pièces est sélectionné mais ses fichiers enfants n’ont pas encore été créés. "
-                    "Exécuter d’abord le split réel."
+                    "Parent(s) multi-pièces incomplet(s) : "
+                    + ", ".join(split_children_scan.get("parents_incomplets") or [])
                 )
             next_unnumbered_idx = 0
             dry_rows = []
@@ -23174,8 +23793,8 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 selected_names.append(name)
         selected_names = sorted(selected_names, key=document_ingestion_sort_key)
         selected_document_roles = build_ingestion_document_roles(dire_name, bcp_name, piece_names, multi_pdf_name, other_names=other_names)
-        if multi_pdf_name and multi_pdf_name != "(aucun)":
-            selected_document_roles.pop(Path(multi_pdf_name).name, None)
+        for parent_pdf_name in multi_pdf_names:
+            selected_document_roles.pop(Path(parent_pdf_name).name, None)
 
         qualification_rows = []
         title_lookup_for_summary = split_table_validated_titles()
@@ -23207,8 +23826,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
             child_upload.name = child_path.name
             selected_uploads.append(child_upload)
             selected_document_roles[child_path.name] = "piece"
-            if multi_pdf_name and multi_pdf_name != "(aucun)":
-                document_parent_sources[child_path.name] = multi_pdf_name
+            document_parent_sources[child_path.name] = child_row.get("parent_source") or ""
 
         for filename in separated_piece_rows_by_name:
             selected_document_roles[filename] = "piece"
@@ -23315,7 +23933,7 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 "reference_piece": reference_piece,
                 "libelle_retenu": libelle,
                 "page_count": page_meta.get("page_count"),
-                "source_parent": multi_pdf_name if multi_pdf_name != "(aucun)" else "",
+                "source_parent": child_row.get("parent_source") or "",
                 "action": "classer",
             })
             original_piece_refs_by_name[child_path.name] = {
@@ -23324,14 +23942,25 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 "reference_piece": reference_piece,
                 "piece_ref_style": child_piece_ref_style,
             }
-        multi_pdf_children_missing = bool(
-            multi_pdf_name
-            and multi_pdf_name != "(aucun)"
-            and not current_split_child_rows
-        )
-        if multi_pdf_name and multi_pdf_name != "(aucun)":
-            st.info(f"PDF parent multi-pièces : {multi_pdf_name} — non classé comme pièce finale")
-            st.write(f"Enfants classés : {len(current_split_child_rows)}")
+        incomplete_multi_pdf_parents = current_split_children_scan.get("parents_incomplets") or []
+        multi_pdf_children_missing = bool(incomplete_multi_pdf_parents)
+        reconciliation_diagnostic = current_split_children_scan.get("reconciliation_manifests") or {}
+        for ambiguity in reconciliation_diagnostic.get("ambiguous") or []:
+            st.error(
+                f"Réconciliation impossible pour {ambiguity.get('parent_document')} : "
+                f"{ambiguity.get('candidate_count', 0)} manifests compatibles. Aucun n'a été choisi."
+            )
+        for parent_status in current_split_children_scan.get("parents") or []:
+            if parent_status.get("reason") == "parent_absent_du_manifest_courant":
+                st.warning(
+                    f"PDF parent multi-pièces : {parent_status.get('parent_document')} — "
+                    "Parent absent du manifest courant"
+                )
+            else:
+                st.info(
+                    f"PDF parent multi-pièces : {parent_status.get('parent_document')} — remplacé par "
+                    f"{parent_status.get('existing_child_count', 0)}/{parent_status.get('expected_child_count', 0)} enfant(s)"
+                )
         if qualification_rows:
             st.markdown("#### Synthèse avant validation documentaire")
             edited_qualification = st.data_editor(
@@ -23410,8 +24039,8 @@ def render_classement_originaux_depot_technique(current_pdf_cohort: dict | None 
                 st.error("Renseigner l'auteur ou le conseil.")
             elif multi_pdf_children_missing:
                 st.error(
-                    "Le PDF multi-pièces est sélectionné mais aucun fichier enfant n’est disponible. "
-                    "Exécuter d’abord le split réel."
+                    "Validation bloquée : parent(s) multi-pièces sans tous leurs enfants attendus : "
+                    + ", ".join(incomplete_multi_pdf_parents)
                 )
             elif invalid_split_child_labels:
                 st.error(
