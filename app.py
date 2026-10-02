@@ -9735,6 +9735,77 @@ def audit_reunion_quality_summary_rows(data: dict) -> list[dict]:
         rows.append({"contrôle": label, "nombre": count, "synthèse": preview})
     return rows
 
+def prepare_audit_reunion_quality_infos(
+    *,
+    infos_path: str | Path,
+    id_affaire: str,
+    id_captation: str,
+    synchronize: bool = True,
+) -> dict:
+    """Résout et, si nécessaire, synchronise infos_projet avant dépôt du job."""
+    rel = (
+        Path(id_affaire)
+        / "AF_Expert_ASR"
+        / "transcriptions"
+        / id_captation
+        / "infos_projet.json"
+    )
+    pcfixe_unc = get_pcfixe_affaires_root() / rel
+    pcfixe_runtime = PCFIXE_AFFAIRES_ROOT / rel
+    requested_raw = str(infos_path or "").strip().strip('"')
+    requested = Path(requested_raw) if requested_raw else None
+    nas_canonical = NAS_AFFAIRES_ROOT / rel
+    nas_candidates = []
+    for candidate in (requested, nas_canonical):
+        if candidate is not None and candidate not in nas_candidates:
+            nas_candidates.append(candidate)
+
+    result = {
+        "pcfixe_path": str(pcfixe_unc),
+        "nas_candidates": [str(path) for path in nas_candidates],
+        "resolved_path": str(pcfixe_runtime),
+        "source": "",
+        "synchronized": False,
+        "sha256_source": "",
+        "sha256_target": "",
+    }
+    if pcfixe_unc.is_file():
+        result["source"] = "pcfixe"
+        return result
+
+    nas_source = next((path for path in nas_candidates if path.is_file()), None)
+    if nas_source is None:
+        checked = ", ".join([str(pcfixe_unc), *result["nas_candidates"]])
+        raise FileNotFoundError(f"infos_projet.json introuvable (PC fixe puis NAS) : {checked}")
+
+    result["source"] = "nas"
+    if not synchronize:
+        return result
+
+    preflight_pcfixe_target_dir(pcfixe_unc.parent)
+    tmp_path = pcfixe_unc.with_suffix(pcfixe_unc.suffix + f".{uuid.uuid4().hex}.tmp")
+    try:
+        shutil.copy2(nas_source, tmp_path)
+        os.replace(tmp_path, pcfixe_unc)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    source_hash = hashlib.sha256(nas_source.read_bytes()).hexdigest()
+    target_hash = hashlib.sha256(pcfixe_unc.read_bytes()).hexdigest()
+    if source_hash != target_hash:
+        raise RuntimeError(
+            "Synchronisation infos_projet.json invalide : hashes SHA-256 différents "
+            f"({nas_source} -> {pcfixe_unc})"
+        )
+    result.update({
+        "synchronized": True,
+        "sha256_source": source_hash,
+        "sha256_target": target_hash,
+    })
+    return result
+
+
 def submit_audit_reunion_quality_job(
     *,
     job_dir: str | Path,
@@ -9751,15 +9822,17 @@ def submit_audit_reunion_quality_job(
         raise ValueError("id_affaire/id_captation invalides.")
 
     job_dir_nas = _nas_affaires_path_to_volume1(job_dir)
-    infos_nas = _compte_rendu_nas_infos_path(id_affaire, id_captation)
     if not job_dir_nas:
         raise ValueError("job_dir obligatoire.")
-    if not infos_nas:
-        raise ValueError("infos_projet obligatoire.")
     if not _is_volume1_affaires_path(job_dir_nas):
         raise ValueError(f"job_dir doit être un chemin NAS /volume1/Affaires : {job_dir_nas}")
-    if not _is_volume1_affaires_path(infos_nas):
-        raise ValueError(f"infos_projet doit être un chemin NAS /volume1/Affaires : {infos_nas}")
+
+    infos_preflight = prepare_audit_reunion_quality_infos(
+        infos_path=infos_path,
+        id_affaire=id_affaire,
+        id_captation=id_captation,
+        synchronize=not dry_run,
+    )
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     job_id = f"audit_cr_{id_affaire}_{id_captation}_{stamp}_{uuid.uuid4().hex[:8]}"
@@ -9767,7 +9840,7 @@ def submit_audit_reunion_quality_job(
         "job_id": job_id,
         "type": "audit_reunion_quality",
         "job_dir": job_dir_nas,
-        "infos_projet": infos_nas,
+        "infos_projet": infos_preflight["resolved_path"],
         "id_affaire": id_affaire,
         "id_captation": id_captation,
     }
@@ -9778,6 +9851,7 @@ def submit_audit_reunion_quality_job(
         "job_path": str(queued_path),
         "status": "dry-run" if dry_run else "queued",
         "job": job,
+        "infos_preflight": infos_preflight,
     }
     if dry_run:
         return result
