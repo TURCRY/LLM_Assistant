@@ -68,6 +68,8 @@ def _load_annotation_functions():
         "_csv_missing_key_rows",
         "_photo_key_basename",
         "_annotation_csv_join_audit",
+        "_annotation_photos_batch_business_counts",
+        "_annotation_photos_batch_business_counts_for_job",
         "_annotation_parse_time_value",
         "_annotation_detail_sort_time",
         "_annotation_verified_batch_from_stamp",
@@ -261,7 +263,11 @@ class AnnotationWordBatchManifestTests(unittest.TestCase):
         self.infos = self.base / "nas" / "infos_projet.json"
         self.photos.parent.mkdir(parents=True, exist_ok=True)
         self.photos.write_text("photo_rel_native;nom_fichier_image\np1;P1.JPG\n", encoding="utf-8")
-        self.batch.write_text("photo_rel_native;batch_status;batch_id;batch_ts\np1;OK;b1;2026-07-24T12:00:00\n", encoding="utf-8")
+        self.batch.write_text(
+            "photo_rel_native;batch_status;batch_id;batch_ts;vlm_status;description_vlm_batch;libelle_propose_batch;commentaire_propose_batch\n"
+            "p1;OK;b1;2026-07-24T12:00:00;OK;description;libelle;commentaire\n",
+            encoding="utf-8",
+        )
         self.infos.write_text("{}", encoding="utf-8")
         self.pcfixe_root = self.base / "pcfixe_affaires"
         self.pcfixe_root.mkdir(parents=True, exist_ok=True)

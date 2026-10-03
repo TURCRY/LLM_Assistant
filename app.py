@@ -11984,6 +11984,7 @@ def _annotation_job_details(
                     "photos_batch_nas_sha256": photos_batch_nas_hash,
                     "photos_batch_csv_size": str(_value(result, "photos_batch_csv_size") or _value(job, "photos_batch_csv_size")),
                     "photos_batch_csv_rows": str(_value(result, "photos_batch_csv_rows") or _value(job, "photos_batch_csv_rows")),
+                    "batch_id": str(_value(result, "batch_id") or _value(job, "batch_id")),
                     "photos_batch_stamp_path": str(_value(result, "photos_batch_stamp_path") or _value(job, "photos_batch_stamp_path")),
                     "output_verified": "true" if output_verified else ("false" if is_modern else ""),
                     "output_verified_local": "true" if output_verified_local else ("false" if is_modern else ""),
@@ -12022,6 +12023,15 @@ def _annotation_job_details(
                         -(mtime or 0),
                     ),
                 }
+                # Le contenu metier n est attribue au job que si le CSV NAS
+                # courant est exactement celui que son manifest a publie.
+                if state == "completed" and paths:
+                    detail.update(_annotation_photos_batch_business_counts_for_job(
+                        paths.get("nas_photos_batch"),
+                        current_hash=current_batch_hash,
+                        job_hash=photos_batch_hash,
+                        batch_id=detail["batch_id"],
+                    ))
                 diagnostics["recognized"].append({
                     "job_id": job_id,
                     "status": state,
@@ -12326,6 +12336,107 @@ def _annotation_csv_join_audit(photos_path: Path | None, batch_path: Path | None
     return result
 
 
+def _annotation_photos_batch_business_counts(
+    batch_path: Path | None,
+    *,
+    batch_id: str = "",
+) -> dict[str, object]:
+    """Synthese metier d un photos_batch.csv pour un batch donne.
+
+    Si batch_id est renseigne, seules les lignes marquees avec cet identifiant
+    sont considerees comme selectionnees. La verification du hash appartient a
+    l appelant : cette fonction ne doit jamais rattacher un CSV courant a un
+    ancien job sans preuve d identite du fichier.
+    """
+    counts: dict[str, object] = {
+        "selected": 0,
+        "vlm_ok": 0,
+        "vlm_error": 0,
+        "description_ok": 0,
+        "libelle_ok": 0,
+        "commentaire_ok": 0,
+        "business_status": "unknown",
+        "business_message": "",
+    }
+    if batch_path is None or not batch_path.is_file():
+        return counts
+    try:
+        _, rows = _read_semicolon_csv(batch_path)
+    except Exception:
+        return counts
+
+    normalized_batch_id = str(batch_id or "").strip()
+    selected_rows = [
+        row for row in rows
+        if normalized_batch_id
+        and str(row.get("batch_id") or "").strip() == normalized_batch_id
+    ]
+    counts["selected"] = len(selected_rows)
+    counts["vlm_ok"] = sum(
+        str(row.get("vlm_status") or "").strip().upper() == "OK"
+        for row in selected_rows
+    )
+    counts["vlm_error"] = sum(
+        str(row.get("vlm_status") or "").strip().upper() == "ERR"
+        or str(row.get("batch_status") or "").strip().upper().startswith("ERR_VLM")
+        for row in selected_rows
+    )
+    counts["description_ok"] = sum(
+        bool(str(row.get("description_vlm_batch") or "").strip())
+        for row in selected_rows
+    )
+    counts["libelle_ok"] = sum(
+        bool(str(row.get("libelle_propose_batch") or "").strip())
+        for row in selected_rows
+    )
+    counts["commentaire_ok"] = sum(
+        bool(str(row.get("commentaire_propose_batch") or "").strip())
+        for row in selected_rows
+    )
+
+    selected = int(counts["selected"])
+    vlm_ok = int(counts["vlm_ok"])
+    vlm_error = int(counts["vlm_error"])
+    if selected <= 0:
+        return counts
+    if vlm_ok == 0:
+        counts["business_status"] = "invalid_vlm_total"
+        counts["business_message"] = f"{vlm_error}/{selected} VLM en erreur"
+    elif vlm_error > 0 or vlm_ok < selected:
+        counts["business_status"] = "partial"
+        counts["business_message"] = f"{vlm_error}/{selected} VLM en erreur"
+    else:
+        counts["business_status"] = "success"
+        counts["business_message"] = f"{vlm_ok}/{selected} VLM réussis"
+    return counts
+
+
+def _annotation_photos_batch_business_counts_for_job(
+    batch_path: Path | None,
+    *,
+    current_hash: str,
+    job_hash: str,
+    batch_id: str,
+) -> dict[str, object]:
+    """Relit le CSV seulement si le hash courant correspond au hash du job."""
+    if (
+        not current_hash
+        or not job_hash
+        or current_hash.casefold() != job_hash.casefold()
+    ):
+        return {
+            "selected": 0,
+            "vlm_ok": 0,
+            "vlm_error": 0,
+            "description_ok": 0,
+            "libelle_ok": 0,
+            "commentaire_ok": 0,
+            "business_status": "unknown",
+            "business_message": "",
+        }
+    return _annotation_photos_batch_business_counts(batch_path, batch_id=batch_id)
+
+
 def _annotation_parse_time_value(value: str) -> float:
     raw = str(value or "").strip()
     if not raw:
@@ -12469,6 +12580,7 @@ def _annotation_verified_batch_from_stamp(
         "photos_batch_nas_sha256": batch_hash,
         "photos_batch_csv_size": str(batch_path.stat().st_size),
         "photos_batch_csv_rows": str(len(batch_rows)),
+        "batch_id": stamp_batch_id,
         "photos_batch_stamp_path": str(stamp_path),
         "output_verified": "true",
         "output_verified_local": "true",
@@ -12487,6 +12599,10 @@ def _annotation_verified_batch_from_stamp(
         "verification_note": "Stamp batch vérifié : hashes, schémas et jointure NAS cohérents.",
         "action_key": "initial",
     }
+    detail.update(_annotation_photos_batch_business_counts(
+        batch_path,
+        batch_id=stamp_batch_id,
+    ))
     return detail, []
 
 
@@ -12741,6 +12857,14 @@ def _annotation_classify_jobs(job_details: dict[str, dict]) -> list[dict]:
             "photos_batch_nas_sha256": str(detail.get("photos_batch_nas_sha256") or "").strip(),
             "photos_batch_sha256": str(detail.get("photos_batch_sha256") or "").strip(),
             "photos_csv_sha256": str(detail.get("photos_csv_sha256") or "").strip(),
+            "selected": int(detail.get("selected") or 0),
+            "vlm_ok": int(detail.get("vlm_ok") or 0),
+            "vlm_error": int(detail.get("vlm_error") or 0),
+            "description_ok": int(detail.get("description_ok") or 0),
+            "libelle_ok": int(detail.get("libelle_ok") or 0),
+            "commentaire_ok": int(detail.get("commentaire_ok") or 0),
+            "business_status": str(detail.get("business_status") or "unknown"),
+            "business_message": str(detail.get("business_message") or ""),
             "source_detail": detail,
         }
         entry["sort_timestamp"] = _annotation_job_recency_key(detail)[1]
@@ -12816,6 +12940,8 @@ def resolve_annotation_batch_state(
         detail = job.get("source_detail") or {}
         # Un no-op n est jamais un traitement initial.
         if job["no_op"]:
+            return False
+        if job.get("business_status") == "invalid_vlm_total":
             return False
         # Sortie validee : soit verifiee explicitement, soit confirmee par le stamp.
         output_verified = job["output_verified"]
@@ -12905,6 +13031,8 @@ def resolve_annotation_batch_state(
             return False
         if job["dry_run"]:
             return False
+        if job.get("business_status") == "invalid_vlm_total":
+            return False
         if job["output_verified"] is not True:
             return False
         if job["output_verified_local"] is not True:
@@ -12939,7 +13067,19 @@ def resolve_annotation_batch_state(
     # initial en echec de publication ne peut pas alimenter le .docx, meme si
     # une relance WEAK no-op est ensuite passée en done.
     word_block_reason = ""
-    if not initial_success:
+    invalid_business_jobs = [
+        job for job in jobs
+        if job.get("status") == "completed"
+        and job.get("business_status") == "invalid_vlm_total"
+    ]
+    invalid_business_jobs.sort(key=_annotation_job_sort_value)
+    latest_invalid_business = invalid_business_jobs[-1] if invalid_business_jobs else None
+    if not initial_success and latest_invalid_business is not None:
+        word_block_reason = (
+            latest_invalid_business.get("business_message")
+            or "échec métier VLM total"
+        )
+    elif not initial_success:
         word_block_reason = "aucun traitement initial reussi pour cette affaire/captation"
     elif output_producer is None:
         word_block_reason = "aucun batch producteur valide de photos_batch.csv (publication NAS ou sortie non verifiee)"
@@ -13071,6 +13211,7 @@ def _annotation_report_preflight(
     reasons: list[str] = []
     warnings: list[str] = []
     latest_key, latest_batch = _annotation_latest_completed_batch(job_details)
+    latest_completed_observed = latest_batch
     if isinstance(producer_override, dict) and producer_override.get("job_id"):
         override_detail = job_details.get("initial") if isinstance(job_details, dict) else None
         merged_producer = dict(producer_override)
@@ -13096,6 +13237,10 @@ def _annotation_report_preflight(
                 if merged_producer.get(field) in (None, "", False) and value not in (None, ""):
                     merged_producer[field] = value
         latest_batch = merged_producer
+    if latest_completed_observed.get("business_status") == "invalid_vlm_total":
+        reasons.append(
+            str(latest_completed_observed.get("business_message") or "échec métier VLM total")
+        )
     latest_photos_hash_for_state = str(latest_batch.get("photos_csv_sha256") or "").strip()
     latest_batch_hash_for_state = str(latest_batch.get("photos_batch_nas_sha256") or latest_batch.get("photos_batch_sha256") or "").strip()
 
@@ -19695,6 +19840,11 @@ elif page == "Annotation photos / Rapport Word":
                 "annoté": detail.get("annotated_photos", ""),
                 "restant": detail.get("remaining_photos", ""),
                 "weak": detail.get("weak_photos", ""),
+                "sélectionné": detail.get("selected", ""),
+                "VLM OK": detail.get("vlm_ok", ""),
+                "VLM erreur": detail.get("vlm_error", ""),
+                "état métier": detail.get("business_status", "unknown"),
+                "diagnostic métier": detail.get("business_message", ""),
                 "date de fin": detail.get("completed_at", ""),
                 "photos.csv utilisé": detail.get("photos_csv") or "",
                 "hash photos.csv": detail.get("photos_csv_sha256") or detail.get("expected_photos_csv_sha256") or "",
@@ -19722,6 +19872,11 @@ elif page == "Annotation photos / Rapport Word":
                     "annoté": "",
                     "restant": "",
                     "weak": "",
+                    "sélectionné": "",
+                    "VLM OK": "",
+                    "VLM erreur": "",
+                    "état métier": "unknown",
+                    "diagnostic métier": "",
                     "date de fin": publish_retry_detail.get("completed_at", ""),
                     "photos.csv utilisé": publish_retry_detail.get("photos_csv") or "",
                     "hash photos.csv": publish_retry_detail.get("photos_csv_sha256") or "",
@@ -20165,6 +20320,13 @@ elif page == "Annotation photos / Rapport Word":
         st.caption(f"Analyse weak retenue : {weak_analysis_job_id or '(aucun)'} — {weak_analysis_status}")
         st.caption(f"Reprise WEAK retenue : {weak_rerun_job_id or '(aucun)'} — {weak_rerun_status}")
         st.caption(f"Reprise publication NAS retenue : {publish_retry_job_id or '(aucune)'} — {publish_retry_status}")
+        latest_business_detail = ann_batch_state.get("latest_job") or {}
+        if latest_business_detail.get("business_status") == "invalid_vlm_total":
+            st.error(
+                "État métier invalide — "
+                f"{latest_business_detail.get('business_message') or 'échec VLM total'} "
+                f"(statut spooler : {latest_business_detail.get('status') or 'inconnu'})"
+            )
         if ann_latest_failure_job_id:
             st.caption(f"Échec historique (non bloquant) : {ann_latest_failure_job_id}")
         report_block_reasons: list[str] = []
